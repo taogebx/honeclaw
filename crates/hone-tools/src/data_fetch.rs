@@ -25,7 +25,7 @@ impl DataFetchTool {
         let pool = hone_core::ApiKeyPool::new(keys);
         Self {
             keys: pool.keys().to_vec(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: Self::normalize_base_url(base_url),
             timeout,
             http: reqwest::Client::new(),
         }
@@ -35,10 +35,20 @@ impl DataFetchTool {
         let pool = config.fmp.effective_key_pool();
         Self {
             keys: pool.keys().to_vec(),
-            base_url: config.fmp.base_url.trim_end_matches('/').to_string(),
+            base_url: Self::normalize_base_url(&config.fmp.base_url),
             timeout: config.fmp.timeout,
             http: reqwest::Client::new(),
         }
+    }
+
+    // FMP 在 2025-08-31 后废弃 /api/v{3,4}/*, 全部迁到 /stable/*. 这里把 base_url 末尾的 /api 剥掉,
+    // 让旧 config (base_url = ".../api") 和新 config (base_url = ".../") 都能拼出 .../stable/* 路径.
+    fn normalize_base_url(raw: &str) -> String {
+        let mut base = raw.trim_end_matches('/').to_string();
+        if let Some(stripped) = base.strip_suffix("/api") {
+            base = stripped.to_string();
+        }
+        base.trim_end_matches('/').to_string()
     }
 
     /// 用指定 key 执行一次 FMP 请求
@@ -86,30 +96,40 @@ impl DataFetchTool {
 
     fn build_url(&self, data_type: &str, ticker: &str) -> Result<String, String> {
         match data_type {
-            "quote" => Ok(format!("{}/v3/quote/{}", self.base_url, ticker)),
-            "profile" => Ok(format!("{}/v3/profile/{}", self.base_url, ticker)),
+            "quote" => Ok(format!("{}/stable/quote?symbol={}", self.base_url, ticker)),
+            "profile" => Ok(format!("{}/stable/profile?symbol={}", self.base_url, ticker)),
             "search" => Ok(format!(
-                "{}/v3/search?query={}&limit=10",
+                "{}/stable/search-name?query={}&limit=10",
                 self.base_url, ticker
             )),
             "financials" => Ok(format!(
-                "{}/v3/income-statement/{}?limit=4",
+                "{}/stable/income-statement?symbol={}&limit=4",
                 self.base_url, ticker
             )),
             "news" => {
                 if ticker.is_empty() {
-                    Ok(format!("{}/v3/stock_news?limit=10", self.base_url))
+                    Ok(format!("{}/stable/news/stock-latest?limit=10", self.base_url))
                 } else {
                     Ok(format!(
-                        "{}/v3/stock_news?tickers={}&limit=10",
+                        "{}/stable/news/stock?symbols={}&limit=10",
                         self.base_url, ticker
                     ))
                 }
             }
-            "gainers_losers" => Ok(format!("{}/v3/stock_market/actives", self.base_url)),
-            "sector_performance" => Ok(format!("{}/v3/sector-performance", self.base_url)),
-            "crypto_quote" => Ok(format!("{}/v3/quote/{}", self.base_url, ticker)),
-            "etf_holdings" => Ok(format!("{}/v3/etf-holder/{}", self.base_url, ticker)),
+            "gainers_losers" => Ok(format!("{}/stable/most-actives", self.base_url)),
+            "sector_performance" => {
+                let today = hone_core::beijing_now().date_naive();
+                Ok(format!(
+                    "{}/stable/sector-performance-snapshot?date={}",
+                    self.base_url,
+                    today.format("%Y-%m-%d")
+                ))
+            }
+            "crypto_quote" => Ok(format!("{}/stable/quote?symbol={}", self.base_url, ticker)),
+            "etf_holdings" => Ok(format!(
+                "{}/stable/etf/holdings?symbol={}",
+                self.base_url, ticker
+            )),
             "earnings_calendar" => Err(
                 "earnings_calendar 需要显式窗口，通过 build_earnings_calendar_url 构造".to_string(),
             ),
@@ -146,7 +166,7 @@ impl DataFetchTool {
 
     fn build_earnings_calendar_url(&self, from: NaiveDate, to: NaiveDate) -> String {
         format!(
-            "{}/v3/earning_calendar?from={}&to={}",
+            "{}/stable/earnings-calendar?from={}&to={}",
             self.base_url,
             from.format("%Y-%m-%d"),
             to.format("%Y-%m-%d")
@@ -383,13 +403,14 @@ mod tests {
 
     #[test]
     fn test_url_building() {
+        // base_url 末尾的 /api 会被 normalize 剥掉, 拼出 stable 端点
         let tool = DataFetchTool::new(vec!["test_key".to_string()], "https://example.com/api", 30);
 
         let url1 = tool.build_url("quote", "AAPL").expect("quote url");
-        let full_url1 = format!("{}?apikey=test_key", url1);
+        let full_url1 = format!("{}&apikey=test_key", url1);
         assert_eq!(
             full_url1,
-            "https://example.com/api/v3/quote/AAPL?apikey=test_key"
+            "https://example.com/stable/quote?symbol=AAPL&apikey=test_key"
         );
 
         let url2 = tool
@@ -398,7 +419,29 @@ mod tests {
         let full_url2 = format!("{}&apikey=test_key", url2);
         assert_eq!(
             full_url2,
-            "https://example.com/api/v3/income-statement/AAPL?limit=4&apikey=test_key"
+            "https://example.com/stable/income-statement?symbol=AAPL&limit=4&apikey=test_key"
+        );
+    }
+
+    #[test]
+    fn test_base_url_normalization() {
+        // 旧 config: 末尾带 /api → 被剥掉
+        let tool_legacy = DataFetchTool::new(vec!["k".to_string()], "https://example.com/api", 30);
+        assert_eq!(
+            tool_legacy.build_url("quote", "AAPL").unwrap(),
+            "https://example.com/stable/quote?symbol=AAPL"
+        );
+        // 新 config: 不带 /api
+        let tool_new = DataFetchTool::new(vec!["k".to_string()], "https://example.com", 30);
+        assert_eq!(
+            tool_new.build_url("quote", "AAPL").unwrap(),
+            "https://example.com/stable/quote?symbol=AAPL"
+        );
+        // 末尾带 / 也被吃掉
+        let tool_slash = DataFetchTool::new(vec!["k".to_string()], "https://example.com/api/", 30);
+        assert_eq!(
+            tool_slash.build_url("quote", "AAPL").unwrap(),
+            "https://example.com/stable/quote?symbol=AAPL"
         );
     }
 
@@ -483,7 +526,7 @@ mod tests {
         let url = tool.build_earnings_calendar_url(from, to);
         assert_eq!(
             url,
-            "https://example.com/api/v3/earning_calendar?from=2026-04-09&to=2026-04-23"
+            "https://example.com/stable/earnings-calendar?from=2026-04-09&to=2026-04-23"
         );
     }
 }
