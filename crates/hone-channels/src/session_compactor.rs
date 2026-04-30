@@ -50,6 +50,8 @@ impl<'a> SessionCompactor<'a> {
             .map(|identity| identity.is_group())
             .unwrap_or(false);
 
+        // [LOCAL PATCH] DM 会话默认阈值放宽 10 倍, 方便个人长会话保留完整历史 (单用户场景)
+        // 群聊仍然按 group_context 配置 (避免群聊上下文爆炸)
         let compress_threshold = if is_group_session {
             self.core
                 .config
@@ -57,7 +59,7 @@ impl<'a> SessionCompactor<'a> {
                 .compress_threshold_messages
                 .max(1)
         } else {
-            20
+            200
         };
         let compress_byte_threshold = if is_group_session {
             self.core
@@ -66,7 +68,7 @@ impl<'a> SessionCompactor<'a> {
                 .compress_threshold_bytes
                 .max(1024)
         } else {
-            80_000
+            800_000
         };
         let retain_recent = if is_group_session {
             self.core
@@ -75,7 +77,7 @@ impl<'a> SessionCompactor<'a> {
                 .retain_recent_after_compress
                 .max(1)
         } else {
-            6
+            50
         };
 
         let total_content_bytes: usize = active_messages
