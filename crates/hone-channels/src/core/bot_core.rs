@@ -352,8 +352,16 @@ impl HoneBotCore {
             )));
             registry.register(Box::new(hone_tools::LocalWriteFileTool::new(
                 sandbox_base,
-                actor,
+                actor.clone(),
             )));
+
+            // image_gen 必须有 actor 才能正确落到 actor sandbox 下的 gen_images
+            if self.config.nano_banana.enabled {
+                registry.register(Box::new(hone_tools::ImageGenTool::from_config(
+                    &self.config,
+                    actor,
+                )));
+            }
         }
 
         // 注册金融数据获取工具

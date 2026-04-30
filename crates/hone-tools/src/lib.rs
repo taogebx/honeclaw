@@ -8,6 +8,7 @@ pub mod data_fetch;
 pub mod deep_research;
 pub mod discover_skills;
 pub mod guard;
+pub mod image_gen_tool;
 pub mod load_skill;
 pub mod local_files;
 pub mod missed_events_tool;
@@ -27,6 +28,7 @@ pub use data_fetch::DataFetchTool;
 pub use deep_research::DeepResearchTool;
 pub use discover_skills::DiscoverSkillsTool;
 pub use guard::ToolExecutionGuard;
+pub use image_gen_tool::ImageGenTool;
 pub use load_skill::LoadSkillTool;
 pub use local_files::{
     LocalListFilesTool, LocalReadFileTool, LocalSearchFilesTool, LocalWriteFileTool,
