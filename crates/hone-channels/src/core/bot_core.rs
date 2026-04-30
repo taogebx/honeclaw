@@ -347,6 +347,10 @@ impl HoneBotCore {
                 actor.clone(),
             )));
             registry.register(Box::new(hone_tools::LocalReadFileTool::new(
+                sandbox_base.clone(),
+                actor.clone(),
+            )));
+            registry.register(Box::new(hone_tools::LocalWriteFileTool::new(
                 sandbox_base,
                 actor,
             )));

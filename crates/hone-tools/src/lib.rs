@@ -28,7 +28,9 @@ pub use deep_research::DeepResearchTool;
 pub use discover_skills::DiscoverSkillsTool;
 pub use guard::ToolExecutionGuard;
 pub use load_skill::LoadSkillTool;
-pub use local_files::{LocalListFilesTool, LocalReadFileTool, LocalSearchFilesTool};
+pub use local_files::{
+    LocalListFilesTool, LocalReadFileTool, LocalSearchFilesTool, LocalWriteFileTool,
+};
 pub use missed_events_tool::MissedEventsTool;
 pub use notification_prefs_tool::NotificationPrefsTool;
 pub use portfolio_tool::PortfolioTool;
