@@ -3153,6 +3153,7 @@ dependencies = [
  "glob",
  "hone-core",
  "hone-event-engine",
+ "hone-integrations",
  "hone-memory",
  "reqwest 0.12.28",
  "serde",
