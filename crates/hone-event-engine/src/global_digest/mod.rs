@@ -1,47 +1,42 @@
-//! 全局 digest —— LLM 精读后每天 N 次的"今日全球要闻"广播。
+//! 全局 digest 内核 —— curator (Pass1+Pass2) / fetcher / audience / event_dedupe /
+//! mainline_distill(投资主线蒸馏)。scheduler 在 `unified_digest::scheduler`,
+//! 本目录是 unified pipeline 的 LLM 内核;`GlobalNewsSource` 在
+//! `unified_digest::sources::global` 里 wrap `collector` 输出成 `UnifiedCandidate`。
 //!
-//! 与 per-actor `digest::` 完全独立的两条管道:
-//! - `digest::`:ticker 命中 → buffer → flush 到单 actor;事件不挂 ticker 就推不到
-//! - `global_digest::`:不挂 ticker,从 store 取候选池 → LLM 两段式精读
-//!   → 渲染单条 broadcast 给所有 `prefs.global_digest_enabled=true` 的 direct actor
-//!
-//! Pipeline:
+//! Pipeline(由 `unified_digest::scheduler` 编排):
 //! 1. `collector::CandidateCollector` —— 从 EventStore 拉 trusted-source High/Medium
 //!    news,过滤掉 legal_ad / pr_wire / opinion_blog / earnings_transcript / 已广播
-//! 2. (后续) `fetcher` 抓原文,`curator` Pass1+Pass2 LLM 精读,`scheduler` 按
-//!    `GlobalDigestConfig.schedules` 触发,`renderer` 出最终文案
+//! 2. `event_dedupe` 折叠同事件多源 → `fetcher` 抓原文 → `curator` Pass1+Pass2 LLM 精读
+//! 3. 输出经 unified scheduler per-actor fan-out,与 buffer/synth 候选池合流后渲染
 //!
-//! 配置:`GlobalDigestConfig`(`hone-core::config::event_engine`)。
-//! 用户开关:`NotificationPrefs.global_digest_enabled`(默认 true)。
-//! 推送 channel:`delivery_log.channel = "global_digest"`。
+//! 配置:`GlobalDigestConfig`(`hone-core::config::event_engine`),仍是 LLM 子配置容器。
+//! 推送 channel:`delivery_log.channel = "unified_digest"`。
 
 pub mod audience;
 pub mod collector;
 pub mod curator;
 pub mod event_dedupe;
 pub mod fetcher;
+pub mod mainline_cron;
+pub mod mainline_distill;
 pub mod renderer;
-pub mod scheduler;
-pub mod thesis_cron;
-pub mod thesis_distill;
 
 pub use audience::{AudienceBuilder, AudienceContext, BriefSource, CompanyBrief};
 pub use collector::{CandidateCollector, GlobalDigestCandidate};
 pub use curator::{
-    BaselineCuratedItem, Curator, PersonalizedItem, PickCategory, RankedCandidate, ThesisRelation,
-    UserThesis,
+    BaselineCuratedItem, Curator, MainlineRelation, PersonalizedItem, PickCategory,
+    RankedCandidate, UserMainline,
 };
 pub use event_dedupe::{
     ClusterAudit, DedupeStats, EventDeduper, LlmEventDeduper, PassThroughDeduper,
 };
 pub use fetcher::{ArticleBody, ArticleFetcher, ArticleSource};
-pub use renderer::render_global_digest;
-pub use scheduler::GlobalDigestScheduler;
-pub use thesis_cron::{
+pub use mainline_cron::{
     DEFAULT_DISTILL_INTERVAL_HOURS, MIN_RETRY_INTERVAL_HOURS, TriggerReason, WEEKLY_REFRESH_HOURS,
     distill_cron_loop, distill_tick, should_trigger,
 };
-pub use thesis_distill::{
-    DistilledTheses, LlmThesisDistiller, ProfileSource, ThesisDistiller, actor_sandbox_dir,
+pub use mainline_distill::{
+    DistilledMainlines, LlmMainlineDistiller, MainlineDistiller, ProfileSource, actor_sandbox_dir,
     distill_and_persist_one, distill_for_actor, extract_tickers, merge_into_prefs, scan_profiles,
 };
+pub use renderer::render_global_digest;

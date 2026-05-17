@@ -9,6 +9,8 @@ use serde_json::Value;
 
 use crate::base::{Tool, ToolParameter};
 
+const MAX_DEEP_RESEARCH_ERROR_CHARS: usize = 300;
+
 /// DeepResearchTool — 启动深度个股研究任务
 pub struct DeepResearchTool {
     /// 研究 API 端点（POST）
@@ -71,10 +73,11 @@ impl Tool for DeepResearchTool {
             }));
         }
 
+        let safe_api_url = sanitize_deep_research_error_detail(&self.api_url);
         tracing::info!(
             "[DeepResearchTool] 启动深度研究 company={} api_url={}",
             company_name,
-            self.api_url
+            safe_api_url
         );
 
         let body = serde_json::json!({
@@ -92,52 +95,51 @@ impl Tool for DeepResearchTool {
             req = req.header("Authorization", format!("Bearer {}", self.api_key));
         }
 
-        let resp = match req.send().await {
-            Ok(r) => r,
+        let response = match req.send().await {
+            Ok(response) => response,
             Err(e) => {
-                tracing::error!("[DeepResearchTool] API 请求失败: {}", e);
+                let safe_error = sanitize_deep_research_error_detail(&e.to_string());
+                tracing::error!("[DeepResearchTool] API 请求失败: {}", safe_error);
                 return Ok(serde_json::json!({
                     "success": false,
-                    "error": format!("研究 API 请求失败: {e}。请确认 DEEP_RESEARCH_API_URL 已正确配置（当前: {}）", self.api_url)
+                    "error": format!("研究 API 请求失败: {safe_error}。请确认 DEEP_RESEARCH_API_URL 已正确配置（当前: {safe_api_url}）")
                 }));
             }
         };
 
-        let status = resp.status();
-        let raw: Value = match resp.json().await {
-            Ok(v) => v,
+        let status = response.status();
+        let response_json: Value = match response.json().await {
+            Ok(value) => value,
             Err(e) => {
-                tracing::error!("[DeepResearchTool] 响应解析失败: {}", e);
+                let safe_error = sanitize_deep_research_error_detail(&e.to_string());
+                tracing::error!("[DeepResearchTool] 响应解析失败: {}", safe_error);
                 return Ok(serde_json::json!({
                     "success": false,
-                    "error": format!("研究 API 响应解析失败: {e}")
+                    "error": format!("研究 API 响应解析失败: {safe_error}")
                 }));
             }
         };
 
         if !status.is_success() {
-            let err_msg = raw
-                .get("error")
-                .or_else(|| raw.get("message"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("未知错误");
+            let err_msg = deep_research_error_message(&response_json);
+            let raw_preview = deep_research_payload_preview(&response_json);
             tracing::error!(
-                "[DeepResearchTool] API 返回错误 status={} error={}",
+                "[DeepResearchTool] API 返回错误 status={} error={} response_preview={}",
                 status,
-                err_msg
+                err_msg,
+                raw_preview
             );
             return Ok(serde_json::json!({
                 "success": false,
-                "error": format!("研究 API 返回错误 (HTTP {}): {}", status, err_msg),
-                "raw": raw
+                "error": format!("研究 API 返回错误 (HTTP {}): {}", status, err_msg)
             }));
         }
 
         // 提取 task_id（兼容多种字段名）
-        let task_id = raw
+        let task_id = response_json
             .get("task_id")
-            .or_else(|| raw.get("taskId"))
-            .or_else(|| raw.get("id"))
+            .or_else(|| response_json.get("taskId"))
+            .or_else(|| response_json.get("id"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -153,9 +155,165 @@ impl Tool for DeepResearchTool {
             "task_id": task_id,
             "company_name": company_name,
             "message": format!("已成功启动 {} 的深度研究任务，系统将每分钟汇报一次进度，最多监控 15 分钟。完整报告约需 1-2 小时，完成后可在「个股研究」页面查阅。", company_name),
-            "raw": raw
+            "raw": response_json
         }))
     }
+}
+
+fn sanitize_deep_research_error_detail(text: &str) -> String {
+    let redacted = redact_query_secrets(&redact_bearer_secret(&redact_url_userinfo(text)));
+    if redacted.chars().count() <= MAX_DEEP_RESEARCH_ERROR_CHARS {
+        return redacted;
+    }
+    redacted
+        .chars()
+        .take(MAX_DEEP_RESEARCH_ERROR_CHARS)
+        .collect::<String>()
+        + "..."
+}
+
+fn deep_research_error_message(raw: &Value) -> String {
+    raw.get("error")
+        .or_else(|| raw.get("message"))
+        .and_then(|v| v.as_str())
+        .map(sanitize_deep_research_error_detail)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "未知错误".to_string())
+}
+
+fn deep_research_payload_preview(raw: &Value) -> String {
+    let redacted = redact_json_secrets(raw);
+    let encoded = serde_json::to_string(&redacted).unwrap_or_else(|_| redacted.to_string());
+    sanitize_deep_research_error_detail(&encoded)
+}
+
+fn redact_json_secrets(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    let lower = key.to_ascii_lowercase();
+                    let redacted = matches!(
+                        lower.as_str(),
+                        "access_token"
+                            | "apikey"
+                            | "api_keys"
+                            | "api_key"
+                            | "apikeys"
+                            | "authorization"
+                            | "password"
+                            | "secret"
+                            | "token"
+                    );
+                    let sanitized = if redacted {
+                        Value::String("<redacted>".to_string())
+                    } else {
+                        redact_json_secrets(value)
+                    };
+                    (key.clone(), sanitized)
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(redact_json_secrets).collect()),
+        Value::String(text) => Value::String(sanitize_deep_research_error_detail(text)),
+        _ => value.clone(),
+    }
+}
+
+fn redact_bearer_secret(text: &str) -> String {
+    let marker = "Bearer ";
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find(marker) {
+        let value_start = index + marker.len();
+        output.push_str(&remaining[..value_start]);
+        output.push_str("<redacted>");
+        let value_tail = remaining[value_start..]
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                (ch == '&' || ch == ')' || ch == ',' || ch == '"' || ch.is_whitespace())
+                    .then_some(idx)
+            })
+            .unwrap_or(remaining[value_start..].len());
+        remaining = &remaining[value_start + value_tail..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn redact_url_userinfo(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(scheme_index) = remaining.find("://") {
+        let after_scheme = scheme_index + 3;
+        output.push_str(&remaining[..after_scheme]);
+        let tail = &remaining[after_scheme..];
+        let auth_end = tail
+            .char_indices()
+            .find_map(|(idx, ch)| (ch == '/' || ch == '?' || ch == ')' || ch == ' ').then_some(idx))
+            .unwrap_or(tail.len());
+        let authority = &tail[..auth_end];
+        if let Some(at_index) = authority.rfind('@') {
+            output.push_str("<redacted>@");
+            output.push_str(&authority[at_index + 1..]);
+        } else {
+            output.push_str(authority);
+        }
+        remaining = &tail[auth_end..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn redact_query_secrets(text: &str) -> String {
+    let mut output = text.to_string();
+    for key in [
+        "access_token",
+        "accessToken",
+        "api_key",
+        "apiKey",
+        "apikey",
+        "token",
+        "secret",
+        "password",
+    ] {
+        output = redact_delimited_secret_value(&output, &format!("{key}="));
+        output = redact_delimited_secret_value(&output, &format!("{key}:"));
+    }
+    output
+}
+
+fn redact_delimited_secret_value(text: &str, needle: &str) -> String {
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find(needle) {
+        let value_start = index + needle.len();
+        output.push_str(&remaining[..value_start]);
+        let leading_whitespace = remaining[value_start..]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        output.push_str(&remaining[value_start..value_start + leading_whitespace]);
+        output.push_str("<redacted>");
+        let value_tail = remaining[value_start + leading_whitespace..]
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                (ch == '&'
+                    || ch == ')'
+                    || ch == ','
+                    || ch == '"'
+                    || ch == '\''
+                    || ch == '}'
+                    || ch == ']'
+                    || ch.is_whitespace())
+                .then_some(idx)
+            })
+            .unwrap_or(remaining[value_start + leading_whitespace..].len());
+        remaining = &remaining[value_start + leading_whitespace + value_tail..];
+    }
+    output.push_str(remaining);
+    output
 }
 
 #[cfg(test)]
@@ -185,7 +343,7 @@ mod tests {
             .execute(serde_json::json!({"company_name": ""}))
             .await
             .expect("execute should not panic");
-        assert_eq!(result["success"], false);
+        assert_eq!(result["success"].as_bool(), Some(false));
         assert!(
             result["error"]
                 .as_str()
@@ -197,13 +355,117 @@ mod tests {
     #[tokio::test]
     async fn execute_network_failure_returns_structured_error() {
         // 使用一个必然失败的端口
-        let tool = DeepResearchTool::new("http://127.0.0.1:19", "");
+        let tool = DeepResearchTool::new(
+            "http://user:pass@127.0.0.1:19/api/research/start?token=secret&ok=1",
+            "",
+        );
         let result = tool
             .execute(serde_json::json!({"company_name": "NVIDIA"}))
             .await
             .expect("execute should not panic");
-        assert_eq!(result["success"], false);
+        assert_eq!(result["success"].as_bool(), Some(false));
         let err = result["error"].as_str().unwrap_or_default();
         assert!(!err.is_empty(), "error should have message");
+        assert!(!err.contains("secret"));
+        assert!(!err.contains("user:pass"));
+        assert!(err.contains("token=<redacted>"));
+        assert!(err.contains("<redacted>@127.0.0.1"));
+    }
+
+    #[test]
+    fn deep_research_error_detail_redacts_url_credentials() {
+        let detail = sanitize_deep_research_error_detail(
+            "request failed for https://user:pass@example.test/path?api_key=abc&ok=1",
+        );
+        assert_eq!(
+            detail,
+            "request failed for https://<redacted>@example.test/path?api_key=<redacted>&ok=1"
+        );
+    }
+
+    #[test]
+    fn deep_research_error_detail_redacts_bearer_credentials() {
+        let detail =
+            sanitize_deep_research_error_detail("request failed with Authorization: Bearer abc123");
+        assert_eq!(
+            detail,
+            "request failed with Authorization: Bearer <redacted>"
+        );
+    }
+
+    #[test]
+    fn deep_research_error_detail_redacts_colon_credentials() {
+        let detail = sanitize_deep_research_error_detail(
+            "backend rejected request with apiKey: header-secret and token=token-secret",
+        );
+
+        assert!(detail.contains("apiKey: <redacted>"));
+        assert!(detail.contains("token=<redacted>"));
+        assert!(!detail.contains("header-secret"));
+        assert!(!detail.contains("token-secret"));
+    }
+
+    #[test]
+    fn deep_research_payload_preview_redacts_secret_fields() {
+        let detail = deep_research_payload_preview(&serde_json::json!({
+            "error": "backend rejected token=abc and Bearer xyz",
+            "debug": {
+                "api_key": "key",
+                "token": "tok",
+                "safe": "kept"
+            }
+        }));
+
+        assert!(detail.contains("backend rejected token=<redacted>"));
+        assert!(detail.contains("Bearer <redacted>"));
+        assert!(detail.contains("\"api_key\":\"<redacted>\""));
+        assert!(detail.contains("\"token\":\"<redacted>\""));
+        assert!(detail.contains("\"safe\":\"kept\""));
+        assert!(!detail.contains("abc"));
+        assert!(!detail.contains("xyz"));
+        assert!(!detail.contains(":\"key\""));
+        assert!(!detail.contains(":\"tok\""));
+    }
+
+    #[tokio::test]
+    async fn execute_http_error_hides_raw_payload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("read local addr");
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0_u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body = r#"{"error":"backend failed token=abc with Bearer xyz","debug":{"api_key":"key","trace_id":"trace-1"}}"#;
+            let response = format!(
+                "HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+
+        let tool = DeepResearchTool::new(&format!("http://{addr}/api/research/start"), "");
+        let result = tool
+            .execute(serde_json::json!({"company_name": "NVIDIA"}))
+            .await
+            .expect("execute should return structured error");
+
+        assert_eq!(result["success"].as_bool(), Some(false));
+        assert!(result.get("raw").is_none());
+        let error = result["error"].as_str().expect("error message");
+        assert!(error.contains("HTTP 502"), "{error}");
+        assert!(error.contains("token=<redacted>"), "{error}");
+        assert!(error.contains("Bearer <redacted>"), "{error}");
+        assert!(!error.contains("abc"), "{error}");
+        assert!(!error.contains("xyz"), "{error}");
+        assert!(!error.contains("trace-1"), "{error}");
     }
 }

@@ -21,6 +21,11 @@ use crate::subscription::SharedRegistry;
 const FRESH_QUOTE_MAX_AGE_SECS: i64 = 15 * 60;
 const CLOSING_QUOTE_MAX_AGE_SECS: i64 = 20 * 60 * 60;
 const FUTURE_QUOTE_MAX_SKEW_SECS: i64 = 5 * 60;
+#[cfg(not(test))]
+const FMP_QUOTE_BATCH_SIZE: usize = 25;
+#[cfg(test)]
+const FMP_QUOTE_BATCH_SIZE: usize = 3;
+const FMP_QUOTE_MAX_PATH_CHARS: usize = 700;
 
 pub struct PricePoller {
     client: FmpClient,
@@ -64,18 +69,115 @@ impl PricePoller {
         if symbols.is_empty() {
             return Ok(vec![]);
         }
-        let joined = symbols.join(",");
-        let path = format!("/v3/quote/{joined}");
-        let raw = self.client.get_json(&path).await?;
-        Ok(events_from_quotes_at(
-            &raw,
+        let batches = fmp_quote_symbol_batches(symbols);
+        if batches.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut batch_results = Vec::new();
+        for batch in &batches {
+            let joined = batch.join(",");
+            let path = format!("/v3/quote/{joined}");
+            match self.client.get_json(&path).await {
+                Ok(raw) => batch_results.push(Ok(raw)),
+                Err(err) => {
+                    tracing::warn!(
+                        poller = "fmp.price",
+                        batch_size = batch.len(),
+                        first_symbol = batch.first().map(String::as_str).unwrap_or(""),
+                        "FMP quote batch failed: {err:#}"
+                    );
+                    batch_results.push(Err(err));
+                }
+            }
+        }
+
+        collect_quote_batch_events(
+            batch_results,
             self.low_pct,
             self.high_pct,
             self.realert_step_pct,
             self.near_hi_lo_tolerance,
             Utc::now(),
-        ))
+        )
     }
+}
+
+fn fmp_quote_symbol_batches(symbols: &[String]) -> Vec<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut batches: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut current_path_chars = "/v3/quote/".len();
+
+    for symbol in symbols {
+        let symbol = symbol.trim().to_ascii_uppercase();
+        if !is_fmp_quote_symbol(&symbol) || !seen.insert(symbol.clone()) {
+            continue;
+        }
+
+        let separator = usize::from(!current.is_empty());
+        let next_path_chars = current_path_chars + separator + symbol.len();
+        if !current.is_empty()
+            && (current.len() >= FMP_QUOTE_BATCH_SIZE || next_path_chars > FMP_QUOTE_MAX_PATH_CHARS)
+        {
+            batches.push(std::mem::take(&mut current));
+            current_path_chars = "/v3/quote/".len();
+        }
+
+        current_path_chars += usize::from(!current.is_empty()) + symbol.len();
+        current.push(symbol);
+    }
+
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+fn is_fmp_quote_symbol(symbol: &str) -> bool {
+    !symbol.is_empty()
+        && symbol.len() <= 32
+        && symbol
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '^'))
+}
+
+fn collect_quote_batch_events<I>(
+    batch_results: I,
+    low_pct: f64,
+    high_pct: f64,
+    realert_step_pct: f64,
+    near_hi_lo_tolerance: f64,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Vec<MarketEvent>>
+where
+    I: IntoIterator<Item = anyhow::Result<Value>>,
+{
+    let mut events = Vec::new();
+    let mut successful_batches = 0usize;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for result in batch_results {
+        match result {
+            Ok(raw) => {
+                successful_batches += 1;
+                events.extend(events_from_quotes_at(
+                    &raw,
+                    low_pct,
+                    high_pct,
+                    realert_step_pct,
+                    near_hi_lo_tolerance,
+                    now,
+                ));
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+
+    if successful_batches == 0 {
+        return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("FMP quote batches failed")));
+    }
+    Ok(events)
 }
 
 #[async_trait]
@@ -110,28 +212,28 @@ fn events_from_quotes_at(
     near_tol: f64,
     now: DateTime<Utc>,
 ) -> Vec<MarketEvent> {
-    let arr = match raw.as_array() {
-        Some(a) => a,
+    let quotes = match raw.as_array() {
+        Some(quotes) => quotes,
         None => return vec![],
     };
-    let mut out = Vec::new();
+    let mut events = Vec::new();
 
-    for item in arr {
-        let Some((quote_time, window)) = quote_time_and_window(item, now) else {
+    for quote in quotes {
+        let Some((quote_time, window)) = quote_time_and_window(quote, now) else {
             continue;
         };
         let date_key = quote_time.date_naive().format("%Y-%m-%d").to_string();
-        let Some(symbol) = item
+        let Some(symbol) = quote
             .get("symbol")
             .and_then(|v| v.as_str())
             .map(String::from)
         else {
             continue;
         };
-        let price = item.get("price").and_then(|v| v.as_f64());
-        let pct = item.get("changesPercentage").and_then(|v| v.as_f64());
-        let year_high = item.get("yearHigh").and_then(|v| v.as_f64());
-        let year_low = item.get("yearLow").and_then(|v| v.as_f64());
+        let price = quote.get("price").and_then(|v| v.as_f64());
+        let pct = quote.get("changesPercentage").and_then(|v| v.as_f64());
+        let year_high = quote.get("yearHigh").and_then(|v| v.as_f64());
+        let year_low = quote.get("yearLow").and_then(|v| v.as_f64());
 
         if let Some(pct) = pct {
             let abs = pct.abs();
@@ -147,8 +249,8 @@ fn events_from_quotes_at(
                 let bps = (pct * 100.0).round() as i64;
                 let direction = if pct >= 0.0 { "+" } else { "" };
                 let lane = price_lane(pct, low_pct, high_pct, step_pct, window);
-                let payload = price_payload(item, pct, price, &date_key, lane.as_ref());
-                out.push(MarketEvent {
+                let payload = price_payload(quote, pct, price, &date_key, lane.as_ref());
+                events.push(MarketEvent {
                     id: lane
                         .as_ref()
                         .map(|lane| lane.event_id(&symbol, &date_key, window))
@@ -171,41 +273,43 @@ fn events_from_quotes_at(
             }
         }
 
-        if let (Some(price), Some(yh)) = (price, year_high) {
-            if yh > 0.0 && price >= yh * (1.0 - near_tol) {
-                out.push(MarketEvent {
-                    id: format!("52h:{symbol}:{date_key}"),
-                    kind: EventKind::Weekly52High,
-                    severity: Severity::Medium,
-                    symbols: vec![symbol.clone()],
-                    occurred_at: quote_time,
-                    title: format!("{symbol} 触及 52 周新高"),
-                    summary: format!("价格 {price:.2} · 年内高 {yh:.2}"),
-                    url: None,
-                    source: "fmp.quote".into(),
-                    payload: item.clone(),
-                });
-            }
+        if let (Some(price), Some(year_high_price)) = (price, year_high)
+            && year_high_price > 0.0
+            && price >= year_high_price * (1.0 - near_tol)
+        {
+            events.push(MarketEvent {
+                id: format!("52h:{symbol}:{date_key}"),
+                kind: EventKind::Weekly52High,
+                severity: Severity::Medium,
+                symbols: vec![symbol.clone()],
+                occurred_at: quote_time,
+                title: format!("{symbol} 触及 52 周新高"),
+                summary: format!("价格 {price:.2} · 年内高 {year_high_price:.2}"),
+                url: None,
+                source: "fmp.quote".into(),
+                payload: quote.clone(),
+            });
         }
-        if let (Some(price), Some(yl)) = (price, year_low) {
-            if yl > 0.0 && price <= yl * (1.0 + near_tol) {
-                out.push(MarketEvent {
-                    id: format!("52l:{symbol}:{date_key}"),
-                    kind: EventKind::Weekly52Low,
-                    severity: Severity::Medium,
-                    symbols: vec![symbol.clone()],
-                    occurred_at: quote_time,
-                    title: format!("{symbol} 触及 52 周新低"),
-                    summary: format!("价格 {price:.2} · 年内低 {yl:.2}"),
-                    url: None,
-                    source: "fmp.quote".into(),
-                    payload: item.clone(),
-                });
-            }
+        if let (Some(price), Some(year_low_price)) = (price, year_low)
+            && year_low_price > 0.0
+            && price <= year_low_price * (1.0 + near_tol)
+        {
+            events.push(MarketEvent {
+                id: format!("52l:{symbol}:{date_key}"),
+                kind: EventKind::Weekly52Low,
+                severity: Severity::Medium,
+                symbols: vec![symbol.clone()],
+                occurred_at: quote_time,
+                title: format!("{symbol} 触及 52 周新低"),
+                summary: format!("价格 {price:.2} · 年内低 {year_low_price:.2}"),
+                url: None,
+                source: "fmp.quote".into(),
+                payload: quote.clone(),
+            });
         }
     }
 
-    out
+    events
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,8 +334,11 @@ impl PriceWindow {
     }
 }
 
-fn quote_time_and_window(item: &Value, now: DateTime<Utc>) -> Option<(DateTime<Utc>, PriceWindow)> {
-    let Some(quote_time) = item
+fn quote_time_and_window(
+    quote: &Value,
+    now: DateTime<Utc>,
+) -> Option<(DateTime<Utc>, PriceWindow)> {
+    let Some(quote_time) = quote
         .get("timestamp")
         .and_then(|v| v.as_i64())
         .and_then(|ts| Utc.timestamp_opt(ts, 0).single())
@@ -260,7 +367,7 @@ fn closing_move_severity(abs_pct: f64, high_pct: f64) -> Severity {
     if abs_pct >= high_pct {
         Severity::High
     } else {
-        Severity::Low
+        Severity::Medium
     }
 }
 
@@ -327,13 +434,13 @@ fn sanitize_realert_step_pct(step_pct: f64) -> f64 {
 }
 
 fn price_payload(
-    item: &Value,
+    quote: &Value,
     pct: f64,
     price: Option<f64>,
     date_key: &str,
     lane: Option<&PriceLane>,
 ) -> Value {
-    let mut payload = item.clone();
+    let mut payload = quote.clone();
     let Some(obj) = payload.as_object_mut() else {
         return payload;
     };
@@ -496,12 +603,12 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.kind, EventKind::Weekly52High))
         );
-        let hi = events
+        let year_high_event = events
             .iter()
             .find(|e| matches!(e.kind, EventKind::Weekly52High))
             .unwrap();
-        assert_eq!(hi.severity, Severity::Medium);
-        assert!(hi.id.starts_with("52h:NVDA:"));
+        assert_eq!(year_high_event.severity, Severity::Medium);
+        assert!(year_high_event.id.starts_with("52h:NVDA:"));
     }
 
     #[test]
@@ -511,12 +618,12 @@ mod tests {
              "yearHigh": 200.0, "yearLow": 50.0}
         ]);
         let events = events_from_quotes(&raw, 5.0, 10.0, 0.001);
-        let lo = events
+        let year_low_event = events
             .iter()
             .find(|e| matches!(e.kind, EventKind::Weekly52Low))
             .unwrap();
-        assert_eq!(lo.severity, Severity::Medium);
-        assert!(lo.id.starts_with("52l:BOO:"));
+        assert_eq!(year_low_event.severity, Severity::Medium);
+        assert!(year_low_event.id.starts_with("52l:BOO:"));
     }
 
     #[test]
@@ -631,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn close_quote_below_high_pct_remains_low_severity() {
+    fn close_quote_below_high_pct_is_medium_digest_signal() {
         let close_time = Utc.with_ymd_and_hms(2026, 4, 22, 20, 0, 1).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 4, 23, 0, 2, 42).unwrap();
         let raw = serde_json::json!([
@@ -644,7 +751,7 @@ mod tests {
             .find(|e| matches!(e.kind, EventKind::PriceAlert { .. }))
             .unwrap();
         assert_eq!(price.id, "price_close:AMD:2026-04-22");
-        assert_eq!(price.severity, Severity::Low);
+        assert_eq!(price.severity, Severity::Medium);
     }
 
     #[test]
@@ -657,6 +764,81 @@ mod tests {
         ]);
         let events = events_from_quotes_at(&raw, 2.5, 6.0, 2.0, 0.001, now);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn quote_symbol_batches_filter_unsupported_symbols_and_split() {
+        let symbols = vec![
+            "aapl".to_string(),
+            "MSFT".to_string(),
+            "MU 2026-06-18 C 520".to_string(),
+            "0700.HK".to_string(),
+            "RXRX 2026-06-18 C 7/9".to_string(),
+            "BRK-B".to_string(),
+            "AAPL".to_string(),
+            "NVDA".to_string(),
+        ];
+
+        let batches = fmp_quote_symbol_batches(&symbols);
+        assert_eq!(
+            batches,
+            vec![
+                vec![
+                    "AAPL".to_string(),
+                    "MSFT".to_string(),
+                    "0700.HK".to_string()
+                ],
+                vec!["BRK-B".to_string(), "NVDA".to_string()],
+            ]
+        );
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.len() <= FMP_QUOTE_BATCH_SIZE)
+        );
+        assert!(
+            batches
+                .iter()
+                .flatten()
+                .all(|symbol| is_fmp_quote_symbol(symbol))
+        );
+    }
+
+    #[test]
+    fn quote_batch_collection_keeps_successful_batches_when_one_fails() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 22, 13, 32, 40).unwrap();
+        let raw = serde_json::json!([
+            {"symbol": "AAPL", "price": 200.0, "changesPercentage": 7.0,
+             "timestamp": now.timestamp(), "yearHigh": 250.0, "yearLow": 150.0}
+        ]);
+
+        let events = collect_quote_batch_events(
+            vec![Ok(raw), Err(anyhow::anyhow!("batch timeout"))],
+            5.0,
+            10.0,
+            2.0,
+            0.001,
+            now,
+        )
+        .expect("partial batch success should return events");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].symbols, vec!["AAPL".to_string()]);
+    }
+
+    #[test]
+    fn quote_batch_collection_fails_when_all_batches_fail() {
+        let err = collect_quote_batch_events(
+            vec![Err(anyhow::anyhow!("batch timeout"))],
+            5.0,
+            10.0,
+            2.0,
+            0.001,
+            Utc::now(),
+        )
+        .expect_err("all failed batches should fail the poller tick");
+
+        assert!(err.to_string().contains("batch timeout"));
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 # Hone Wiki
 
-Last updated: 2026-04-26
+Last updated: 2026-05-11
 
 This page is the practical wiki entry for Honeclaw. It explains the repository layout, the main runtime pieces, and the common ways to install, configure, start, stop, and verify the project.
 
@@ -51,7 +51,7 @@ Top-level layout:
 | `Cargo.toml` | Rust workspace manifest. |
 | `package.json` | Bun workspace scripts for Web and desktop frontend flows. |
 | `config.example.yaml` | Canonical example config. Copy to `config.yaml` for source runs. |
-| `launch.sh` | Source checkout launcher for backend, Web, desktop, and release-desktop modes. |
+| `launch.sh` | Compatibility shim that points to the CLI startup path. Source checkout startup goes through `cargo run -p hone-cli -- start --build`. |
 | `crates/` | Shared Rust libraries. |
 | `bins/` | Runnable Rust binaries. |
 | `agents/` | Agent adapters and runner implementations. |
@@ -109,7 +109,7 @@ Source checkout defaults:
 | `data/` | Runtime data root. |
 | `data/runtime/effective-config.yaml` | Generated runtime config snapshot for spawned processes. |
 | `data/runtime/logs/` | Runtime log files. |
-| `data/runtime/*.pid` | Launcher pid files. |
+| `data/runtime/*.pid` | Runtime supervisor pid files. |
 | `data/runtime/locks/` | Process lock files. |
 | `data/sessions.sqlite3` | SQLite session runtime store when enabled. |
 | `agent-sandboxes/` | Actor-scoped workspaces and company profile docs. |
@@ -119,11 +119,12 @@ Installed release defaults:
 | Path | Purpose |
 | --- | --- |
 | `~/.honeclaw/current` | Active release bundle symlink. |
-| `~/.honeclaw/config.yaml` | User config. |
+| `~/.honeclaw/config.yaml` | Canonical user config. |
 | `~/.honeclaw/data` | Runtime data. |
 | `~/.honeclaw/data/runtime/effective-config.yaml` | Generated runtime config. |
 | `~/.honeclaw/current/share/honeclaw/skills` | Bundled skills. |
-| `~/.honeclaw/current/share/honeclaw/web` | Bundled Web assets. |
+| `~/.honeclaw/current/share/honeclaw/web` | Bundled admin Web assets. |
+| `~/.honeclaw/current/share/honeclaw/web-public` | Bundled public/user Web assets. |
 
 ## Prerequisites
 
@@ -184,40 +185,47 @@ cp config.example.yaml config.yaml
 bun install
 ```
 
-Start backend and enabled channel listeners only:
+Build the local CLI/runtime binaries and start backend plus enabled channel listeners:
 
 ```bash
-./launch.sh
+cargo run -p hone-cli -- start --build
 ```
 
-Start backend, enabled channels, and both admin/public Vite frontends:
+Start admin/public Vite frontends through the CLI wrapper after the backend is ready:
 
 ```bash
-./launch.sh --web
+cargo run -p hone-cli -- web admin-ui --dev
+cargo run -p hone-cli -- web user-ui --dev
 ```
 
-Start desktop development mode where the desktop owns bundled backend/channel sidecars:
+The direct Bun scripts remain available for frontend-only work: `bun run dev:web` and `bun run dev:web:public`.
+
+For the full source Web startup checklist and macOS Rollup/Node signing pitfall, see [`docs/runbooks/source-web-startup.md`](./runbooks/source-web-startup.md).
+
+Desktop development uses explicit Tauri commands:
 
 ```bash
-./launch.sh --desktop
+bun run tauri:prep:dev -- --skip-dev-command
+bunx tauri dev --config bins/hone-desktop/tauri.generated.conf.json
 ```
 
-Start backend/channels outside the desktop host, then launch desktop in remote mode:
+For desktop work against an already running CLI backend, prepare only the shell side and then run Tauri:
 
 ```bash
-./launch.sh --desktop --remote
+bun run tauri:prep:dev -- --skip-dev-command --shell-only
+bunx tauri dev --config bins/hone-desktop/tauri.generated.conf.json
 ```
 
-Start release desktop mode without Tauri dev hot reload:
+Build release desktop assets directly when needed:
 
 ```bash
-./launch.sh --release
+bun run build:desktop
 ```
 
-Stop launcher-managed processes:
+Stop a foreground source runtime:
 
 ```bash
-./launch.sh stop
+Ctrl-C
 ```
 
 ## Desktop Startup Modes
@@ -226,25 +234,26 @@ Use the mode that matches what you are testing:
 
 | Command | Best For | What It Starts |
 | --- | --- | --- |
-| `./launch.sh --desktop` | Bundled desktop integration checks. | Vite + Tauri dev; desktop starts embedded backend and enabled channels. |
-| `./launch.sh --desktop --remote` | Daily desktop UI work while keeping backend/channels stable. | Backend + channels + Vite + Tauri dev connected to remote backend config. |
-| `./launch.sh --release` | Long-running desktop verification without Rust hot reload. | Builds release desktop assets and runs the release desktop binary. |
+| `bun run tauri:prep:dev -- --skip-dev-command` + `bunx tauri dev --config bins/hone-desktop/tauri.generated.conf.json` | Bundled desktop integration checks. | Vite + Tauri dev; desktop starts embedded backend and enabled channels. |
+| `bun run tauri:prep:dev -- --skip-dev-command --shell-only` + Tauri dev | Daily desktop UI work while keeping backend/channels stable. | Tauri dev shell connected to an existing CLI-started backend. |
+| `bun run build:desktop` | Long-running desktop verification / packaging prep. | Builds release desktop assets and bundled sidecars. |
 
-For daily development, prefer `--desktop --remote` when backend/channel processes should not restart on every desktop shell rebuild. Use `--desktop` when validating bundled sidecar startup, process locks, and desktop-managed runtime behavior.
+For daily development, keep `cargo run -p hone-cli -- start --build` running in one terminal and use Tauri dev in another when backend/channel processes should not restart on every desktop shell rebuild.
 
 ## Web Startup Modes
 
 | Command | Best For |
 | --- | --- |
-| `./launch.sh` | Runtime-only backend/channel smoke. |
-| `./launch.sh --web` | Browser UI development against local backend/channels. |
+| `cargo run -p hone-cli -- start --build` | Runtime-only backend/channel smoke from source. |
+| `cargo run -p hone-cli -- web admin-ui --dev` | CLI-managed admin Vite frontend when backend is already running. |
+| `cargo run -p hone-cli -- web user-ui --dev` | CLI-managed public/user Vite frontend when public backend is already running. |
 | `bun run dev:web` | Frontend-only admin UI work when backend is already running. |
 | `bun run dev:web:public` | Frontend-only public chat UI work when public backend is already running. |
 | `bun run build:web` | Build admin Web assets. |
 | `bun run build:web:public` | Build public Web assets. |
 | `bun run build:web:desktop` | Build desktop Web assets with relative asset paths. |
 
-`./launch.sh --web` starts both the admin and public Vite servers after the backend is ready.
+Run the CLI backend and Vite frontends as separate foreground processes.
 
 ## Configuration
 
@@ -267,6 +276,7 @@ hone-cli doctor
 hone-cli onboard
 hone-cli configure --section agent --section channels --section providers
 hone-cli config get agent.runner
+hone-cli config set agent.hone_cloud.api_key "<api-key>"
 hone-cli config set agent.runner opencode_acp
 hone-cli models set --runner opencode_acp --model openrouter/openai/gpt-5.4 --variant medium
 ```
@@ -275,28 +285,36 @@ Important config areas:
 
 - `agent.*`: runner choice, model routing, timeout behavior.
 - `llm.*`: provider keys and OpenAI-compatible/OpenRouter routes.
-- `channels.*`: Feishu, Discord, Telegram, and iMessage enablement and credentials.
-- `web.*`: admin/public ports and host behavior.
-- `storage.*`: JSON/SQLite session backend and data paths.
-- `scheduler.*`: scheduled task and heartbeat behavior.
+- `imessage.*`, `feishu.*`, `telegram.*`, `discord.*`: channel enablement, credentials, allowlists, and chat scope.
+- `web.*`: Web console auth token and workflow/research integration settings.
+- `storage.*`: session data paths and backend selection, especially `sessions_dir`, `session_sqlite_db_path`, `session_sqlite_shadow_write_enabled`, and `session_runtime_backend`.
+- `admins.*`: channel admin identities and runtime admin registration passphrase.
 - `event_engine.*`: market/news event monitoring and delivery.
+- `logging.*`: runtime log level, file output, console output, and optional UDP sink.
+- `security.*`: actor isolation and tool-guard policy.
+- `nano_banana.*`: OpenRouter-backed image generation defaults.
 - `search.*`, `fmp.*`: external data/search providers.
+- `language`: UI / CLI display language (`zh` or `en`).
+
+Admin/public Web ports are runtime environment settings, primarily `HONE_WEB_PORT` and `HONE_PUBLIC_WEB_PORT`, rather than `config.yaml` keys.
+Public SMS login and optional Aliyun Captcha are also runtime environment settings; use `config.example.yaml` and `docs/runbooks/backend-deployment.md` as the reference for `ALIBABA_CLOUD_*`, `HONE_ALIYUN_SMS_*`, `HONE_ALIYUN_CAPTCHA_*`, and `HONE_PUBLIC_SECURE_COOKIE`.
 
 Never commit local secrets in `config.yaml`.
 
 ## Model And Runner Setup
 
-Hone can use local CLI/ACP runners or OpenAI-compatible cloud APIs.
+Hone can use Hone Cloud, local CLI/ACP runners, or OpenAI-compatible cloud APIs.
 
 Common runner choices:
 
 | Runner | Use When |
 | --- | --- |
+| `hone_cloud` | You want the default hosted Hone service from `config.example.yaml`; set `agent.hone_cloud.api_key` before starting. |
 | `opencode_acp` | You want Hone to inherit local OpenCode provider/model config. |
 | `codex_acp` | You use Codex ACP and want ACP session integration. |
 | `codex_cli` | You use Codex CLI directly. |
 | `function_calling` | You want the built-in OpenAI-compatible function-calling path. |
-| `multi-agent` | You want separate search and answer stages. |
+| `multi-agent` | You want separate search and OpenCode ACP answer stages; search keys come from `agent.multi_agent.search.api_key` or legacy `llm.auxiliary.api_key`, while answer keys can inherit `llm.providers.openrouter`. |
 
 Typical OpenCode setup:
 
@@ -312,7 +330,7 @@ Typical model override:
 hone-cli models set --runner opencode_acp --model openrouter/openai/gpt-5.4 --variant medium
 ```
 
-If using cloud APIs, configure keys through `hone-cli onboard`, `hone-cli configure`, or direct config edits.
+If using Hone Cloud, keep `agent.runner=hone_cloud` and set `agent.hone_cloud.api_key`. If using other cloud APIs, configure keys through `hone-cli onboard`, `hone-cli configure`, or direct config edits.
 
 ## Channel Setup
 
@@ -348,18 +366,12 @@ Defaults in source checkout:
 Override ports with environment variables:
 
 ```bash
-HONE_WEB_PORT=8078 HONE_PUBLIC_WEB_PORT=8089 ./launch.sh --web
+HONE_WEB_PORT=8078 HONE_PUBLIC_WEB_PORT=8089 cargo run -p hone-cli -- start --build
 ```
 
 ## Stop, Restart, And Cleanup
 
-Stop processes started by `launch.sh`:
-
-```bash
-./launch.sh stop
-```
-
-Stop a foreground `hone-cli start`:
+Stop a foreground `hone-cli start` or source runtime:
 
 ```bash
 Ctrl-C
@@ -429,7 +441,7 @@ command -v hone-cli || ls -l ~/.local/bin/hone-cli
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-### `./launch.sh` says `config.yaml` is missing
+### Source startup says `config.yaml` is missing
 
 ```bash
 cp config.example.yaml config.yaml
@@ -447,15 +459,19 @@ exec "$SHELL" -l
 bun install
 ```
 
-### Port already occupied
+### Vite fails with Rollup native addon code-signing errors on macOS
 
-Try the managed stop first:
+If `bun run dev:web` fails with `@rollup/rollup-darwin-arm64`, `ERR_DLOPEN_FAILED`, or a Team ID code-signing mismatch, make sure Homebrew Node comes before app-bundled Node in `PATH`:
 
 ```bash
-./launch.sh stop
+env PATH=/opt/homebrew/bin:$HOME/.bun/bin:$PATH cargo run -p hone-cli -- web admin-ui --dev
 ```
 
-If a process is still holding a port, inspect it:
+See the detailed source Web startup runbook: [`docs/runbooks/source-web-startup.md`](./runbooks/source-web-startup.md).
+
+### Port already occupied
+
+Inspect the process holding the port before stopping it:
 
 ```bash
 lsof -nP -iTCP:8077 -sTCP:LISTEN
@@ -475,6 +491,7 @@ For installed release, reinstall the latest bundle and confirm:
 
 ```bash
 ls ~/.honeclaw/current/share/honeclaw/web/index.html
+ls ~/.honeclaw/current/share/honeclaw/web-public/index.html
 ```
 
 ### A channel exits during startup
@@ -494,13 +511,14 @@ For source desktop release mode, rebuild desktop Web assets with the desktop-spe
 
 ```bash
 bun run build:web:desktop
-./launch.sh --release
+bun run build:desktop
 ```
 
 For desktop dev, prefer:
 
 ```bash
-./launch.sh --desktop --remote
+bun run tauri:prep:dev -- --skip-dev-command --shell-only
+bunx tauri dev --config bins/hone-desktop/tauri.generated.conf.json
 ```
 
 ## Contributor Reading Map

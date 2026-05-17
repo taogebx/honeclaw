@@ -3,7 +3,470 @@
 - **发现时间**: 2026-04-22 07:00 CST
 - **Bug Type**: Business Error
 - **严重等级**: P2
-- **状态**: Later
+- **状态**: Fixed
+
+## 修复记录（2026-05-15 08:07 CST）
+
+- 复核当前 HEAD 后确认：普通 scheduler 路径已经会在成功输出送达前调用 `guard_commodity_causality_for_event(...)`，并在命中时写入 `commodity_causality_guarded=true`、`raw_preview`、`guarded_preview`、`deliver_preview` 元数据；`detail_json.scheduler=null` 的最新样本按当前机器旧 / 非生产运行态证据处理，不再推翻代码层修复。
+- 本轮补充精确回归 `commodity_guard_covers_oil_scheduler_contract_months_and_tail_risk_claim`，覆盖 2026-05-15 04:02 复发文本里的 `Brent Jul 2026 约 106.30 美元`、`WTI Jun 2026 约 101.80 美元`、科技股尾盘防守信号与通胀 / 利率风险判断。当前 guard 会改写为安全说明，并移除原文价格和未核验因果判断。
+- 验证：
+  - `cargo test -p hone-channels commodity_guard_covers_oil_scheduler_contract_months_and_tail_risk_claim --lib -- --nocapture`
+  - `cargo test -p hone-channels commodity_ --lib -- --nocapture`
+  - `cargo check -p hone-channels --tests`
+  - `rustfmt --edition 2024 --config skip_children=true --check crates/hone-channels/src/scheduler.rs`
+- 关联 GitHub Issue：无。
+
+## 最新进展（2026-05-15 07:02 CST）
+
+- 本轮巡检把本单从 `Fixed` 调回 `New`：最近四小时真实窗口中，普通 scheduler `Oil_Price_Monitor_Closing` 再次成功外发具体 WTI / Brent 价格和科技股尾盘影响判断，且台账没有商品 guard 或同窗来源审计元数据。
+- `data/sessions.sqlite3` -> `cron_job_runs`
+  - `run_id=21406`
+  - `job_name=Oil_Price_Monitor_Closing`
+  - `executed_at=2026-05-15T04:02:12.046149+08:00`
+  - `execution_status=completed`
+  - `message_send_status=sent`
+  - `delivered=1`
+  - `detail_json={"delivery_key":"j_355ba2f1:2026-05-15:04:00","receive_id":"...","scheduler":null}`
+  - `response_preview` 向用户发送 `Brent Jul 2026 约 106.30 美元`、`WTI Jun 2026 约 101.80 美元`，并进一步判断“这对今晚高估值科技股不是尾盘强防守信号；油价仍是通胀与利率风险项，但从盘面看，QQQ、RKLB、COHR 没有被油价持续压住”。
+- 结论：这是同一“原油普通 scheduler 外发未核验价格 / 因果口径”的持续复发，不新建重复文档。该问题已经成功送达用户侧，并直接影响油价、通胀和科技股风险判断，因此维持功能性质量缺陷 `P2 / New`。
+
+## 修复记录（2026-05-14 20:06 CST）
+
+- 本轮把商品归因 guard 从 heartbeat 专用扩展为普通 scheduler / heartbeat 共享：
+  - `scheduler_event_is_commodity_related(...)` 不再要求 `event.heartbeat=true`，因此 `Oil_Price_Monitor_Closing` 这类普通原油 scheduler 会被同一出站边界拦截。
+  - 普通 scheduler 成功输出在最终 `ScheduledTaskExecution` 前调用 `guard_commodity_causality_for_event(...)`；命中后会发送安全说明，并在 `metadata` 写入 `commodity_causality_guarded=true`、`raw_preview`、`guarded_preview`、`deliver_preview`，避免再次出现 `detail_json.scheduler=null` 且无法审计的坏播报。
+  - 对任务名不含原油但正文含 WTI / Brent / 油价 / 能源通胀归因的普通 scheduler，也会基于输出内容触发 guard，覆盖 `OWALERT_PostMarket` 复发形态。
+  - 未核验近似报价识别补齐 `WTI 约 101.02 美元` 这类不带 `$` 的写法；能源通胀压力 / 风险偏好修复等油价因果表述纳入高风险归因触发词。
+- 新增回归：
+  - `commodity_guard_covers_non_heartbeat_oil_scheduler`
+  - `commodity_guard_covers_non_heartbeat_market_scheduler_output`
+- 验证：
+  - `rustfmt --edition 2024 --config skip_children=true --check crates/hone-channels/src/scheduler.rs`
+  - `cargo test -p hone-channels commodity_ --lib -- --nocapture`
+  - `cargo test -p hone-channels heartbeat_ --lib -- --nocapture`
+- 关联 GitHub Issue：无。
+- 未验证项：本轮不重启 live 服务，也不使用当前机器线上运行态作为修复判定；状态先记 `Fixed`，待正常部署 / 重启后再通过真实普通 scheduler 窗口复核是否可关闭。
+
+## 最新进展（2026-05-14 07:06 CST）
+
+- 本轮巡检把本单从 `Closed` 调回 `New`：`2026-05-13 15:04 CST` 关闭结论只证明 `全天原油价格3小时播报` heartbeat guard 在 live 生效，但最近四小时内同类原油普通 scheduler 又成功外发无法从台账证明的价格口径与盘面归因，且 `detail_json.scheduler=null`，说明普通 scheduler 路径没有同等 guard / 审计元数据。
+- `data/sessions.sqlite3` -> `cron_job_runs`
+  - `run_id=20251`
+  - `job_name=Oil_Price_Monitor_Closing`
+  - `executed_at=2026-05-14T04:01:16.603792+08:00`
+  - `execution_status=completed`
+  - `message_send_status=sent`
+  - `delivered=1`
+  - `detail_json={"delivery_key":"j_355ba2f1:2026-05-14:04:00","receive_id":"...","scheduler":null}`
+  - `response_preview` 向用户发送 `WTI 约 101.02 美元`、`Brent 约 105.63 美元`、`WSJ 今日结算口径`，并把油价回落组织成“对今晚科技股不是压制项，反而是边际缓和；尾盘是否防守主要看 QQQ/COHR/RKLB 自身承接”的确定性判断。
+- `data/sessions.sqlite3` -> `cron_job_runs`
+  - `run_id=20275`
+  - `job_name=OWALERT_PostMarket`
+  - `executed_at=2026-05-14T04:33:09.396235+08:00`
+  - `execution_status=completed`
+  - `message_send_status=sent`
+  - `delivered=1`
+  - `detail_json.scheduler=null`
+  - `response_preview` 继续复用同一油价口径：`USO 收盘附近 142.07`、`WTI 跌 1.1% 至 101.02 美元`、`Brent 跌 2.0% 至 105.63 美元`，并将“能源通胀压力边际缓和”写成 AI 风险偏好修复的核心解释之一。
+- 最近四小时同名 `全天原油价格3小时播报` heartbeat 本身主要为 `noop` 或因 `mimo-v2.5-pro` `Param Incorrect` 失败，没有新增 heartbeat 原油坏播报；本轮复发点是非 heartbeat / 普通 scheduler 的原油收盘与盘后扫描路径。
+- 结论：这是同一“原油定时播报外发未核验价格 / 因果口径”的影响范围扩展，不新建重复文档。该问题会影响用户对油价、科技股尾盘防守与次日交易框架的判断，因此仍按功能性质量缺陷 `P2 / New` 跟踪。
+
+## live 关闭复核（2026-05-13 15:04 CST）
+
+- 本轮确认 `2026-05-13 10:22 CST` runtime 重启后，商品 heartbeat guard 已在 live 生效，本单从 `Fixed` 更新为 `Closed`。
+- `data/sessions.sqlite3` -> `cron_job_runs`
+  - `run_id=19814`
+  - `job_name=全天原油价格3小时播报`
+  - `executed_at=2026-05-13T12:00:38.857534+08:00`
+  - `execution_status=completed`
+  - `message_send_status=sent`
+  - `delivered=1`
+  - `detail_json.scheduler.commodity_causality_guarded=true`
+  - `raw_preview` 仍包含 WTI / Brent 价格与霍尔木兹、美伊紧张等未核验归因。
+  - `deliver_preview` / `response_preview` 已被改写为安全说明：本轮包含未完成同窗来源核验的原因归因，已移除原正文中的宏观、地缘、供需、库存等主因叙述，且未保留原正文中的价格或归因句。
+- `data/sessions.sqlite3` -> `cron_job_runs`
+  - `run_id=19875`
+  - `executed_at=2026-05-13T15:01:35.010128+08:00`
+  - 同一安全说明被 `duplicate_suppressed=true` 压成 `noop + skipped_noop`，没有新增用户可见坏播报。
+- 最近四小时同名原油 heartbeat 只有正常 `noop`、一次 guard 后安全送达和一次安全说明去重；未再看到未核验价格 / 地缘归因直接外发。因此本单关闭。后续若部署后重新出现未核验油价或地缘主因直接送达，应在本单追加复发证据并重新打开。
+
+## 修复记录（2026-05-12 19:12 CST）
+
+- `crates/hone-channels/src/scheduler.rs` 继续加固原油 / 大宗商品 heartbeat guard：
+  - 高风险归因识别补充 `冲突`、`紧张`、`战略储备`、`石油储备`、`沙特`、`阿美`、`警告` 等复发措辞，覆盖 `战争紧张 / 霍尔木兹 / 沙特阿美 CEO 警告 / 美国战略储备` 组合。
+  - 未核验价格识别补充 `约$`、`约为$`、`约每桶` 等近似报价写法；这类价格不再被当作可保留的“已核验价格口径”。
+  - 当正文包含未核验归因或市场口径时，guard 只保留明确写出“本轮工具 / 同窗来源 / 同窗核验 / 已核验 / 交易所 / 官方报价”等来源核验语义的价格句；否则只发送安全说明，避免把模型生成的 WTI/Brent 价格继续包装成可用报价。
+- 新增回归：`commodity_heartbeat_guard_rewrites_unverified_price_and_war_claims`。
+- 验证：
+  - `rustfmt --edition 2024 --check crates/hone-channels/src/scheduler.rs`
+  - `cargo test -p hone-channels commodity_heartbeat_ --lib -- --nocapture`
+  - `cargo test -p hone-channels heartbeat_ --lib -- --nocapture`
+  - `cargo check -p hone-channels --tests`
+- 关联 GitHub Issue：无。
+
+## 旧运行态复核（2026-05-13 07:08 CST）
+
+- 本轮巡检在当前机器 live 数据中继续看到同类用户可见坏样本，但仍不足以推翻 `2026-05-12 19:12 CST` 的仓库代码修复结论；当前按旧运行态 / 未确认重启证据补充，不把状态从 `Fixed` 回退为 `New`。
+- `data/sessions.sqlite3` -> `cron_job_runs`
+  - `run_id=19614`
+  - `job_name=Oil_Price_Monitor_Closing`
+  - `executed_at=2026-05-13T04:01:25.195462+08:00`
+  - `execution_status=completed`
+  - `message_send_status=sent`
+  - `delivered=1`
+  - `response_preview` 向用户发送 `Brent 最新可核验约 107.8-107.9 美元`、`WTI 约 102.2 美元`，并把伊朗 / 霍尔木兹风险、油价 + CPI + 利率共同压制高估值科技股、COHR / RKLB 尾盘防守线等组织成确定性判断。
+  - 同条记录没有看到商品 guard 元数据或“未完成同窗来源核验”的安全改写痕迹。
+- 最近四小时同名 `全天原油价格3小时播报` heartbeat 主要因 `mimo-v2.5-pro` `Param Incorrect` 失败或返回 `noop`，没有新增三小时原油 heartbeat 成功坏播报；本次用户可见样本来自同类原油 scheduler 的 `Oil_Price_Monitor_Closing`。
+- 结论：04:01 样本说明 live 运行态仍会把无法从台账证明的价格区间与地缘归因外发为风险判断；但仓库 HEAD 已包含 19:12 CST 的 commodity guard 加固与回归测试。本轮仅补充证据，后续应在重启 / 部署后复核是否消失。
+
+## 修复记录（2026-05-10 23:11 CST）
+
+- `crates/hone-channels/src/scheduler.rs` 将原油 / 大宗商品 heartbeat guard 从“只识别因果归因”扩展到事实口径错误：
+  - 检测显式日期与中文星期不一致，例如 `2026-05-10 周六`。
+  - 检测 Bloomberg / Reuters / WSJ / EIA 等外部来源口径、累计涨跌、近一个月表现、估算 / 推算 / 预测 / 未核验价格等无法由当前出站层证明同窗核验的片段。
+  - 这类片段不会再作为 `【已保留的价格口径】` 原样保留；guard 会改写为“未完成同窗来源核验”的安全说明。
+- 新增回归：`commodity_heartbeat_guard_rewrites_wrong_weekday_and_unverified_prices`。
+- 验证：
+  - `cargo test -p hone-channels commodity_heartbeat_ --lib -- --nocapture`
+  - `cargo test -p hone-channels heartbeat_ --lib -- --nocapture`
+  - `cargo check -p hone-channels --tests`
+  - `rustfmt --edition 2024 --config skip_children=true --check crates/hone-channels/src/scheduler.rs memory/src/session.rs`
+- 关联 GitHub Issue：无。
+
+## 旧运行态复核（2026-05-12 23:03 CST）
+
+- 本轮巡检在当前机器 live 数据中继续看到同类坏样本，但仍不足以推翻 `2026-05-12 19:12 CST` 的仓库代码修复结论。最近四小时内同名 `全天原油价格3小时播报` 没有新增已送达坏播报，但相关原油 scheduler 仍成功外发未核验价格区间与地缘归因：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=19471`
+    - `job_name=Oil_Price_Monitor_Premarket`
+    - `executed_at=2026-05-12T21:31:21.956860+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `response_preview` 向用户发送 `Brent 约 105-108 美元`、`WTI 约 98-102 美元`，并把中东 / 伊朗局势、霍尔木兹风险写成油价支撑和高估值科技股压力来源。
+    - `detail_json` 只有 `delivery_key`、`receive_id` 与 `scheduler:null`，未见可审计同窗来源字段，也未见商品 guard 元数据。
+    - `run_id=19499`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-05-12T23:00:09.831204+08:00`
+    - `execution_status=noop`
+    - `message_send_status=skipped_noop`
+    - `delivered=0`
+    - `detail_json.parse_kind=JsonNoop`，没有新增用户可见三小时播报。
+- 结论：21:31 样本说明当前机器运行态仍会把无法从台账证明的价格区间和地缘归因组织成确定性风险判断并发送；但仓库代码已在 19:12 CST 针对战争紧张、霍尔木兹、沙特阿美、战略储备与未核验近似报价补 guard 和回归测试。本轮仅作为旧运行态 / 未确认重启证据补充到原文档，不把状态从 `Fixed` 回退为 `New`。
+
+## 最新进展（2026-05-12 19:03 CST）
+
+- 本轮巡检继续保持本单 `P2 / New`，但最近四小时内没有新增已送达的原油坏播报；最新模型坏输出被 preview 去重压成未发送：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=19371`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-05-12T18:01:25.543984+08:00`
+    - `execution_status=noop`
+    - `message_send_status=skipped_noop`
+    - `delivered=0`
+    - `detail_json.parse_kind=JsonTriggered`
+    - `detail_json.duplicate_suppressed=true`
+    - `suppressed_preview` 仍生成 `WTI原油（CLM26）约$100.98/桶`、`布伦特原油（CBK26）约$108.35/桶`，并继续把霍尔木兹封锁风险、美伊紧张局势写成油价驱动。
+    - `matched_preview` 指向 `2026-05-12 15:00` 已送达的同类原油播报。
+  - `data/runtime/logs/sidecar.log`
+    - `2026-05-12 18:01:25.543 CST` 记录同一任务 `duplicate_suppressed`，没有进入 Feishu send。
+- 结论：18:01 样本证明模型侧仍会生成同类未核验归因正文，但它没有实际送达用户；因此本轮不新增严重等级变化，不把该样本单独作为新的缺陷根因。当前活跃依据仍是 15:00 CST 已成功外发、且未见 `commodity_causality_guarded` 的坏播报。
+
+## 最新进展（2026-05-12 15:03 CST）
+
+- 本轮巡检把本单从 `Fixed` 回退为 `New`：最近四小时真实窗口中，`全天原油价格3小时播报` 再次成功送达未核验或高风险归因正文，且未见商品 heartbeat guard 元数据。
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=19314`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-05-12T15:01:07.295257+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `detail_json.scheduler.parse_kind=JsonTriggered`
+    - `response_preview` / `deliver_preview` 继续发送 `WTI原油约$99.02/桶`、`布伦特原油约$105.27/桶`，并把战争紧张、霍尔木兹海峡、沙特阿美 CEO 警告、美国战略储备贷款等写成价格上涨原因。
+    - 同条 `detail_json.scheduler` 未见 `commodity_causality_guarded=true` 或重写后的安全说明。
+  - `data/runtime/logs/sidecar.log`
+    - `2026-05-12 15:01:04.495-15:01:04.496 CST` 记录同一任务 `parse_kind=JsonTriggered` 后直接 `deliver`，`deliver_preview` 与用户可见正文一致。
+- 结论：该样本不是单纯格式问题，也不是仅内部日志噪声；它已经成功外发到用户侧，并继续把无法从当前台账证明的价格与地缘/供给归因组织成确定性播报，影响用户对自动播报可信度和风险判断，因此按功能性质量缺陷 `P2 / New` 跟踪。
+
+## 旧运行态复核（2026-05-11 03:02 CST）
+
+- `2026-05-11 07:03 CST` 本轮最近四小时巡检继续看到旧运行态坏样本，但仍不足以推翻仓库代码层面的 `Fixed` 结论：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=18507`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-05-11T06:01:03.587167+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `detail_json.scheduler.parse_kind=JsonTriggered`
+    - `response_preview` / `deliver_preview` 继续发送 `WTI 原油：约 $109.76/桶`、`布伦特原油：约 $100-101/桶`、`WTI 与布伦特价差出现异常倒挂`，并保留霍尔木兹 / 美伊交火、IEA 上调需求、CNBC 油价突破 `$110` 等未核验归因。
+    - 同条 `detail_json.scheduler` 未见 `commodity_causality_guarded=true` 或重写后的安全说明。
+  - `data/runtime/logs/sidecar.log`
+    - `2026-05-11 06:01:01 CST` 同一任务记录 `parse_kind=JsonTriggered` 后直接 `deliver`，`deliver_preview` 保留上述价格和归因正文。
+  - `2026-05-11 06:30` 与 `07:00` 同任务已回到 `noop / skipped_noop`，没有新增原油坏播报送达。
+  - 结论：这仍按当前本机旧运行态 / 未确认重启后的 live 窗口处理；仓库 HEAD 已包含 `1d405f2` 的商品 heartbeat guard 修复，本轮不把状态从 `Fixed` 回退为 `New`。后续若确认部署新代码后仍出现同样 `deliver_preview`，再重新打开。
+
+- 本轮在本机 live 数据中仍看到修复前原油播报坏态延续，且形态从“未触发 guard”变化为“guard 触发后仍保留高风险正文”：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=18350`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-05-11T00:01:15.404631+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `detail_json.scheduler.parse_kind=JsonTriggered`
+    - `detail_json.scheduler.commodity_causality_guarded=true`
+    - `response_preview` 已加 `【归因口径】原因归因未完成同窗来源核验...` 前缀，但后文仍发送 `WTI 原油（CLM26）：约 $96-98/桶`、`布伦特原油：约 $101-103/桶`、`近两周原油价格从4月中旬 $110+ 回落至当前区间`，并继续保留中东及南亚地缘局势、全球经济放缓、汽油期货上涨等归因线索。
+  - 结论：该样本来自当前本机旧运行态 / 未确认重启后的 live 窗口；由于仓库代码已在 `2026-05-10 23:11 CST` 扩展商品 heartbeat guard 覆盖未核验价格、错误日期星期与外部来源口径，本轮不把状态从 `Fixed` 回退为 `New`。后续若部署新代码后仍复现，再重新打开。
+
+## 最新进展（2026-05-10 19:02 CST）
+
+- 本轮缺陷巡检确认原油定时播报质量问题在最近四小时真实窗口仍有用户可见复发，状态从 `Fixed` 回退为 `New`：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=18186`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-05-10T18:02:05.545515+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `detail_json.scheduler.parse_kind=JsonTriggered`
+    - `response_preview` 以 `2026-05-10 周六 18:00 北京时间` 开头，但 2026-05-10 是周日；正文还继续发送 `WTI 原油（近月合约）：约 $95.42/桶（5月8日 Bloomberg 数据）`、`布伦特原油（近月合约）：约 $100.49-$101.29/桶`、`近一个月布伦特累计上涨约4.76%` 等无法从当前台账证明同窗核验的价格 / 背景口径。
+  - 同条 `detail_json.scheduler` 未看到 `commodity_causality_guarded` 或重写后的安全说明，`deliver_preview` 与用户可见正文一致。
+- 结论：这是同一原油 heartbeat 事实/口径质量链路复发，不新建重复文档。该问题不只是表达风格：日期口径错误和未核验价格/背景会影响用户对自动播报的可信度与风险判断，因此继续按功能性质量缺陷 `P2 / New` 跟踪。
+
+## 修复进展（2026-05-10 07:05 CST）
+
+- 本轮修复不再依赖当前机器生产日志或真实 Feishu 投递状态，只基于既有坏样本和本地可测 `hone-channels` heartbeat 出站边界做通用加固。
+- `crates/hone-channels/src/scheduler.rs` 的原油 / 大宗商品 heartbeat guard 从“给原正文加归因提示”改为“重写高风险正文”：
+  - 检测到宏观、地缘、供需、库存、OPEC、航运等原因归因时，不再把原正文原样外发。
+  - guard 会移除原正文中的未核验主因叙述，只保留明显是价格口径、带价格单位、且不含归因/估算/预测/未独立校验的片段。
+  - 如果原文只有估算价格、预测区间、经验贴水或高风险原因叙述，则只发送安全说明，提示本轮未保留原正文中的价格或归因句。
+  - 这覆盖了 2026-05-10 03:03 的复发形态：即使正文已带 `原因归因未完成同窗来源核验` 前缀，只要后文仍包含 `霍尔木兹`、直接军事冲突、累计涨幅或估算收盘价，仍会被重写，不再继续外发原始高风险正文。
+- 新增回归：`commodity_heartbeat_guard_rewrites_prefixed_bad_body` 锁住“已有归因提示但正文仍含未核验高风险叙述”的复发样本。
+- 验证：
+  - `rustfmt --edition 2024 --check crates/hone-channels/src/scheduler.rs bins/hone-desktop/src/commands.rs`
+  - `cargo test -p hone-channels commodity_heartbeat_ --lib -- --nocapture`
+  - `cargo check -p hone-channels --tests`
+
+## 最新进展（2026-05-10 03:03 CST）
+
+- `全天原油价格3小时播报` 在最近四小时真实窗口再次成功送达。虽然当前代码已触发 `commodity_causality_guarded` 并在最终 `response_preview` 前加上归因口径提示，但用户可见正文仍继续保留未经同窗来源核验的地缘 / 供需叙述与高风险价格推算：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=17790`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-05-10T03:01:10.439058+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `response_preview` 以 `【归因口径】原因归因未完成同窗来源核验...不能视为已确认油价主因` 开头，但随后仍向用户发送 `WTI 6月合约...估算收盘约 $95.9/桶（精确收盘价未独立校验）`、`中东霍尔木兹海峡近封锁状态持续推高地缘风险溢价`、`5月5日中东直接军事冲突消息曾令油价单日飙升超6%`、`2026年以来布伦特累计涨幅约 59%-80%` 等未核验叙述。
+  - `data/runtime/logs/sidecar.log`
+    - `2026-05-10 03:01:08.047 CST` 记录同一任务 `parse_kind=JsonTriggered`，随后执行 `deliver`。
+    - `2026-05-10 03:01:08.048 CST` 记录 `commodity_causality_guarded`，说明 guard 识别到了高风险归因，但当前实现只是加提示，没有阻断或改写正文里的未核验原因与价格推算。
+- 结论：`2026-05-08 19:05` 的 guard 加固确实生效了一部分，但仍不足以满足“搜索 / 来源不足时只报已核验价格，未核验原因必须降级或不输出”的端到端预期。当前问题不再是完全没有不确定性提示，而是 guard 后仍把大量未核验地缘事件、供应叙事和估算价格留在最终播报正文中，用户仍可能把这些内容当作可操作线索。严重等级维持 `P2`，状态从 `Fixed` 回退为 `New`。
+
+## 修复进展（2026-05-08 19:05 CST）
+
+- 本轮复核 `2026-05-08 15:00` 最新坏样本后确认，上一轮输出侧 guard 的问题不是执行链路缺失，而是启发式边界过窄：
+  - “美伊在霍尔木兹海峡发生交火事件，推高风险溢价”“供应中断担忧”“关停风险”等写法没有稳定命中 causality trigger。
+  - 泛化的“仅供参考”会被当成原因归因已降级，从而可能让“行情报价仅供参考”误替代“原因归因未核验”。
+- `crates/hone-channels/src/scheduler.rs` 本轮继续沿 commodity heartbeat 公共出站边界加固：
+  - 高风险大宗商品归因识别扩展到 `原因 / 归因 / 推高 / 推升 / 风险溢价 / 担忧 / 供应中断 / 关停风险 / 美伊` 等表达。
+  - 不确定性放行条件改为原因/归因相关口径，例如 `原因未核验`、`归因待确认`、`暂不归因`、`来源不足`、`同窗核验`、`原因仅供参考`；单独的行情级 `仅供参考` 不再跳过原因 guard。
+  - 继续保持非大宗商品 heartbeat 不受影响，已明确标注原因归因待确认的原油播报不重复加前缀。
+- 新增回归覆盖：
+  - 最新同型 `美伊 / 霍尔木兹 / 推高风险溢价 / 供应中断担忧 / 关停风险` 坏样本会被自动加上用户可见归因口径。
+  - “价格为市场参考数据，仅供参考”这类泛化 disclaimer 不会绕过未核验原因归因 guard。
+- 验证：
+  - `rustfmt --edition 2024 --check crates/hone-channels/src/scheduler.rs`
+  - `cargo test -p hone-channels commodity_heartbeat_ --lib -- --nocapture`
+  - `cargo test -p hone-channels heartbeat_prompt_requires_source_grounding_for_geopolitics --lib -- --nocapture`
+  - `cargo check -p hone-channels --tests`
+- 状态更新为 `Fixed`。后续若已部署当前代码后仍出现原油 / WTI / Brent heartbeat 将未核验宏观、地缘、供需或库存原因写成确定性主因，且没有 `commodity_causality_guarded=true` 或原因归因提示，应重新打开并优先核对新的归因措辞是否仍未被识别。
+
+## 最新进展（2026-05-08 15:02 CST）
+
+- `全天原油价格3小时播报` 在最近四小时真实窗口再次成功送达，且正文继续把未核验的地缘 / 供应归因写成确定性事实；这说明 `2026-05-07` 的输出侧 guard 修复结论在 live heartbeat 中再次失效：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=16863`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-05-08T15:00:51.341030+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `response_preview` 直接向用户发送 `WTI 原油：$95.79/桶（前收 $94.81，日内涨幅 +1.03%）`、`布伦特原油：$101.43/桶（前收 $100.06，日内涨幅 +1.37%）`。
+    - 同条正文把 `地缘政治升级：美伊在霍尔木兹海峡发生交火事件，推高风险溢价`、`供应中断担忧：中东约 670 万桶/日产能存在关停风险`、`EIA 数据显示 2026 年 Q1 原油和成品油价格大幅上涨` 写成价格变动原因。
+    - 正文没有看到 `未核验 / 待确认 / 仅供参考 / 同窗来源核验` 等不确定性口径；`detail_json.scheduler` 只有 `parse_kind=JsonTriggered`、`raw_preview`、`deliver_preview` 等字段，未看到 `commodity_causality_guarded=true`。
+  - `data/runtime/logs/sidecar.log`
+    - `2026-05-08 15:00:51.341 CST` 对应 `parse_kind=JsonTriggered` 并成功 deliver，说明这不是中间草稿，而是已外发的最终可见播报。
+- 结论：到 `2026-05-08 15:02` 为止，这条功能性质量缺陷重新进入活跃态；最新样本同时包含具体未核验地缘事件、供应中断规模和价格数字，且缺少 guard 元数据与用户可见不确定性提示。严重等级维持 `P2`，状态从 `Fixed` 回退为 `New`。
+
+## 修复进展（2026-05-07 19:07 CST）
+
+- 本轮不再依赖当前机器旧生产窗口、线上 Feishu 投递或真实市场数据状态判定缺陷活跃性，只基于既有 bug 证据与本地可测代码路径做通用加固。
+- `crates/hone-channels/src/scheduler.rs` 为原油 / WTI / Brent / 大宗商品类 heartbeat 外发正文增加输出侧归因 guard：
+  - 若正文包含宏观、地缘、供需、库存、OPEC、航运、关税等高风险因果归因，并且没有明确写出“未核验 / 待确认 / 仅供参考 / 同窗来源核验”等不确定性口径，会自动在消息前加上“原因归因未完成同窗来源核验”的用户可见提示。
+  - guarded 消息的 metadata 会记录 `commodity_causality_guarded=true` 与 `guarded_preview`，便于后续审计这类降级是否频繁发生。
+  - 已经主动标注“仅供参考 / 需继续确认”等口径的原油播报不会被重复加前缀；非大宗商品 heartbeat 不受影响。
+- 这不是针对某一次 OPEC / 霍尔木兹 / 关税叙述的特判，而是对高风险大宗商品因果归因的通用输出边界：模型若仍要外发这类归因，必须带不确定性提示，不能继续包装成已确认油价主因。
+- 验证：
+  - `cargo test -p hone-channels commodity_heartbeat_ --lib -- --nocapture`
+  - `cargo test -p hone-channels heartbeat_prompt_requires_source_grounding_for_geopolitics --lib -- --nocapture`
+
+## 最新进展（2026-05-04 06:02 CST）
+
+- `全天原油价格3小时播报` 在最近一小时真实窗口再次成功送达，且正文继续把预测口径和未核验价格差写成当前事实：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=15376`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-05-04T06:00:38.652250+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `response_preview` 直接向用户发送：`布伦特原油 (Brent)：约 $108-111/桶（5月1日收盘价 $108.17，5月4日预测区间）`、`WTI 原油：数据未直接获取，通常较 Brent 贴水 $3-5/桶`、`过去一个月 Brent 累计下跌约 0.79%，但同比仍上涨 76%+`。
+    - 这条回复虽然附带“市场参考数据、非实时交易所报价”的提示，但仍把 `5月4日预测区间`、`WTI 通常较 Brent 贴水 $3-5/桶` 这种推断性口径直接写进“最新原油价格”，没有降级成“未核验/仅供参考”，也没有给出同窗可追溯来源。
+- `data/runtime/logs/sidecar.log`
+    - `2026-05-04 06:00:36.245-06:00:36.246` 记录同一任务 `parse_kind=JsonTriggered` 并执行 `deliver`，`deliver_preview` 与 sqlite 中的用户可见正文一致。
+- 结论：到 `2026-05-04 06:02` 为止，这条质量缺陷仍在真实整点播报里活跃；最新 06:00 窗口已从“地缘叙述当事实”进一步漂移到“预测区间/经验贴水当现价事实”，状态维持 `New`、严重等级维持 `P2`。
+
+## 最新进展（2026-05-04 03:02 CST）
+
+- `全天原油价格3小时播报` 在最近一小时真实窗口再次成功送达，且正文继续把未核验的宏观/供给归因写成确定性事实：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=15240`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-05-04T03:01:11.632202+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `detail_json.scheduler.raw_preview` 与 `deliver_preview` 直接向用户发送：`近期变动背景：油价承压主要受OPEC+供应政策不确定性及全球经济增速担忧...`
+    - 同条回复虽然明确承认“美国原油期货市场目前处于休市状态”“以上价格为最新可得数据（上一交易日5月1日收盘价）”，但仍把 `OPEC+供应政策不确定性` 与 `全球经济增速担忧` 组织成确定性主因，没有标注“原因待核验/仅供参考”。
+  - `data/runtime/logs/sidecar.log`
+    - `2026-05-04 03:01:08.335-03:01:08.336` 记录同一任务 `parse_kind=JsonTriggered` 并执行 `deliver`，`deliver_preview` 与 sqlite 中的用户可见正文一致。
+- 结论：到 `2026-05-04 03:02` 为止，这条质量缺陷仍在真实整点播报里活跃；最新 03:00 窗口虽然改写了原因话术，但仍把未经同窗来源核验的宏观/供给叙述包装成确定性油价主因，因此状态维持 `New`、严重等级维持 `P2`。
+
+## 最新进展（2026-05-02 21:03 CST）
+
+- `全天原油价格3小时播报` 在最近一小时真实窗口再次成功送达，且正文继续把未核验的贸易/地缘叙述写成确定性油价主因：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=13881`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-05-02T21:01:28.812662+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `response_preview` 直接向用户发送：`近期变动因素：OPEC+产量决策影响供应预期，同时国际贸易关税政策不确定性持续影响市场情绪与伊朗原油相关供应风险。`
+    - 同条回复虽然补了“数据存在数小时延迟”，但仍把 `国际贸易关税政策不确定性` 与 `伊朗原油相关供应风险` 组织成确定性主因，没有标注“原因待核验/仅供参考”。
+  - `data/runtime/logs/sidecar.log`
+    - `2026-05-02 21:01:25.621-21:01:25.622` 记录同一任务 `parse_kind=JsonTriggered` 并执行 `deliver`，`deliver_preview` 与 sqlite 中的用户可见正文一致。
+- 结论：到 `2026-05-02 21:03` 为止，这条质量缺陷仍在真实整点播报里活跃；最新 21:00 窗口虽然没有继续复用“标普上调油价预期”那套话术，但仍把未核验的贸易/地缘叙述包装成确定性油价归因，因此状态维持 `New`、严重等级维持 `P2`。
+
+## 最新进展（2026-05-02 06:04 CST）
+
+- `全天原油价格3小时播报` 在最近一小时真实窗口再次成功送达，且正文继续把未经核验的机构观点与供需叙事写成确定性事实：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=13202`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-05-02T06:01:11.919294+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `response_preview` 直接向用户发送：`标普最新预测2026年剩余时间原油价格：WTI 95美元/桶、布伦特100美元/桶`，并把 `标普于4月30日上调2026年剩余时间WTI和布伦特原油价格预期各15美元/桶`、`全球石油需求增加且供需趋于不平衡` 组织成确定性主因。
+    - 同条回复没有标注“机构预测口径”与“原因待核验”，而是把供需解释包装成已确认事实；这仍不符合“搜索降级时只报已核验价格、未核验原因必须降级”的预期。
+  - `data/runtime/logs/sidecar.log`
+    - `2026-05-02 06:01:11.919-06:01:11.920` 记录同一任务 `parse_kind=JsonTriggered` 并执行 `deliver`，`deliver_preview` 与 sqlite 中的用户可见正文一致。
+- 结论：到 `2026-05-02 06:04` 为止，这条质量缺陷仍在真实整点播报里活跃；最新 06:00 窗口虽然不再复用“霍尔木兹海峡”叙事，但仍把未经核验的机构预测和供需解释组织成确定性油价主因，因此状态维持 `New`、严重等级维持 `P2`。
+
+## 最新进展（2026-05-02 03:03 CST）
+- `全天原油价格3小时播报` 在最近一小时真实窗口再次成功送达，且正文继续把未核验的宏观/地缘归因写成确定性事实：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=13070`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-05-02T03:00:54.340876+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `response_preview` 直接向用户发送：`近期油价承压，主要因市场对2026年需求前景的担忧——摩根大通预测2026年布伦特均价约60美元/桶，尽管汇丰上调预测至80美元/桶，但整体预期仍偏谨慎。地缘风险（特别是霍尔木兹海峡局势）为价格提供一定支撑，但基本面走弱压力更大。`
+    - 同条回复还把 `布伦特原油约 108.02 美元/桶（5月1日数据），较前一日下跌约2.15%` 与上述主因一起组织成确定性结论，没有标注“原因未核验/暂不归因”。
+  - `data/runtime/logs/sidecar.log`
+    - `2026-05-02 03:00:52.513-03:00:52.514` 记录同一任务 `parse_kind=JsonTriggered` 并执行 `deliver`，`deliver_preview` 与 sqlite 中的用户可见正文一致。
+- 结论：到 `2026-05-02 03:03` 为止，这条质量缺陷仍在真实整点播报里活跃；即使搜索与价格链路继续给出可用片段，最终播报仍把 `2026 年需求前景` 与 `霍尔木兹海峡局势` 组织成确定性因果，没有降级为“已核验价格 + 原因待确认”，因此状态维持 `New`、严重等级维持 `P2`。
+
+## 最新进展（2026-05-02 00:02 CST）
+
+- `全天原油价格3小时播报` 在最近一小时真实窗口再次成功送达，且正文继续把未核验的地缘归因写成确定性事实：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=12935`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-05-02T00:01:22.448715+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `response_preview` 直接向用户发送：`近期变动原因：价格主要受地缘政治紧张局势驱动，特别是霍尔木兹海峡供应风险持续支撑油价。`
+    - 同条回复继续把 `地缘政治因素已超越供需基本面成为主导力量`、`油价此前从极端高位$126回调后，目前在高位区间震荡运行` 包装成确定性叙事，没有降级成“待核验/仅供参考”。
+  - `data/runtime/logs/sidecar.log`
+    - `2026-05-02 00:01:19.115-00:01:19.116` 记录同一任务 `parse_kind=JsonTriggered` 并执行 `deliver`，`deliver_preview` 与 sqlite 中的用户可见正文一致。
+- 结论：到 `2026-05-02 00:02` 为止，这条质量缺陷仍在真实整点播报里活跃；即使 `web_search` 的空成功边界已经加固，原油 heartbeat 仍会在没有可追溯同窗来源的情况下，把霍尔木兹海峡相关叙述写成确定性油价主因，因此状态维持 `New`、严重等级维持 `P2`。
+
+## 修复进展（2026-05-01 19:07 CST）
+
+- `crates/hone-tools/src/web_search.rs` 将 Tavily 未配置 key、全 key 因额度 / 鉴权 / 临时故障不可用时的返回从 `Ok({"status":"unavailable","results":[]})` 改为 `HoneError::Tool(...)`。
+- 这会让 `ToolRegistry` 与 function-calling runner 把搜索降级识别为工具失败，而不是继续记录 `tool_execute_success` 并给后续模型一个看似成功的空搜索证据；错误文案保持脱敏，不包含 Tavily 原始支持邮箱、升级提示或 key 细节。
+- 这不是针对单次 Tavily 波动的特判，而是通用错误边界修复：外部搜索不可用时必须显式失败，原油 / 宏观 / 地缘归因链路不能再把“空成功搜索”当作已核验来源。
+- 验证：
+  - `cargo test -p hone-tools web_search --lib -- --nocapture`
+  - `cargo check -p hone-tools --tests`
+- 状态调整为 `Fixed`。后续若已部署当前代码后仍出现“全 key 不可用但 `web_search` 被记为成功，并据此输出确定性高风险归因”，应重新打开并优先排查是否还有其它搜索工具路径返回空成功。
+
+## 最新进展（2026-05-01 15:18 CST）
+
+- `全天原油价格3小时播报` 在最近一小时真实窗口再次成功送达，且正文继续把未核验的地缘/宏观归因写成确定性事实：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=12509`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-05-01T15:01:09.785404+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `response_preview` 直接向用户发送：`近期变动原因（据 EIA）：2026 年一季度原油及成品油价格大幅攀升，主因 2 月 28 日中东军事行动及后续霍尔木兹海峡实质关闭。`
+    - 同条回复继续把 `Brent 涨幅超过 WTI`、`美国页岩油产量韧性有限` 组织成确定性叙事；正文没有把这些高风险原因降级成“待核验/仅供参考”。
+  - `data/runtime/logs/web.log.2026-05-01`
+    - `2026-05-01 15:01:07.598` 记录同一任务 `parse_kind=JsonTriggered` 并执行 `deliver`，说明这不是中间草稿，而是已外发的最终可见播报。
+- 结论：到 `2026-05-01 15:18` 为止，这条质量缺陷继续活跃；最新整点播报仍把未核验的中东军事行动/霍尔木兹海峡叙述包装成确定性油价主因，因此状态维持 `New`、严重等级维持 `P2`。
+
+## 最新进展（2026-05-01 04:01 CST）
+
+- `Oil_Price_Monitor_Closing` 在最近一小时真实窗口再次成功送达，且正文继续把未核验的地缘/宏观归因写成确定性事实：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=11974`
+    - `job_name=Oil_Price_Monitor_Closing`
+    - `executed_at=2026-05-01T04:01:02.613973+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `response_preview` 直接向用户发送：`结论是：油价今天从中东风险高位回落，未形成尾盘继续压制科技股的主线。`
+    - 同条回复继续把 `CNBC口径显示，Brent在4月30日盘中曾因美伊冲突风险冲至约126美元高位，随后回落至约114.22美元`、`Trading Economics口径显示，WTI相关原油报价约105.74美元，较前一日回落` 组织成“共同结论一致”的确定性叙事，并据此下结论 `科技股风险偏好恢复`；正文没有把这些原因归因降级成“待核验/仅供参考”。
+  - `data/runtime/logs/sidecar.log`
+    - `2026-05-01 04:00:11.651-04:00:12.385` 与 `04:00:40.078-04:00:40.796` 同窗连续记录 Tavily 4 个 key 全部因 `usage limit` / `鉴权被拒绝` 失败，但 `web_search` 仍回写 `tool_execute_success`
+    - `2026-05-01 04:01:00.018` 同一会话仍落成 `step=session.persist_assistant detail=done -> done ... success=true reply.chars=1302`，说明这不是中间草稿，而是已持久化并成功外发的最终可见回复
+- 结论：到 `2026-05-01 04:01` 为止，这条质量缺陷继续活跃；搜索链路在同窗明显降级后，播报正文仍把“中东风险高位回落 -> 科技股风险偏好恢复”包装成确定性结论，因此状态维持 `New`、严重等级维持 `P2`。
+
+## 最新进展（2026-04-30 15:01 CST）
+
+- `全天原油价格3小时播报` 在最近一小时真实窗口再次成功送达，且正文继续把未核验的宏观/地缘归因写成确定性事实：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=11311`
+    - `job_name=全天原油价格3小时播报`
+    - `executed_at=2026-04-30T15:01:15+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `delivered=1`
+    - `response_preview` 直接向用户发送：`近期变动主因：中东地缘风险溢价持续消退，OPEC+延续增产节奏，全球原油库存处于季节性累库阶段，需求端关注中美贸易磋商进展及夏季驾驶旺季消费预期。`
+    - 同条消息同时写出 `注：因数据链路暂时受限，以上价格为行情参考区间，非交易所实时报价`，但仍把上面的归因作为确定性“主因”输出，没有降级成“原因未核验/仅供参考”。
+  - `data/runtime/logs/sidecar.log`
+    - `2026-04-30 15:01:12.849-15:01:12.850` 记录同一任务 `parse_kind=JsonTriggered` 与成功 `deliver`，说明这不是中间草稿，而是已外发的最终可见播报。
+    - 同窗 `15:00:41.563-15:00:43.326` 连续记录 Tavily `usage limit` / `鉴权被拒绝`，且 `web_search` 最终仍回写 `tool_execute_success`；外部搜索已明显降级，但播报正文没有把原因归因同步降级。
+- 结论：这说明 `2026-04-28` 标记为 `Later` 的止血在 `2026-04-30 15:01` 真实窗口再次失效；同一根因已继续 live 复现，应维持 `New` 并回到活跃待修复队列。
 
 ## 修复进展（2026-04-28）
 

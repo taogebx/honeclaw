@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use hone_core::agent::AgentResponse;
+use hone_core::agent::{AgentResponse, ToolCallMade};
 
 use crate::HoneBotCore;
 use crate::outbound::{ResponseContentSegment, split_response_content_segments};
@@ -64,6 +64,18 @@ pub(crate) fn finalize_agent_response(
         response.error = Some(EMPTY_SUCCESS_FALLBACK_MESSAGE.to_string());
         outcome.fallback_reason = Some("sanitized_empty_success");
     } else if is_transitional_planning_sentence(sanitized.content.trim()) {
+        if let Some(recovered) =
+            recover_successful_side_effect_confirmation(&response.tool_calls_made)
+        {
+            tracing::info!(
+                "[AgentSession] recovered side-effect confirmation from tool result runner={} session_id={}",
+                runner_name,
+                session_id
+            );
+            response.content = recovered;
+            response.error = None;
+            return outcome;
+        }
         tracing::warn!(
             "[AgentSession] transitional planning sentence detected, treating as empty runner={} session_id={} chars={}",
             runner_name,
@@ -80,6 +92,230 @@ pub(crate) fn finalize_agent_response(
 
     response.content = normalize_local_image_references(core, session_id, &response.content);
     outcome
+}
+
+fn recover_successful_side_effect_confirmation(tool_calls: &[ToolCallMade]) -> Option<String> {
+    tool_calls.iter().rev().find_map(|call| {
+        if call.result.get("success").and_then(|value| value.as_bool()) != Some(true) {
+            return None;
+        }
+        match call.name.as_str() {
+            "cron_job" => recover_cron_job_confirmation(call),
+            "portfolio" => recover_portfolio_confirmation(call),
+            _ => None,
+        }
+    })
+}
+
+fn recover_cron_job_confirmation(call: &ToolCallMade) -> Option<String> {
+    let action = tool_action(call);
+    match action.as_deref() {
+        Some("add") => cron_job_confirmation_message("已创建定时任务", call),
+        Some("update") => cron_job_confirmation_message("已更新定时任务", call),
+        Some("remove") => call
+            .result
+            .get("removed_job_id")
+            .and_then(|value| value.as_str())
+            .map(|job_id| format!("已删除定时任务：{job_id}。")),
+        _ => None,
+    }
+}
+
+fn cron_job_confirmation_message(prefix: &str, call: &ToolCallMade) -> Option<String> {
+    let job = call.result.get("job")?;
+    let name = job
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("未命名任务");
+    let job_id = job.get("id").and_then(|value| value.as_str()).unwrap_or("");
+    let schedule = job.get("schedule").map(format_cron_schedule);
+    let mut message = format!("{prefix}：{name}");
+    if let Some(schedule) = schedule.filter(|value| !value.is_empty()) {
+        message.push_str("（");
+        message.push_str(&schedule);
+        message.push('）');
+    }
+    if !job_id.is_empty() {
+        message.push_str("。任务 ID：");
+        message.push_str(job_id);
+    }
+    message.push('。');
+    Some(message)
+}
+
+fn recover_portfolio_confirmation(call: &ToolCallMade) -> Option<String> {
+    let action = tool_action(call)?;
+    let tickers = portfolio_tickers(call);
+    if tickers.is_empty() {
+        return None;
+    }
+    let label = tickers.join("、");
+    let message = match action.as_str() {
+        "add" => {
+            let mut message = format!("已记录持仓：{label}");
+            if let Some(cost_basis) = portfolio_cost_basis(call) {
+                message.push_str("，成本价 ");
+                message.push_str(&cost_basis);
+            }
+            message.push_str("。后续跟踪会优先参考这条持仓记录。");
+            message
+        }
+        "update" => format!("已更新持仓：{label}。后续跟踪会使用最新持仓记录。"),
+        "remove" => format!("已处理持仓/关注删除请求：{label}。"),
+        "watch" => match portfolio_first_result(call).as_deref() {
+            Some("already_holding") => format!("{label} 已在持仓中，会继续按持仓跟踪。"),
+            Some("already_watching") => format!("{label} 已在关注列表中，会继续跟踪。"),
+            _ => format!("已加入关注列表：{label}。后续会继续跟踪。"),
+        },
+        "unwatch" => format!("已取消关注：{label}。"),
+        _ => return None,
+    };
+    Some(message)
+}
+
+fn tool_action(call: &ToolCallMade) -> Option<String> {
+    call.result
+        .get("action")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            call.arguments
+                .get("action")
+                .and_then(|value| value.as_str())
+        })
+        .map(str::to_string)
+}
+
+fn portfolio_tickers(call: &ToolCallMade) -> Vec<String> {
+    let mut tickers = Vec::new();
+    push_portfolio_ticker(&mut tickers, &call.result);
+    if let Some(holdings) = call
+        .result
+        .get("holdings")
+        .and_then(|value| value.as_array())
+    {
+        for holding in holdings {
+            push_portfolio_ticker(&mut tickers, holding);
+        }
+    }
+    if let Some(holdings) = call
+        .arguments
+        .get("holdings")
+        .and_then(|value| value.as_array())
+    {
+        for holding in holdings {
+            push_portfolio_ticker(&mut tickers, holding);
+        }
+    }
+    push_portfolio_ticker(&mut tickers, &call.arguments);
+    tickers
+}
+
+fn push_portfolio_ticker(tickers: &mut Vec<String>, value: &serde_json::Value) {
+    let Some(ticker) = value
+        .get("ticker")
+        .or_else(|| value.get("symbol"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_ascii_uppercase())
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    if !tickers.iter().any(|existing| existing == &ticker) {
+        tickers.push(ticker);
+    }
+}
+
+fn portfolio_cost_basis(call: &ToolCallMade) -> Option<String> {
+    call.arguments
+        .get("cost_basis")
+        .and_then(format_number_value)
+        .or_else(|| {
+            call.arguments
+                .get("holdings")
+                .and_then(|value| value.as_array())
+                .and_then(|holdings| holdings.first())
+                .and_then(|holding| holding.get("cost_basis"))
+                .and_then(format_number_value)
+        })
+}
+
+fn format_number_value(value: &serde_json::Value) -> Option<String> {
+    if let Some(number) = value.as_f64() {
+        return Some(if number.fract() == 0.0 {
+            format!("{number:.0}")
+        } else {
+            format!("{number:.2}")
+        });
+    }
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn portfolio_first_result(call: &ToolCallMade) -> Option<String> {
+    call.result
+        .get("result")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            call.result
+                .get("holdings")
+                .and_then(|value| value.as_array())
+                .and_then(|holdings| holdings.first())
+                .and_then(|holding| holding.get("result"))
+                .and_then(|value| value.as_str())
+        })
+        .map(str::to_string)
+}
+
+fn format_cron_schedule(schedule: &serde_json::Value) -> String {
+    let repeat = schedule
+        .get("repeat")
+        .and_then(|value| value.as_str())
+        .unwrap_or("daily");
+    let hour = schedule
+        .get("hour")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let minute = schedule
+        .get("minute")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let time = format!("{hour:02}:{minute:02}");
+    match repeat {
+        "heartbeat" => "每 30 分钟条件轮询".to_string(),
+        "workday" => format!("工作日 {time}"),
+        "trading_day" => format!("交易日 {time}"),
+        "weekly" => {
+            let weekday = schedule
+                .get("weekday")
+                .and_then(|value| value.as_u64())
+                .and_then(weekday_label)
+                .unwrap_or("每周");
+            format!("{weekday} {time}")
+        }
+        "once" => schedule
+            .get("date")
+            .and_then(|value| value.as_str())
+            .filter(|date| !date.trim().is_empty())
+            .map(|date| format!("{date} {time}"))
+            .unwrap_or(time),
+        _ => format!("每天 {time}"),
+    }
+}
+
+fn weekday_label(value: u64) -> Option<&'static str> {
+    match value {
+        0 => Some("每周一"),
+        1 => Some("每周二"),
+        2 => Some("每周三"),
+        3 => Some("每周四"),
+        4 => Some("每周五"),
+        5 => Some("每周六"),
+        6 => Some("每周日"),
+        _ => None,
+    }
 }
 
 pub(crate) fn response_leaks_system_prompt(content: &str) -> bool {

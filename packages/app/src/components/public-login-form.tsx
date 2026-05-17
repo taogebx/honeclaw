@@ -1,139 +1,215 @@
-// public-login-form.tsx — /me 和 /chat 共用的登录卡（tab: 密码登录 / 邀请码激活）
-//
-// 默认展示"密码登录"；"邀请码激活"用于新用户首次进入。顶部一行引导文案 +
-// 每个 tab 下一行小字，让用户不用猜该选哪边。
+// public-login-form.tsx — /me 和 /chat 共用的手机号验证码登录卡
 
-import { Show, createMemo, createSignal, type JSX, type ParentProps } from "solid-js"
-import { PublicCheckbox } from "./public-checkbox"
-import { PublicPasswordField } from "./public-password-field"
-import { publicInviteLogin, publicPasswordLogin } from "@/lib/api"
-import { CONTENT } from "@/lib/public-content"
-import { normalizeInviteCode, normalizePhoneNumber } from "@/lib/public-chat"
-import { TOS_VERSION } from "@/lib/tos"
-import type { PublicAuthUserInfo } from "@/lib/types"
-
-type LoginTab = "password" | "invite"
+import {
+  Show,
+  createMemo,
+  createSignal,
+  onCleanup,
+  onMount,
+  type ParentProps,
+} from "solid-js";
+import { PublicCheckbox } from "./public-checkbox";
+import {
+  getPublicCaptchaConfig,
+  publicSendSmsCode,
+  publicSmsLogin,
+} from "@/lib/api";
+import {
+  AliyunCaptchaController,
+  type PublicCaptchaConfig,
+} from "@/lib/aliyun-captcha";
+import { CONTENT } from "@/lib/public-content";
+import { normalizePhoneNumber } from "@/lib/public-chat";
+import { TOS_VERSION } from "@/lib/tos";
+import type { PublicAuthUserInfo } from "@/lib/types";
 
 type Props = {
-  onLogin: (user: PublicAuthUserInfo) => void | Promise<void>
-  title?: string
-  subtitle?: string
-}
+  onLogin: (user: PublicAuthUserInfo) => void | Promise<void>;
+  title?: string;
+  subtitle?: string;
+};
+
+let captchaIdSeed = 0;
 
 export function PublicLoginForm(props: Props) {
-  const [tab, setTab] = createSignal<LoginTab>("password")
-  const [phoneNumber, setPhoneNumber] = createSignal("")
-  const [password, setPassword] = createSignal("")
-  const [inviteCode, setInviteCode] = createSignal("")
-  const [remember, setRemember] = createSignal(true)
-  const [agreed, setAgreed] = createSignal(false)
-  const [submitting, setSubmitting] = createSignal(false)
-  const [error, setError] = createSignal("")
+  const [phoneNumber, setPhoneNumber] = createSignal("");
+  const [verifyCode, setVerifyCode] = createSignal("");
+  const [remember, setRemember] = createSignal(true);
+  const [agreed, setAgreed] = createSignal(false);
+  const [submitting, setSubmitting] = createSignal(false);
+  const [sending, setSending] = createSignal(false);
+  const [cooldown, setCooldown] = createSignal(0);
+  const [error, setError] = createSignal("");
+  const [notice, setNotice] = createSignal("");
+  const captchaElementId = `public-login-captcha-${++captchaIdSeed}`;
+  const captchaButtonId = `public-login-captcha-button-${captchaIdSeed}`;
+  let captchaConfigPromise: Promise<PublicCaptchaConfig> | undefined;
+  let captchaController: AliyunCaptchaController | undefined;
+  const clearFeedback = () => {
+    setError("");
+    setNotice("");
+  };
 
-  const phoneOk = createMemo(() => normalizePhoneNumber(phoneNumber()).length >= 5)
-  const passwordReady = createMemo(
-    () => phoneOk() && password().length > 0 && agreed() && !submitting(),
-  )
-  const inviteReady = createMemo(
-    () =>
-      phoneOk() &&
-      normalizeInviteCode(inviteCode()).length > 0 &&
-      agreed() &&
-      !submitting(),
-  )
+  const phoneOk = createMemo(
+    () => normalizePhoneNumber(phoneNumber()).length >= 5,
+  );
+  const codeOk = createMemo(() =>
+    /^[0-9A-Za-z]{4,8}$/.test(verifyCode().trim()),
+  );
+  const sendReady = createMemo(
+    () => phoneOk() && !sending() && cooldown() <= 0,
+  );
+  const loginReady = createMemo(
+    () => phoneOk() && codeOk() && agreed() && !submitting(),
+  );
 
-  const submitPassword = async () => {
-    if (!passwordReady()) return
-    setSubmitting(true)
-    setError("")
+  let cooldownTimer: ReturnType<typeof setInterval> | undefined;
+  onCleanup(() => {
+    if (cooldownTimer) clearInterval(cooldownTimer);
+  });
+  onMount(() => {
+    void preloadCaptcha();
+  });
+
+  const startCooldown = () => {
+    setCooldown(60);
+    if (cooldownTimer) clearInterval(cooldownTimer);
+    cooldownTimer = setInterval(() => {
+      setCooldown((value) => {
+        if (value <= 1) {
+          if (cooldownTimer) clearInterval(cooldownTimer);
+          cooldownTimer = undefined;
+          return 0;
+        }
+        return value - 1;
+      });
+    }, 1000);
+  };
+
+  const sendCode = async () => {
+    if (!sendReady()) return;
+    setSending(true);
+    clearFeedback();
     try {
-      const user = await publicPasswordLogin({
-        phone_number: normalizePhoneNumber(phoneNumber()),
-        password: password(),
-        remember: remember(),
-      })
-      await props.onLogin(user)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setSubmitting(false)
-    }
-  }
-
-  const submitInvite = async () => {
-    if (!inviteReady()) return
-    setSubmitting(true)
-    setError("")
-    try {
-      const user = await publicInviteLogin(
-        normalizeInviteCode(inviteCode()),
+      const captchaVerifyParam = await verifyCaptchaIfEnabled();
+      await publicSendSmsCode(
         normalizePhoneNumber(phoneNumber()),
-      )
-      await props.onLogin(user)
+        captchaVerifyParam,
+      );
+      setNotice(CONTENT.auth.login.code_sent);
+      startCooldown();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setSubmitting(false)
+      setSending(false);
     }
-  }
+  };
 
-  const submitCurrentTab = () => {
-    if (tab() === "password") {
-      void submitPassword()
-      return
+  const verifyCaptchaIfEnabled = async () => {
+    const captcha = await ensureCaptchaController();
+    if (!captcha) return undefined;
+    return captcha.verify();
+  };
+
+  const preloadCaptcha = async () => {
+    try {
+      const captcha = await ensureCaptchaController();
+      await captcha?.prepare();
+    } catch {
+      // Surface initialization errors only when the user actively requests SMS.
     }
-    void submitInvite()
-  }
+  };
 
-  const tabBtnStyle = (active: boolean): JSX.CSSProperties => ({
-    flex: "1",
-    padding: "10px 8px",
-    "border-radius": "8px",
-    border: "none",
-    background: active ? "#fff" : "transparent",
-    color: active ? "#0f172a" : "#64748b",
-    "font-family": "inherit",
-    "font-size": "13px",
-    "font-weight": active ? "700" : "500",
-    cursor: "pointer",
-    "box-shadow": active ? "0 1px 3px rgba(15,23,42,0.08)" : "none",
-    transition: "all 0.15s ease",
-  })
+  const ensureCaptchaController = async () => {
+    captchaConfigPromise ??= getPublicCaptchaConfig();
+    const config = await captchaConfigPromise;
+    if (!config.enabled) return undefined;
+    captchaController ??= new AliyunCaptchaController(
+      config,
+      captchaElementId,
+      captchaButtonId,
+    );
+    return captchaController;
+  };
+
+  const submitLogin = async () => {
+    if (!loginReady()) return;
+    setSubmitting(true);
+    clearFeedback();
+    try {
+      const user = await publicSmsLogin({
+        phone_number: normalizePhoneNumber(phoneNumber()),
+        verify_code: verifyCode().trim(),
+        remember: remember(),
+        tos_version: TOS_VERSION,
+      });
+      await props.onLogin(user);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   return (
     <div
+      class="public-login-screen"
       style={{
         "padding-top": "56px",
-        "min-height": "100vh",
+        "min-height": "100dvh",
         background: "#f8fafc",
         "font-family": "var(--font-sans, 'Plus Jakarta Sans', sans-serif)",
         display: "flex",
         "align-items": "center",
         "justify-content": "center",
+        "box-sizing": "border-box",
+        "overflow-y": "auto",
+        "-webkit-overflow-scrolling": "touch",
+        width: "100%",
       }}
     >
-      <div style={{ "max-width": "440px", width: "100%", margin: "0 auto", padding: "0 24px" }}>
+      <div
+        class="public-login-card-wrap"
+        style={{
+          "max-width": "440px",
+          width: "100%",
+          margin: "0 auto",
+          padding: "0 24px",
+        }}
+      >
         {/* Header */}
         <div style={{ "margin-bottom": "22px", "text-align": "center" }}>
-          <img src="/logo.svg" style={{ height: "36px", "margin-bottom": "16px" }} alt="Hone" />
+          <img
+            src="/logo.svg"
+            style={{ height: "36px", "margin-bottom": "16px" }}
+            alt="Hone"
+          />
           <h1
             style={{
               "font-size": "22px",
               "font-weight": "700",
               color: "#0f172a",
               margin: "0 0 8px",
-              "letter-spacing": "-0.01em",
+              "letter-spacing": "0",
             }}
           >
             {props.title ?? CONTENT.auth.login.title}
           </h1>
-          <p style={{ "font-size": "13px", color: "#64748b", margin: "0", "line-height": "1.6" }}>
+          <p
+            style={{
+              "font-size": "13px",
+              color: "#64748b",
+              margin: "0",
+              "line-height": "1.6",
+            }}
+          >
             {props.subtitle ?? CONTENT.auth.login.subtitle}
           </p>
         </div>
 
         {/* Card */}
         <div
+          class="public-login-card"
           style={{
             padding: "22px",
             "border-radius": "14px",
@@ -142,42 +218,6 @@ export function PublicLoginForm(props: Props) {
             "box-shadow": "0 4px 24px rgba(15,23,42,0.05)",
           }}
         >
-          {/* Tabs */}
-          <div
-            style={{
-              display: "flex",
-              gap: "4px",
-              padding: "4px",
-              background: "#f1f5f9",
-              "border-radius": "10px",
-              "margin-bottom": "10px",
-            }}
-          >
-            <button
-              type="button"
-              onClick={() => {
-                setTab("password")
-                setError("")
-              }}
-              style={tabBtnStyle(tab() === "password")}
-              data-testid="tab-password"
-            >
-              {CONTENT.auth.login.tab_password}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setTab("invite")
-                setError("")
-              }}
-              style={tabBtnStyle(tab() === "invite")}
-              data-testid="tab-invite"
-            >
-              {CONTENT.auth.login.tab_invite}
-            </button>
-          </div>
-
-          {/* Per-tab hint */}
           <p
             style={{
               margin: "0 0 16px",
@@ -187,16 +227,16 @@ export function PublicLoginForm(props: Props) {
               "text-align": "center",
             }}
           >
-            <Show
-              when={tab() === "password"}
-              fallback={CONTENT.auth.login.hint_invite}
-            >
-              {CONTENT.auth.login.hint_password}
-            </Show>
+            {CONTENT.auth.login.hint_sms}
           </p>
 
-          {/* Phone (shared) */}
-          <div style={{ display: "flex", "flex-direction": "column", "margin-bottom": "12px" }}>
+          <div
+            style={{
+              display: "flex",
+              "flex-direction": "column",
+              "margin-bottom": "12px",
+            }}
+          >
             <FieldLabel>{CONTENT.auth.login.phone_label}</FieldLabel>
             <TextInput
               value={phoneNumber()}
@@ -208,39 +248,80 @@ export function PublicLoginForm(props: Props) {
             />
           </div>
 
-          {/* Tab body */}
-          <Show
-            when={tab() === "password"}
-            fallback={
-              <div style={{ display: "flex", "flex-direction": "column", "margin-bottom": "12px" }}>
-                <FieldLabel>{CONTENT.auth.login.invite_label}</FieldLabel>
-                <TextInput
-                  value={inviteCode()}
-                  onInput={setInviteCode}
-                  placeholder={CONTENT.auth.login.invite_placeholder}
-                  ariaLabel={CONTENT.auth.login.invite_aria}
-                  onEnter={submitInvite}
-                />
-              </div>
-            }
+          <div
+            class="public-login-code-row"
+            style={{ display: "flex", gap: "10px", "margin-bottom": "12px" }}
           >
-            <div style={{ display: "flex", "flex-direction": "column", "margin-bottom": "12px" }}>
-              <FieldLabel>{CONTENT.auth.login.password_label}</FieldLabel>
-              <PublicPasswordField
-                value={password()}
-                onInput={setPassword}
-                placeholder={CONTENT.auth.login.password_placeholder}
-                autoComplete="current-password"
-                ariaLabel={CONTENT.auth.login.password_aria}
-                onEnter={submitPassword}
+            <div
+              style={{ flex: "1", display: "flex", "flex-direction": "column" }}
+            >
+              <FieldLabel>{CONTENT.auth.login.code_label}</FieldLabel>
+              <TextInput
+                value={verifyCode()}
+                onInput={setVerifyCode}
+                placeholder={CONTENT.auth.login.code_placeholder}
+                ariaLabel={CONTENT.auth.login.code_aria}
+                inputMode="numeric"
+                onEnter={submitLogin}
               />
             </div>
-            <div style={{ "margin-bottom": "12px" }}>
-              <PublicCheckbox checked={remember()} onChange={setRemember}>
-                <span style={{ "font-size": "13px" }}>{CONTENT.auth.login.remember_30d}</span>
-              </PublicCheckbox>
-            </div>
-          </Show>
+            <button
+              class="public-login-code-button"
+              type="button"
+              disabled={!sendReady()}
+              onClick={sendCode}
+              style={{
+                "align-self": "end",
+                width: "116px",
+                height: "40px",
+                "border-radius": "8px",
+                border: "1px solid rgba(245,158,11,0.38)",
+                background: sendReady() ? "#fff7ed" : "#f8fafc",
+                color: sendReady() ? "#b45309" : "#94a3b8",
+                cursor: sendReady() ? "pointer" : "not-allowed",
+                "font-family": "inherit",
+                "font-size": "13px",
+                "font-weight": "700",
+              }}
+            >
+              {sending()
+                ? CONTENT.auth.login.sending_code
+                : cooldown() > 0
+                  ? CONTENT.auth.login.resend_in.replace(
+                      "{seconds}",
+                      String(cooldown()),
+                    )
+                  : CONTENT.auth.login.send_code}
+            </button>
+          </div>
+          <div
+            id={captchaElementId}
+            style={{ position: "relative", "z-index": "20" }}
+          />
+          <button
+            id={captchaButtonId}
+            type="button"
+            tabindex="-1"
+            aria-hidden="true"
+            style={{
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: "0",
+              border: "0",
+              opacity: "0",
+              overflow: "hidden",
+              "pointer-events": "none",
+            }}
+          />
+
+          <div style={{ "margin-bottom": "12px" }}>
+            <PublicCheckbox checked={remember()} onChange={setRemember}>
+              <span style={{ "font-size": "13px" }}>
+                {CONTENT.auth.login.remember_30d}
+              </span>
+            </PublicCheckbox>
+          </div>
 
           <div style={{ "margin-bottom": "16px" }}>
             <PublicCheckbox checked={agreed()} onChange={setAgreed}>
@@ -253,33 +334,43 @@ export function PublicLoginForm(props: Props) {
               <ErrorBox message={error()} />
             </div>
           </Show>
+          <Show when={notice()}>
+            <div style={{ "margin-bottom": "12px" }}>
+              <NoticeBox message={notice()} />
+            </div>
+          </Show>
 
           <SubmitButton
-            disabled={tab() === "password" ? !passwordReady() : !inviteReady()}
+            disabled={!loginReady()}
             loading={submitting()}
-            label={
-              tab() === "password"
-                ? CONTENT.auth.login.submit_password
-                : CONTENT.auth.login.submit_invite
-            }
-            onClick={submitCurrentTab}
+            label={CONTENT.auth.login.submit_sms}
+            onClick={submitLogin}
           />
         </div>
       </div>
     </div>
-  )
+  );
 }
 
 // ── local helpers ─────────────────────────────────────────────────────────────
 
 function TextInput(props: {
-  value: string
-  onInput: (v: string) => void
-  placeholder?: string
-  type?: string
-  ariaLabel?: string
-  onEnter?: () => void
-  autoComplete?: string
+  value: string;
+  onInput: (v: string) => void;
+  placeholder?: string;
+  type?: string;
+  ariaLabel?: string;
+  onEnter?: () => void;
+  autoComplete?: string;
+  inputMode?:
+    | "none"
+    | "text"
+    | "tel"
+    | "url"
+    | "email"
+    | "numeric"
+    | "decimal"
+    | "search";
 }) {
   return (
     <input
@@ -288,11 +379,12 @@ function TextInput(props: {
       placeholder={props.placeholder}
       autocomplete={props.autoComplete}
       aria-label={props.ariaLabel}
+      inputmode={props.inputMode}
       onInput={(e) => props.onInput(e.currentTarget.value)}
       onKeyDown={(e) => {
         if (e.key === "Enter" && props.onEnter) {
-          e.preventDefault()
-          props.onEnter()
+          e.preventDefault();
+          props.onEnter();
         }
       }}
       style={{
@@ -309,15 +401,15 @@ function TextInput(props: {
         transition: "border-color 0.15s ease, box-shadow 0.15s ease",
       }}
       onFocus={(e) => {
-        e.currentTarget.style.borderColor = "#f59e0b"
-        e.currentTarget.style.boxShadow = "0 0 0 3px rgba(245,158,11,0.15)"
+        e.currentTarget.style.borderColor = "#f59e0b";
+        e.currentTarget.style.boxShadow = "0 0 0 3px rgba(245,158,11,0.15)";
       }}
       onBlur={(e) => {
-        e.currentTarget.style.borderColor = "rgba(15,23,42,0.14)"
-        e.currentTarget.style.boxShadow = "none"
+        e.currentTarget.style.borderColor = "rgba(15,23,42,0.14)";
+        e.currentTarget.style.boxShadow = "none";
       }}
     />
-  )
+  );
 }
 
 function FieldLabel(props: ParentProps) {
@@ -333,7 +425,7 @@ function FieldLabel(props: ParentProps) {
     >
       {props.children}
     </span>
-  )
+  );
 }
 
 function ErrorBox(props: { message: string }) {
@@ -350,7 +442,24 @@ function ErrorBox(props: { message: string }) {
     >
       {props.message}
     </div>
-  )
+  );
+}
+
+function NoticeBox(props: { message: string }) {
+  return (
+    <div
+      style={{
+        padding: "10px 12px",
+        "border-radius": "8px",
+        background: "rgba(22,163,74,0.06)",
+        border: "1px solid rgba(22,163,74,0.2)",
+        color: "#15803d",
+        "font-size": "12.5px",
+      }}
+    >
+      {props.message}
+    </div>
+  );
 }
 
 function TosLink() {
@@ -376,14 +485,14 @@ function TosLink() {
       </a>
       {CONTENT.auth.tos.version_template.replace("{version}", TOS_VERSION)}
     </>
-  )
+  );
 }
 
 function SubmitButton(props: {
-  disabled: boolean
-  loading: boolean
-  label: string
-  onClick: () => void
+  disabled: boolean;
+  loading: boolean;
+  label: string;
+  onClick: () => void;
 }) {
   return (
     <button
@@ -402,11 +511,13 @@ function SubmitButton(props: {
         "font-size": "15px",
         "font-weight": "700",
         color: "#fff",
-        "box-shadow": props.disabled ? "none" : "0 4px 14px rgba(245,158,11,0.28)",
+        "box-shadow": props.disabled
+          ? "none"
+          : "0 4px 14px rgba(245,158,11,0.28)",
         transition: "background 0.15s ease",
       }}
     >
       {props.loading ? CONTENT.auth.login.loading : props.label}
     </button>
-  )
+  );
 }

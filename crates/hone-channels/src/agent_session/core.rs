@@ -22,6 +22,7 @@ use crate::prompt::PromptOptions;
 use crate::prompt_audit::PromptAuditMetadata;
 use crate::response_finalizer::{EMPTY_SUCCESS_FALLBACK_MESSAGE, finalize_agent_response};
 use crate::runners::{AgentRunnerEmitter, AgentRunnerRequest, AgentRunnerResult};
+use crate::runtime::user_visible_error_message;
 use crate::session_compactor::SessionCompactor;
 use crate::turn_builder::{PromptTurnBuilder, SlashSkillExpansion};
 
@@ -30,8 +31,8 @@ use super::guard::QuotaReservationGuard;
 use super::helpers::{
     CONTEXT_OVERFLOW_FALLBACK_MESSAGE, CONTEXT_OVERFLOW_POST_COMPACT_RESTORE_LIMIT,
     CONTEXT_OVERFLOW_RECOVERY_LIMIT, CompactCommand, EMPTY_SUCCESS_RETRY_LIMIT,
-    is_context_overflow_error_text, merge_message_metadata, persistable_turn_from_response,
-    restore_limit_before_compaction, should_return_runner_result,
+    is_context_overflow_error_text, merge_message_metadata, non_finance_boundary_reply,
+    persistable_turn_from_response, restore_limit_before_compaction, should_return_runner_result,
 };
 use super::progress::{progress_watchdog_tick, run_with_progress_ticks};
 use super::restore::restore_context;
@@ -171,7 +172,7 @@ impl AgentSession {
     /// 外层除了 `agent.run start` 之外没有任何痕迹，直到整个 run 结束或超时才会再次落日志
     /// （参见 `docs/bugs/feishu_scheduler_run_stuck_without_cron_job_run.md`）。这里用一个
     /// `tokio::select!` ticker 在 run_fut 未完成时定期打 `agent.run.progress`，保证：
-    /// - `sidecar.log` 在卡死期间仍有心跳，运维能立刻判定「执行中 vs 卡死」；
+    /// - 结构化运行日志在卡死期间仍有心跳，运维能立刻判定「执行中 vs 卡死」；
     /// - session 可见进度事件 (`session_progress_event`) 同步到 UI/下游，避免客户端以为 run 已失联。
     async fn run_runner_with_progress_watchdog(
         &self,
@@ -290,7 +291,14 @@ impl AgentSession {
                 }),
             })
             .map_err(|err| {
-                tracing::error!("[AgentSession] execution prepare failed: {}", err);
+                tracing::error!(
+                    session_id = %session_id,
+                    channel = %self.actor.channel,
+                    user_id = %self.actor.user_id,
+                    channel_target = %self.channel_target,
+                    "[AgentSession] execution prepare failed: {}",
+                    err
+                );
                 let kind = if err.contains("sandbox") {
                     AgentSessionErrorKind::Io
                 } else {
@@ -320,6 +328,33 @@ impl AgentSession {
             return;
         };
 
+        let _ = self.core.session_storage.append_session_messages(
+            session_id,
+            vec![session_message_from_normalized(
+                &message,
+                hone_core::beijing_now_rfc3339(),
+            )],
+        );
+    }
+
+    fn persist_assistant_text_turn(
+        &self,
+        session_id: &str,
+        content: &str,
+        metadata_extra: HashMap<String, Value>,
+    ) {
+        let response = AgentResponse {
+            content: content.to_string(),
+            tool_calls_made: Vec::new(),
+            iterations: 0,
+            success: false,
+            error: None,
+        };
+        let metadata =
+            merge_message_metadata(self.message_metadata.assistant.clone(), metadata_extra);
+        let Some(message) = persistable_turn_from_response(&response, metadata) else {
+            return;
+        };
         let _ = self.core.session_storage.append_session_messages(
             session_id,
             vec![session_message_from_normalized(
@@ -593,7 +628,14 @@ impl AgentSession {
                 }
             }
             Err(err) => {
-                tracing::error!("[AgentSession] manual compact failed: {}", err);
+                tracing::error!(
+                    session_id = %session_id,
+                    channel = %self.actor.channel,
+                    user_id = %self.actor.user_id,
+                    channel_target = %self.channel_target,
+                    "[AgentSession] manual compact failed: {}",
+                    err
+                );
                 self.emit(session_progress_event(
                     "session.compress",
                     Some("failed".to_string()),
@@ -654,6 +696,89 @@ impl AgentSession {
         }
     }
 
+    async fn run_domain_boundary_short_circuit(
+        &self,
+        session_id: String,
+        raw_input: &str,
+        reply: &str,
+    ) -> AgentSessionResult {
+        let started = Instant::now();
+        let _ = self.core.session_storage.add_message(
+            &session_id,
+            "user",
+            raw_input,
+            self.message_metadata.user.clone(),
+        );
+        self.emit(AgentSessionEvent::UserMessage {
+            content: raw_input.to_string(),
+        })
+        .await;
+        self.core.log_message_step(
+            &self.actor.channel,
+            &self.actor.user_id,
+            &session_id,
+            "session.persist_user",
+            "domain_boundary",
+            self.message_id.as_deref(),
+            None,
+        );
+        self.core.log_message_received(
+            &self.actor.channel,
+            &self.actor.user_id,
+            &self.channel_target,
+            &session_id,
+            raw_input,
+            self.recv_extra.as_deref(),
+            self.message_id.as_deref(),
+        );
+
+        let response = AgentResponse {
+            content: reply.to_string(),
+            tool_calls_made: Vec::new(),
+            iterations: 0,
+            success: true,
+            error: None,
+        };
+        self.core.log_message_step(
+            &self.actor.channel,
+            &self.actor.user_id,
+            &session_id,
+            "agent.domain_boundary",
+            "short_circuit_non_finance",
+            self.message_id.as_deref(),
+            None,
+        );
+        self.persist_successful_assistant_turn(&session_id, &response, None);
+        self.core.log_message_step(
+            &self.actor.channel,
+            &self.actor.user_id,
+            &session_id,
+            "session.persist_assistant",
+            "domain_boundary",
+            self.message_id.as_deref(),
+            None,
+        );
+        let elapsed_ms = started.elapsed().as_millis();
+        self.core.log_message_finished(
+            &self.actor.channel,
+            &self.actor.user_id,
+            &session_id,
+            &response,
+            elapsed_ms,
+            self.message_id.as_deref(),
+        );
+        self.emit(AgentSessionEvent::Done {
+            response: response.clone(),
+        })
+        .await;
+
+        AgentSessionResult {
+            response,
+            elapsed_ms,
+            session_id,
+        }
+    }
+
     fn default_gemini_stream_options(&self, timeout: Option<Duration>) -> GeminiStreamOptions {
         GeminiStreamOptions {
             max_iterations: 18,
@@ -694,14 +819,19 @@ impl AgentSession {
             message: message.clone(),
         };
         self.emit(session_error_event(error.clone())).await;
+        let response = AgentResponse {
+            content: String::new(),
+            tool_calls_made: Vec::new(),
+            iterations: 0,
+            success: false,
+            error: Some(message),
+        };
+        self.emit(AgentSessionEvent::Done {
+            response: response.clone(),
+        })
+        .await;
         AgentSessionResult {
-            response: AgentResponse {
-                content: String::new(),
-                tool_calls_made: Vec::new(),
-                iterations: 0,
-                success: false,
-                error: Some(message),
-            },
+            response,
             elapsed_ms: 0,
             session_id,
         }
@@ -729,7 +859,7 @@ impl AgentSession {
             ConversationQuotaReserveResult::Reserved(reservation) => Ok(Some(reservation)),
             ConversationQuotaReserveResult::Bypassed => Ok(None),
             ConversationQuotaReserveResult::Rejected(snapshot) => {
-                Err(hone_core::HoneError::Tool(format!(
+                Err(hone_core::HoneError::Other(format!(
                     "已达到今日对话上限（{}/{}，北京时间 {}），请明天再试",
                     snapshot.success_count + snapshot.in_flight,
                     snapshot.limit,
@@ -776,16 +906,68 @@ impl AgentSession {
                 .await;
         }
 
+        if options.quota_mode != AgentRunQuotaMode::ScheduledTask
+            && !self.core.is_admin_actor(&self.actor)
+        {
+            if let Some(reply) = non_finance_boundary_reply(user_input) {
+                return self
+                    .run_domain_boundary_short_circuit(session_id, user_input, reply)
+                    .await;
+            }
+        }
+
         // 配额预留；后续任何失败分支都靠 guard 在 drop 时自动把预留释放掉,
         // 不再需要每处都手写 release_daily_conversation。
         let quota_guard = match self.reserve_conversation_quota(options.quota_mode) {
             Ok(reservation) => QuotaReservationGuard::new(self.core.clone(), reservation),
             Err(err) => {
+                let raw_error = err.to_string();
+                let quota_message = user_visible_error_message(Some(raw_error.as_str()));
+                let _ = self.core.session_storage.add_message(
+                    &session_id,
+                    "user",
+                    user_input,
+                    self.message_metadata.user.clone(),
+                );
+                self.emit(AgentSessionEvent::UserMessage {
+                    content: user_input.to_string(),
+                })
+                .await;
+                self.core.log_message_step(
+                    &self.actor.channel,
+                    &self.actor.user_id,
+                    &session_id,
+                    "session.persist_user",
+                    "quota_rejected",
+                    self.message_id.as_deref(),
+                    None,
+                );
+                self.core.log_message_received(
+                    &self.actor.channel,
+                    &self.actor.user_id,
+                    &self.channel_target,
+                    &session_id,
+                    user_input,
+                    self.recv_extra.as_deref(),
+                    self.message_id.as_deref(),
+                );
+                let mut metadata = HashMap::new();
+                metadata.insert("quota_rejected".to_string(), Value::Bool(true));
+                self.persist_assistant_text_turn(&session_id, &quota_message, metadata);
+                self.core.log_message_step(
+                    &self.actor.channel,
+                    &self.actor.user_id,
+                    &session_id,
+                    "session.persist_assistant",
+                    "quota_rejected",
+                    self.message_id.as_deref(),
+                    None,
+                );
                 return self
                     .fail_run(
                         session_id,
                         AgentSessionErrorKind::AgentFailed,
-                        err.to_string(),
+                        quota_message,
                     )
                     .await;
             }
@@ -870,7 +1052,14 @@ impl AgentSession {
         .await;
 
         if let Err(err) = self.core.maybe_compress_session(&session_id).await {
-            tracing::error!("[AgentSession] compress failed: {}", err);
+            tracing::error!(
+                session_id = %session_id,
+                channel = %self.actor.channel,
+                user_id = %self.actor.user_id,
+                channel_target = %self.channel_target,
+                "[AgentSession] compress failed: {}",
+                err
+            );
             self.emit(session_progress_event(
                 "session.compress",
                 Some("failed".to_string()),
@@ -899,7 +1088,14 @@ impl AgentSession {
                 .core
                 .strict_actor_sandbox_guard_message()
                 .unwrap_or("当前 runner 不支持严格 actor sandbox。");
-            tracing::error!("[AgentSession] strict actor sandbox guard: {}", message);
+            tracing::error!(
+                session_id = %session_id,
+                channel = %self.actor.channel,
+                user_id = %self.actor.user_id,
+                channel_target = %self.channel_target,
+                "[AgentSession] strict actor sandbox guard: {}",
+                message
+            );
             drop(quota_guard);
             return self
                 .fail_run(
@@ -983,11 +1179,14 @@ impl AgentSession {
             }
 
             tracing::warn!(
-                "[AgentSession] context overflow detected, compacting and retrying runner={} session_id={} attempt={}/{}",
-                execution.runner_name,
-                session_id,
-                recovery_idx + 1,
-                CONTEXT_OVERFLOW_RECOVERY_LIMIT
+                session_id = %session_id,
+                channel = %self.actor.channel,
+                user_id = %self.actor.user_id,
+                channel_target = %self.channel_target,
+                runner = %execution.runner_name,
+                attempt = recovery_idx + 1,
+                max_attempts = CONTEXT_OVERFLOW_RECOVERY_LIMIT,
+                "[AgentSession] context overflow detected, compacting and retrying"
             );
             self.core.log_message_step(
                 &self.actor.channel,
@@ -1016,15 +1215,21 @@ impl AgentSession {
             match self.force_compact_for_context_overflow(&session_id).await {
                 Ok(compacted) => {
                     tracing::info!(
-                        "[AgentSession] context overflow recovery compacted={} session_id={}",
+                        session_id = %session_id,
+                        channel = %self.actor.channel,
+                        user_id = %self.actor.user_id,
+                        channel_target = %self.channel_target,
                         compacted,
-                        session_id
+                        "[AgentSession] context overflow recovery compacted"
                     );
                 }
                 Err(err) => {
                     tracing::error!(
-                        "[AgentSession] context overflow recovery compact failed session_id={} err={}",
-                        session_id,
+                        session_id = %session_id,
+                        channel = %self.actor.channel,
+                        user_id = %self.actor.user_id,
+                        channel_target = %self.channel_target,
+                        "[AgentSession] context overflow recovery compact failed: {}",
                         err
                     );
                     response.error = Some(CONTEXT_OVERFLOW_FALLBACK_MESSAGE.to_string());
@@ -1042,8 +1247,11 @@ impl AgentSession {
                 Ok(execution) => execution,
                 Err((_kind, err)) => {
                     tracing::error!(
-                        "[AgentSession] context overflow recovery prepare failed session_id={} err={}",
-                        session_id,
+                        session_id = %session_id,
+                        channel = %self.actor.channel,
+                        user_id = %self.actor.user_id,
+                        channel_target = %self.channel_target,
+                        "[AgentSession] context overflow recovery prepare failed: {}",
                         err
                     );
                     response.success = false;

@@ -1,0 +1,489 @@
+# Bug: 核心观察股池晚间快报退化为“击球区待确认”，固定观察池区间未被正确带入
+
+- **发现时间**: 2026-04-29 23:06 CST
+- **Bug Type**: System Error
+- **严重等级**: P3
+- **状态**: Fixed
+- **修复结论复核**:
+  - `2026-05-15 04:05 CST` 本轮修复最新可复现解析缺口，状态从 `New` 更新为 `Fixed`：
+    - 复核当前代码确认，既有恢复链路已覆盖 Markdown 表格和 `击球区:` 行，但没有覆盖缺陷文档中多次出现的紧凑 compact summary 形态，例如 `MSFT $335-$350`、`NVDA $150-$165`、`GOOGL $255-$275`。
+    - `crates/hone-channels/src/scheduler.rs` 现在会在观察池 / 击球区定时任务的 compact summary / session summary 中逐行提取 `ticker + $区间` 形态，并支持同一行多个 ticker 与 `保守/合理/激进` 分档区间；`待确认` 不会被回灌为有效区间。
+    - 新增回归测试：
+      - `scheduled_watchlist_prompt_recovers_compact_inline_hit_zones`
+    - 验证通过：
+      - `rustfmt --edition 2024 --config skip_children=true --check crates/hone-channels/src/scheduler.rs`
+      - `cargo test -p hone-channels scheduled_watchlist_ --lib -- --nocapture`
+      - `cargo check -p hone-channels --tests`
+    - 无关联 GitHub Issue。
+  - `2026-05-15 03:03 CST` 本轮确认该缺陷继续活跃：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=21176`
+      - `job_name=核心观察股池晚间快报`
+      - `executed_at=2026-05-14T23:02:53.528384+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 继续把核心股 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 和拓展股批量写成 `击球区：待确认`。
+    - 结论：
+      - 这是同一根因 / 同一影响范围的持续复发，不新建重复文档。
+      - 仍定为 `P3`：任务按时完成并送达，价格与财报字段仍可读；受损的是固定观察池字段恢复与报告参考价值，没有阻断主投递链路，因此不是 `P2` 或更高。
+  - `2026-05-14 23:04 CST` 本轮确认该缺陷继续活跃：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=21108`
+      - `job_name=科技核心股池 · 晚间击球区快报`
+      - `executed_at=2026-05-14T21:37:27.210326+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 继续把核心股 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 和拓展股批量写成 `击球区：待确认`。
+    - 同窗 `run_id=21154` / `核心观察股池晚间快报` 在 23:00 CST 刚进入 `running + pending`，截至本轮巡检尚未形成终态；本轮不把它作为新增坏答复证据。
+    - 结论：
+      - 这是同一根因 / 同一影响范围的持续复发，不新建重复文档。
+      - 仍定为 `P3`：任务按时完成并送达，价格与财报字段仍可读；受损的是固定观察池字段恢复与报告参考价值，没有阻断主投递链路。
+  - `2026-05-14 11:05 CST` 本轮确认该缺陷继续活跃：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=20500`
+      - `job_name=核心观察池早间简报`
+      - `executed_at=2026-05-14T09:02:06.918236+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 继续把核心股 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 和拓展股批量写成 `击球区：待确认`。
+    - 结论：
+      - 这是同一根因 / 同一影响范围的持续复发，不新建重复文档。
+      - 仍定为 `P3`：任务按时完成并送达，价格与财报字段仍可读；受损的是固定观察池字段恢复与报告参考价值，没有阻断主投递链路。
+  - `2026-05-13 23:04 CST` 本轮确认该缺陷在 10:22 CST runtime 重启后仍复发，状态从 `Fixed` 调回 `New`：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=20021`
+      - `job_name=核心观察股池晚间快报`
+      - `executed_at=2026-05-13T23:03:15.391904+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 继续把核心股 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 和拓展股批量写成 `击球区：待确认`。
+    - 结论：
+      - 这次样本发生在 10:22 CST runtime 重启之后，不能再按“重启前旧 live 证据”处理。
+      - 这是同一根因 / 同一影响范围的复发，不新建重复文档。
+      - 仍定为 `P3`：任务按时完成并送达，价格与财报字段仍可读；受损的是固定观察池字段恢复与报告参考价值，没有阻断主投递链路。
+  - `2026-05-13 11:08 CST` 本轮在当前机器 live 数据中继续看到一条旧运行态坏样本，但样本发生在 `2026-05-13 10:22 CST` Feishu runtime 重启前；仍不推翻仓库代码层面的 `Fixed` 结论：
+    - `data/sessions.sqlite3` -> `session_messages`
+      - `session_id=Actor_feishu__direct__ou_5f2ccd43e67b89664af3a72e13f9d48773`
+      - `ordinal=171`
+      - `timestamp=2026-05-13T09:00:03.231658+08:00`
+      - user turn 为 `[定时任务触发] 任务名称：核心观察池早间简报`，要求按当前 25 支观察池发送早间简报，列出当前价格、击球区区间值、下一次财报时间。
+      - `ordinal=172`
+      - `timestamp=2026-05-13T09:03:16.782086+08:00`
+      - assistant final 把核心股 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 继续写成 `击球区：待确认`，拓展股同样批量缺失固定击球区。
+    - 结论：
+      - 这是同一根因 / 同一影响范围的持续 live 证据，不新建重复文档。
+      - 当前仓库代码已包含观察池击球区恢复注入与回归测试；最新坏样本发生在 10:22 runtime 重启前，因此仍按旧 live / 未确认部署证据处理。
+      - 仍定为 `P3 / Fixed`：任务按时完成并送达，价格与财报字段仍可读；受损的是固定观察池字段恢复与报告参考价值，没有阻断主投递链路。
+  - `2026-05-12 23:03 CST` 本轮在当前机器 live 数据中继续看到坏样本，但仍按旧运行态 / 未确认重启证据处理，不推翻仓库代码层面的 `Fixed` 结论：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=19472`
+      - `job_name=科技核心股池 · 晚间击球区快报`
+      - `executed_at=2026-05-12T21:38:28.341966+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 把 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 等核心股继续写成 `击球区：待确认`，拓展股同样批量缺失固定区间。
+      - `run_id=19503`
+      - `job_name=核心观察股池晚间快报`
+      - `executed_at=2026-05-12T23:02:38.094520+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 再次把核心 7 支与拓展股批量写成 `击球区：待确认`。
+    - 结论：
+      - 这是同一根因 / 同一影响范围的持续 live 证据，不新建重复文档。
+      - 当前仓库代码已包含观察池击球区恢复注入与回归测试；本轮没有证据证明 live 进程已重启到该实现后仍失败，因此维持 `P3 / Fixed`。
+      - 仍定为 `P3` 的原因：任务按时完成并送达，价格与财报字段仍可读；受损的是固定观察池字段恢复和报告参考价值，没有阻断主投递链路。
+  - `2026-05-11 23:02 CST` 本轮在当前机器未重启 live 数据中继续看到坏样本，但仍不足以推翻仓库代码层面的 `Fixed` 结论：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=18907`
+      - `job_name=科技核心股池 · 晚间击球区快报`
+      - `executed_at=2026-05-11T21:36:11.296971+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 把 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 等核心股继续写成 `击球区：待确认`，拓展股同样批量缺失固定区间。
+      - `run_id=18940`
+      - `job_name=核心观察股池晚间快报`
+      - `executed_at=2026-05-11T23:01:45.296030+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 再次把除 `LITE` 外的 24 支观察池统一写成 `击球区：待确认`。
+    - `data/sessions/Actor_feishu__direct__ou_5f2ccd43e67b89664af3a72e13f9d48773.json`
+      - `2026-05-11T21:35:02.377561+08:00` 与 `2026-05-11T23:00:02.469583+08:00` 的持久化 user prompt 仍只有通用“稳定本地字段约束”，未出现当前仓库代码应注入的 `【已恢复的本地击球区参考】`。
+      - 对应 assistant final 在 `21:36:08` 与 `23:01:39` 继续写出“除 LITE 外，其余 24 支击球区区间未在本轮任务正文或已恢复上下文中给出”。
+    - 结论：
+      - 这是同一根因 / 同一影响范围的旧运行态复现，不新建重复文档。
+      - 当前仓库代码已包含 `recover_watchlist_hit_zone_context` 的批量恢复逻辑与 `scheduled_watchlist_prompt_recovers_all_hit_zones_when_task_omits_tickers` 回归；最新持久化 prompt 未出现注入段，更像 live 进程未部署 / 未重启到该修复，而不是当前代码路径重新失效。
+      - 仍定为 `P3 / Fixed`：任务按时完成并送达，价格与财报字段仍可读；受损的是固定观察池字段恢复与报告参考价值，没有阻断主投递链路。后续若确认部署当前代码后仍无 `【已恢复的本地击球区参考】` 或仍批量 `待确认`，再重新打开。
+  - `2026-05-11 03:06 CST` 本轮修复 `2026-05-10 23:10 CST` 复发根因，状态从 `New` 更新为 `Fixed`：
+    - 复核代码后确认上一轮恢复逻辑仍有一个早退缺口：`recover_watchlist_hit_zone_context` 只有在任务正文显式列出 ticker 时才会恢复击球区；而最新复发任务正文是“按当前 25 支观察池...”，没有列出 `MSFT / NVDA / GOOGL...`，因此虽然 session compact summary 里保存了观察池表，恢复链路仍直接返回空。
+    - `crates/hone-channels/src/scheduler.rs` 现在在任务正文没有显式 ticker 时，会从当前会话 `compact summary` / `session.summary` 的观察池表格和行内文本中批量恢复所有形如 `ticker -> 击球区` 的稳定本地字段，再注入 `【已恢复的本地击球区参考】`。
+    - 该逻辑仍只接受带 `$` 且形如区间/分档区间的值，并继续忽略 `待确认`，避免把坏样本回灌成真值。
+    - 新增回归测试：
+      - `scheduled_watchlist_prompt_recovers_all_hit_zones_when_task_omits_tickers`
+    - 验证通过：
+      - `cargo test -p hone-channels scheduled_watchlist_ --lib -- --nocapture`
+      - `cargo check -p hone-channels --tests`
+      - `rustfmt --edition 2024 --check crates/hone-channels/src/scheduler.rs`
+    - 全仓 `cargo fmt --all --check` 未作为通过项：它暴露了 `bins/hone-cli/**`、`crates/hone-core/src/quiet.rs`、`crates/hone-event-engine/**` 等本轮未改文件的既有格式差异；本轮只对改动文件执行了定向 rustfmt。
+    - 无关联 GitHub Issue。
+  - `2026-05-10 23:10 CST` 本轮确认 `2026-05-10 03:07 CST` 的 `Fixed` 结论在最新真实窗口再次失效，状态从 `Fixed` 调回 `New`：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=18313`
+      - `job_name=核心观察股池晚间快报`
+      - `executed_at=2026-05-10T23:01:14.750714+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 开头写出 `25 支 quote 已返回...保留任务正文里唯一确认的 LITE 击球区`，随后 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN` 等核心股继续统一显示 `击球区：待确认`。
+    - `data/sessions/Actor_feishu__direct__ou_5f2ccd43e67b89664af3a72e13f9d48773.json`
+      - `2026-05-10T21:35:01.878225+08:00` 的 `科技核心股池 · 晚间击球区快报` 也继续要求 25 支观察池列出击球区。
+      - `2026-05-10T21:37:08.407798+08:00` assistant final 仍把核心股批量写成 `击球区：待确认`。
+    - 结论：
+      - 这是同一根因/同一影响范围的复发，不新建重复文档。
+      - 仍定为 `P3`：任务按时完成并送达，价格与财报字段仍可读；受损的是固定观察池字段恢复与报告参考价值，没有阻断主投递链路。
+  - `2026-05-10 03:07 CST` 本轮修复不再只靠 prompt/guidance 提醒模型“自己去恢复区间”，而是在 scheduler 构造任务输入时显式把当前 actor 会话里已保存的观察池击球区恢复进本轮 prompt：
+    - `crates/hone-channels/src/scheduler.rs`
+      - 对命中“观察池 + 击球区 / hit zone”的普通定时任务，新增从当前 session `compact summary` / `session.summary` 提取 ticker -> 击球区的恢复逻辑。
+      - 若 summary 里存在如 `| MSFT | ... | $335–$350 |`、`| TSM | ... | 保守$290–$310 / 合理$320–$340 / 激进$345–$355 |` 这类稳定本地字段，会在本轮 prompt 追加 `【已恢复的本地击球区参考】`，避免 answer 阶段继续把已知区间写成 `待确认`。
+      - 该恢复链路只接受带 `$` 且形如区间/分档区间的值，并显式忽略 `待确认`，避免把最新坏样本再次当成真值回灌。
+    - 新增回归测试：
+      - `scheduled_watchlist_prompt_recovers_hit_zones_from_compact_summary`
+      - `scheduled_watchlist_hit_zone_prompt_keeps_stable_local_fields`
+    - 验证通过：
+      - `cargo test -p hone-channels scheduled_watchlist_hit_zone_prompt_keeps_stable_local_fields -- --nocapture`
+      - `cargo test -p hone-channels scheduled_watchlist_prompt_recovers_hit_zones_from_compact_summary -- --nocapture`
+      - `cargo check -p hone-channels --tests`
+    - 状态更新为 `Fixed`：本轮已把“已恢复的本地击球区没有可靠进入最终答案”收口到 scheduler 输入构造层；由于本任务不重启服务、不制造新运行态样本，是否在下一个 `21:35 / 23:00 / 09:00` 真实窗口完全恢复，仍需后续只读复核。
+  - `2026-05-09 23:03 CST` 本轮确认 `2026-05-07 11:06 CST` 的 `Fixed` 结论在最新真实窗口再次失效，状态从 `Fixed` 调回 `New`：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=17647`
+      - `job_name=科技核心股池 · 晚间击球区快报`
+      - `executed_at=2026-05-09T21:37:04.786083+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 开头继续把 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 等核心股统一写成 `击球区：待确认`，拓展股同样开始批量退化为 `待确认`。
+      - `run_id=17674`
+      - `job_name=核心观察股池晚间快报`
+      - `executed_at=2026-05-09T23:01:47.341171+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 再次把核心 7 支全部写成 `击球区：待确认`，拓展股也继续批量缺失固定区间。
+    - `data/sessions/Actor_feishu__direct__ou_5f2ccd43e67b89664af3a72e13f9d48773.json`
+      - 同一会话的历史 compact summary 仍包含 25 支观察池既有击球区，例如 `MSFT $335-$350`、`NVDA $150-$165`、`GOOGL $255-$275`、`AAPL $205-$225`、`AVGO $300-$310`、`TSM 保守 $290-$310 / 合理 $320-$340 / 激进 $345-$355` 等。
+      - 最新任务正文也已包含 `稳定本地字段约束`：观察池、击球区、策略纪律属于用户本地状态，`data_fetch` 只校验最新价格和财报日期；不要因为行情工具没有返回击球区字段就把既有区间统一降级为 `待确认`。
+      - 但最终用户可见答复仍把除 `LITE` 外的固定击球区批量丢失，说明 2026-05-07 新增的提示/搜索阶段约束没有在 live 输出中恢复该链路。
+    - 结论：
+      - 这是同一根因/同一影响范围的复发，不新建重复文档。
+      - 仍定为 `P3`：任务按时完成并送达，价格与财报字段仍可读；受损的是固定观察池字段恢复与报告参考价值，没有阻断主投递链路。
+  - `2026-05-06 23:10 CST` 同链路缺陷在最近一小时真实窗口再次复现：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=16148`
+      - `job_name=核心观察股池晚间快报`
+      - `executed_at=2026-05-06T23:02:33.490786+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 继续写出：`除 LITE 外，其余 24 支击球区本轮未拿到已验证区间，统一标注“待确认”`
+    - `data/runtime/logs/web.log.2026-05-06`
+      - `2026-05-06 23:00:00-23:02:30` 同会话完成 `tools=25(Tool: hone/data_fetch)`，并以 `success=true reply.chars=1343` 收口
+    - 结论：
+      - 到 `2026-05-06 23:10` 为止，这条缺陷在最新晚间窗口仍未恢复；主链路成功送达，但除 `LITE` 外的固定击球区仍被静默降级为 `待确认`。
+  - `2026-05-06 09:04 CST` 同链路缺陷在最近一小时真实窗口再次复现：
+    - `data/sessions/Actor_feishu__direct__ou_5f2ccd43e67b89664af3a72e13f9d48773.json`
+      - 最新 `2026-05-06T09:01:23.843+08:00` `[定时任务触发] 任务名称：核心观察池早间简报` 继续明确要求 25 支观察池“列出每个标的的当前价格、击球区区间值、下一次财报时间”
+      - `assistant final` 仍把 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 等核心股统一写成 `击球区：待确认`，只保留 `LITE` 的固定区间
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=15985`
+      - `job_name=核心观察池早间简报`
+      - `executed_at=2026-05-06T09:01:26.145203+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 开头继续把 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 等核心股统一标成 `击球区：待确认`
+    - 结论：
+      - 到 `2026-05-06 09:04` 为止，这条缺陷在最新盘前窗口仍未恢复；当前坏态继续表现为“任务成功送达，但固定击球区静默降级为待确认”
+  - `2026-05-05 23:02 CST` 同链路缺陷在最近一小时真实窗口再次复现：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=15923`
+      - `job_name=核心观察股池晚间快报`
+      - `executed_at=2026-05-05T23:01:27.160152+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 开头继续写出：`除 LITE 外，其余 24 支击球区本轮未拿到已验证区间，统一标注“待确认”`，随后再次把 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 等核心股统一标成 `击球区：待确认`
+    - 结论：
+      - 到 `2026-05-05 23:02` 为止，这条缺陷在最新晚间窗口仍未恢复；当前坏态继续表现为“任务成功送达，但固定击球区静默降级为待确认”
+  - `2026-05-04 09:01 CST` 同链路缺陷在最近一小时真实窗口再次复现：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=15533`
+      - `job_name=核心观察池早间简报`
+      - `executed_at=2026-05-04T09:01:21.484572+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 开头继续写出：`以下为 data_fetch 返回的最新美股市场口径，价格与财报时间已校验`，随后再次把 `MSFT / NVDA / GOOGL / AAPL` 等核心股统一标成 `击球区：待确认`
+    - 结论：
+      - 到 `2026-05-04 09:01` 为止，这条缺陷在最新盘前窗口仍未恢复；当前坏态继续表现为“任务成功送达，但固定击球区静默降级为待确认”
+  - `2026-05-03 23:01 CST` 同链路缺陷在最近一小时真实窗口再次复现：
+    - `data/sessions/Actor_feishu__direct__ou_5f2ccd43e67b89664af3a72e13f9d48773.json`
+      - 最新 `2026-05-03T23:00:02.935849+08:00` `[定时任务触发] 任务名称：核心观察股池晚间快报` 再次明确要求 25 支观察池“列出每个标的的当前价格、击球区区间值、下一次财报时间”
+      - `2026-05-03T23:01:10.651019+08:00` assistant final 仍把 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 及其余 17 支拓展股统一写成 `击球区：待确认`，只保留 `LITE` 的固定区间
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=15058`
+      - `job_name=核心观察股池晚间快报`
+      - `executed_at=2026-05-03T23:01:12.901404+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+    - 结论：
+      - 到 `2026-05-03 23:01` 为止，这条缺陷在最新晚间窗口仍未恢复；当前坏态继续表现为“任务成功送达，但固定击球区静默降级为待确认”，且最新证据直接来自用户可见最终答复
+  - `2026-05-03 21:37 CST` 同链路缺陷在最近一小时真实窗口再次复现：
+    - `data/sessions/Actor_feishu__direct__ou_5f2ccd43e67b89664af3a72e13f9d48773.json`
+      - `2026-05-03T21:35:02.888866+08:00` 最新 `[定时任务触发] 任务名称：科技核心股池 · 晚间击球区快报` 再次明确要求 25 支观察池“列出每个标的的当前价格、击球区区间值、下一次财报时间”，且仅额外给出 `LITE` 的击球区配置
+      - `2026-05-03T21:37:11.184468+08:00` assistant final 仍把 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 及其余 17 支拓展股统一写成 `击球区：待确认`，只保留 `LITE` 的固定区间，并在末尾再次声明 `除 LITE 外，其余 24 支击球区区间未完成校验`
+    - `data/runtime/prompt-audit/feishu/latest-Actor_feishu__direct__ou_5f2ccd43e67b89664af3a72e13f9d48773.json`
+      - `runtime_input` 仍原样要求“每次简要列出每个标的的当前价格、击球区区间值、下一次财报时间”，说明任务模板本身没有降级要求
+      - 同一 prompt 仅把 `LITE` 的击球区显式写入本轮输入，最终答案继续把其余 24 支统一降成 `待确认`
+    - 结论：
+      - 到 `2026-05-03 21:37` 为止，这条缺陷在最新晚间窗口仍未恢复；当前坏态继续表现为“任务成功送达，但固定击球区静默降级为待确认”，且最新证据直接来自用户可见最终答复
+  - `2026-05-03 09:01 CST` 同链路缺陷在最近一小时真实窗口再次复现：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=14430`
+      - `job_name=核心观察池早间简报`
+      - `executed_at=2026-05-03T09:01:07.463168+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 开头继续写出：`本次已用 data_fetch 校验 25 支观察池最新美股价格与下一次财报时间`，随后再次明确 `除 LITE 外，其余 24 支击球区区间未完成校验，不能计算真实击球区距离`，并把 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 等核心股继续统一标成 `击球区：待确认`
+    - 结论：
+      - 到 `2026-05-03 09:01` 为止，这条缺陷已从前一晚的晚间快报延续到次日盘前；当前坏态继续表现为“任务成功送达，但固定击球区静默降级为待确认”。
+  - `2026-05-02 23:01 CST` 同链路缺陷在最近一小时真实窗口再次复现：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=13974`
+      - `job_name=核心观察股池晚间快报`
+      - `executed_at=2026-05-02T23:01:05.345132+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 开头继续写出：`以下为 data_fetch 返回的最新美股市场口径，价格与财报时间已校验`，随后将 `MSFT / NVDA / GOOGL` 等核心股继续统一标成 `击球区：待确认`
+    - `data/runtime/logs/sidecar.log`
+      - `2026-05-02 23:00:17-23:01:05` 同窗继续高频执行 `Tool: hone/data_fetch`
+      - 终态仍成功送达，没有新的 `tool_failed` 或本地文件检索失败
+    - 结论：
+      - 到 `2026-05-02 23:01` 为止，这条缺陷在最新晚间窗口仍未恢复；当前坏态继续表现为“任务成功送达，但固定击球区静默降级为待确认”。
+  - `2026-05-02 21:36 CST` 同链路缺陷在最近一小时真实窗口再次复现：
+    - `data/sessions/Actor_feishu__direct__ou_5f2ccd43e67b89664af3a72e13f9d48773.json`
+      - `updated_at=2026-05-02T21:36:27.864248+08:00`
+      - 最新 `[定时任务触发] 任务名称：科技核心股池 · 晚间击球区快报` 继续要求“每个标的列出当前价格、击球区区间值、下一次财报时间”
+      - 实际 assistant final 再次写出 `除 LITE 外，其余 24 支击球区区间未完成校验`，并把核心股与拓展股中的其余标的统一降成 `击球区：待确认`
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=13907`
+      - `job_name=科技核心股池 · 晚间击球区快报`
+      - `executed_at=2026-05-02T21:36:30.424136+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 开头继续写出：`以下为 data_fetch 返回的最新美股市场口径，价格与财报时间已校验`，随后将除 `LITE` 外的 24 支标的统一标成 `击球区：待确认`
+    - `data/runtime/logs/sidecar.log`
+      - `2026-05-02 21:35:52-21:36:27` 同会话继续高频执行 `Tool: hone/data_fetch`
+      - `2026-05-02 21:36:27.865-21:36:27.866` 整轮仍以 `success=true elapsed_ms=85373 tools=25(Tool: hone/data_fetch) reply.chars=1441` 收口
+      - 同窗没有新的 `tool_failed` 或本地文件检索失败，说明当前坏态继续表现为“区间配置没有进入最终答案”，而不是主链路执行失败
+  - `2026-05-02 09:02 CST` 同链路缺陷在最近一小时真实窗口再次复现：
+    - `data/sessions/Actor_feishu__direct__ou_5f2ccd43e67b89664af3a72e13f9d48773.json`
+      - `updated_at=2026-05-02T09:01:29.928698+08:00`
+      - 最新 `[定时任务触发] 任务名称：核心观察池早间简报` 继续明确要求四段结构，并要求“列出每个标的的当前价格、击球区区间值、下一次财报时间”
+      - 实际 assistant final 再次写出 `除 LITE 外，其余 24 支标的击球区区间未在本轮数据链路中完成校验，全部标注为“待确认”`
+      - 同条回复的“击球区距离表”也只计算 `LITE`，其余 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META / BABA / AAOI / MU / SNDK / STX / WDC / COHR / GEV / TSLA / ORCL / TSM / GLW / CRDO / RKLB / INTC / BE / AMD` 统一降成 `击球区数据待确认，本轮不计算距离`
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=13349`
+      - `job_name=核心观察池早间简报`
+      - `executed_at=2026-05-02T09:01:32.694401+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 开头继续写出：`但除 LITE 外，其余 24 支击球区区间未在本轮数据链路中完成校验，全部标注为“待确认”`
+    - `data/runtime/logs/sidecar.log`
+      - `2026-05-02 09:00:02-09:01:29` 同会话继续跑完 `tools=25(Tool: hone/data_fetch)`，并以 `done success=true elapsed_ms=87651 reply.chars=2334` 收口
+      - 同窗没有新的 `tool_failed`，说明当前坏态依旧是“区间配置/记忆没有进入最终答案”，而不是主链路执行失败
+  - `2026-05-01 23:01 CST` 同链路缺陷在最近一小时真实窗口再次复现：
+    - `data/sessions/Actor_feishu__direct__ou_5f2ccd43e67b89664af3a72e13f9d48773.json`
+      - `updated_at=2026-05-01T23:01:14.020643+08:00`
+      - 最新 `[定时任务触发] 任务名称：核心观察股池晚间快报` 仍要求“每个标的列出当前价格、击球区区间值、下一次财报时间”
+      - 实际 assistant final 再次写出 `除 LITE 外，其余击球区区间仍未完成备案，统一标注待确认`，并把 25 支观察池中的 24 支继续降成 `击球区待确认`
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=12887`
+      - `job_name=核心观察股池晚间快报`
+      - `executed_at=2026-05-01T23:01:16+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 继续原样写出：`除 LITE 外，其余击球区区间仍未完成备案，统一标注待确认`
+    - `data/runtime/logs/sidecar.log`
+      - `2026-05-01 23:00:31-23:01:14` 同会话再次连续执行 20+ 次 `Tool: hone/data_fetch`，并夹带 `portfolio`、`web_search`
+      - `2026-05-01 23:01:14.021` 整轮仍以 `success=true elapsed_ms=71991 tools=26(Tool: hone/data_fetch,Tool: hone/skill_tool) reply.chars=1368` 收口
+      - 最新窗口同样没有出现 `local_search_files` / `local_list_files` / `tool_failed`，说明坏态继续指向“击球区配置/记忆注入缺失”，而不是旧的本地文件搜索失败
+  - `2026-05-01 21:36 CST` 同链路缺陷在最近一小时真实窗口再次复现，先前 `Fixed` 结论失效：
+    - `data/sessions/Actor_feishu__direct__ou_5f2ccd43e67b89664af3a72e13f9d48773.json`
+      - `updated_at=2026-05-01T21:36:10.365924+08:00`
+      - 最新 `[定时任务触发] 任务名称：科技核心股池 · 晚间击球区快报` 仍要求“每个标的列出当前价格、击球区区间值、下一次财报时间”
+      - 实际 assistant final 继续写出 `除 LITE 外，其余击球区区间当前仍未完成备案，统一标注待确认`，并把 25 支观察池中的 24 支继续降成 `击球区待确认`
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=12822`
+      - `job_name=科技核心股池 · 晚间击球区快报`
+      - `executed_at=2026-05-01T21:36:15+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 继续原样写出：`除 LITE 外，其余击球区区间当前仍未完成备案，统一标注待确认`
+    - `data/runtime/logs/sidecar.log`
+      - `2026-05-01 21:35:30-21:35:45` 同会话连续执行 20+ 次 `Tool: hone/data_fetch`
+      - `2026-05-01 21:36:10.366` 整轮仍以 `success=true elapsed_ms=68369 tools=26(Tool: hone/data_fetch,Tool: hone/skill_tool) reply.chars=1371` 收口
+      - 最新窗口里没有再出现 `local_search_files` / `local_list_files` / `tool_failed`，说明当前坏态已经不再等同于 `2026-04-29` 记录里的“本地文件搜索被单个坏文件打断”
+- `2026-05-01 23:01 CST` 的 `核心观察股池晚间快报` 与 `2026-05-01 21:36 CST` 的 `科技核心股池 · 晚间击球区快报` 说明，这条缺陷已同时影响两套观察池日报模板，而不再只限于单个晚间快报名字。
+- `2026-05-03 23:01 CST` 的 `核心观察股池晚间快报` 说明，这条缺陷在最新晚间窗口仍未恢复；当前坏态继续表现为“任务成功送达，但固定击球区静默降级为待确认”，且已经连续跨越同日 `21:35` 与 `23:00` 两轮快报。
+- `2026-05-02 09:02 CST` 的 `核心观察池早间简报` 说明，这条缺陷仍持续影响同一观察池的早间链路，而且已从前一晚延续到次日盘前，不是只在单个晚间模板里偶发。
+- `2026-05-02 21:36 CST` 的 `科技核心股池 · 晚间击球区快报` 说明，这条缺陷在同一天晚间窗口仍未恢复，且当前坏态即便不再出现显式本地检索报错，也会把绝大多数固定击球区静默降级为 `待确认`。
+- `2026-04-30 21:36 CST` 同症状其实已在前一日晚间快报继续活跃：
+    - `cron_job_runs.run_id=11653`
+    - `job_name=科技核心股池 · 晚间击球区快报`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `response_preview` 同样写出 `除 LITE 外，其余击球区未完成校验，统一标注待确认`
+    - 说明 `2026-05-01` 的复现不是偶发回潮，而是至少连续两晚的稳定回退
+- **证据来源**:
+  - `data/sessions/Actor_feishu__direct__ou_5f2ccd43e67b89664af3a72e13f9d48773.json`
+    - `updated_at=2026-05-01T09:01:25.107409+08:00`
+    - 最近一小时真实会话里，同链路的 `核心观察池早间简报` 再次在正文开头明确写出：`除 LITE 外，其余击球区未在当前资料中完成备案，统一标注“待确认”`
+    - 同条回复把 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 以及拓展池大部分标的的击球区继续统一降成 `待确认`，只保留 `LITE` 的固定区间；末尾还写出 `除 LITE 外，其余 24 支击球区区间未在当前资料中校验到`
+    - 这说明问题没有停留在 `2026-04-29 23:00` 的晚间快报单点，而是到 `2026-05-01 09:01` 已扩散到同一观察池的早间简报任务
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `run_id=10496`
+    - `job_name=核心观察股池晚间快报`
+    - `executed_at=2026-04-29T23:01:20+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `should_deliver=1`
+    - `delivered=1`
+    - `response_preview` 开头直接写出：`未找到本地完整击球区配置，除 LITE 外其余击球区标注为待确认`
+    - 同条消息把 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 以及拓展池标的的击球区统一降成 `待确认`
+  - 对照同一任务上一日真实窗口：
+    - `run_id=9269`
+    - `job_name=核心观察股池晚间快报`
+    - `executed_at=2026-04-28T23:00:00+08:00`
+    - `execution_status=completed`
+    - `message_send_status=sent`
+    - `response_preview` 仍能稳定给出固定击球区，例如 `MSFT $335-350`、`NVDA $150-165`、`GOOGL $255-275`、`AAPL $205-225`
+    - 这说明问题不是任务定义本身没有击球区，而是 2026-04-29 23:00 这轮在检索/拼装阶段发生了新的退化
+  - `data/runtime/logs/sidecar.log`
+    - `2026-04-29 23:00:23.526` 同一会话开始调用 `Tool: hone/local_list_files`
+    - `2026-04-29 23:00:23.529` 紧接着开始调用 `Tool: hone/local_search_files`
+    - `2026-04-29 23:00:23.666` 同会话记录 `runner.stage=acp.tool_failed`
+    - 随后 `23:00:44.492-23:00:44.493` 只看到两次 `local_read_file` 成功，`23:01:16.381` 整轮仍以 `success=true reply.chars=1485` 收口
+    - 这说明链路在本地配置检索阶段发生了工具退化，但最终仍把缺失配置后的降级正文作为成功结果送达
+
+## 端到端链路
+
+1. Feishu scheduler 在 `2026-04-29 23:00` 触发 `核心观察股池晚间快报`。
+2. 搜索/整理阶段先尝试通过本地文件工具恢复观察池击球区配置。
+3. 本地检索阶段出现 `acp.tool_failed`，随后只读到了部分本地文件。
+4. 最终回复仍以 `completed + sent` 送达，但正文把除 `LITE` 外几乎所有标的的击球区统一降成“待确认”。
+5. 用户虽然收到了完整日报，但失去了这条任务最关键的固定参考字段之一。
+
+## 期望效果
+
+- `核心观察股池晚间快报` 应稳定带出观察池的固定击球区区间，而不是在已有历史配置的情况下把大部分标的退化成“待确认”。
+- 若本地配置检索失败，链路应优先复用上一轮已知固定区间，或者显式标记本轮任务失败，而不是把缺字段正文当作成功播报送达。
+- 对同一观察池任务，前后相邻窗口不应出现“昨天能给完整击球区，今天几乎全丢失”的无提示回退。
+
+## 当前实现效果
+
+- `2026-05-10 21:35` 与 `23:00` 两个最新真实窗口证明，本缺陷在 `2026-05-10 03:07` 的 scheduler 输入恢复修复后仍复现：两条任务均成功送达，但最终答复继续只保留或声称只保留 `LITE` 击球区，核心股与大部分拓展股仍显示 `击球区：待确认`。
+- `2026-05-09 21:35` 与 `23:00` 两个最新真实窗口证明，本缺陷在 `2026-05-07` 提示与 search guidance 修复后仍复现：两条任务均 `completed + sent + delivered=1`，但核心股与大部分拓展股继续显示 `击球区：待确认`。
+- 最新任务输入已经带有“稳定本地字段约束”，且会话历史 compact summary 中仍保存完整击球区，说明当前坏态不再只是“提示缺约束”，而是已恢复的本地/历史稳定字段没有可靠进入最终答案或被答案阶段忽略。
+- 当前任务主链路没有中断，`cron_job_runs` 与日志都显示这轮任务成功送达。
+- `2026-05-06 23:02` 的 `核心观察股池晚间快报` 说明，问题到本轮巡检时仍持续活跃：任务继续成功送达，但正文明确写出“除 LITE 外，其余 24 支击球区本轮未拿到已验证区间，统一标注待确认”。
+- `2026-05-06 09:01` 的 `核心观察池早间简报` 说明，问题到本轮巡检时仍持续活跃：任务继续成功送达，但核心股里的 `MSFT / NVDA / GOOGL / AAPL` 等固定击球区仍被统一替换成 `待确认`。
+- `2026-05-05 23:01` 的 `核心观察股池晚间快报` 说明，问题到本轮巡检时仍持续活跃：任务继续成功送达，但核心股里的 `MSFT / NVDA / GOOGL / AAPL` 等固定击球区仍被统一替换成 `待确认`。
+- `2026-05-04 09:01` 的 `核心观察池早间简报` 说明，问题到本轮巡检时仍持续活跃：任务继续成功送达，但核心股里的 `MSFT / NVDA / GOOGL / AAPL` 等固定击球区仍被统一替换成 `待确认`。
+- `2026-05-03 09:01` 的 `核心观察池早间简报` 说明，问题到本轮巡检时仍持续活跃：任务继续成功送达，但核心股里的多支固定击球区仍被统一替换成 `待确认`，而且已经从前一晚延续到次日盘前。
+- `2026-05-02 23:01` 的最新晚间窗口说明，问题到本轮巡检时仍持续活跃：任务继续成功送达，但核心股里的多支固定击球区仍被统一替换成 `待确认`。
+- `2026-05-02 21:36` 的最新晚间窗口说明，问题到当晚仍持续活跃：任务继续成功送达，但绝大多数标的的固定击球区仍被统一替换成 `待确认`。
+- `2026-05-01 09:01` 的 `核心观察池早间简报` 说明，这条缺陷并非只影响晚间快报：同一观察池链路在最近一小时仍继续把除 `LITE` 外几乎所有标的的击球区统一降成“待确认”。
+- `2026-04-30 21:35`、`2026-05-01 21:35` 与 `2026-05-01 23:00` 三个连续窗口说明，这条缺陷在此前标记 `Fixed` 后仍持续影响相同观察池链路，而且已经覆盖不同日报模板，而不是只剩历史残留。
+- 但真正送达给用户的正文已经不再提供多数标的的固定击球区，只剩“待确认”占位。
+- 从上一日同任务对照看，配置并非天然缺失，因此这不是用户要求变更，而是当前任务在本地配置检索或上下文拼装阶段发生了退化。
+- 这是质量类缺陷。之所以定级为 `P3`，是因为任务仍成功生成并送达，价格与财报字段也仍可读；受损的是分析完整性和参考价值，而不是主功能链路可用性。
+
+## 用户影响
+
+- 用户无法再直接把当日价格与既定击球区做对照，晚间快报的核心决策价值明显下降。
+- 同一任务前后两天输出能力不一致，会削弱用户对“长期观察池记忆”与固定模板稳定性的信任。
+- 当击球区被统一降级成“待确认”时，用户若继续依赖这条快报做观察池排序，会被迫回到手工核对或重新追问。
+
+## 根因判断
+
+- `2026-04-29` 的首个坏样本里，本地击球区配置检索链路退化是明确放大器：日志同轮出现 `local_list_files` / `local_search_files` 后立即 `acp.tool_failed`，与正文“未找到本地完整击球区配置”的自述一致。
+- `2026-05-02 21:36` 的最新样本再次证明，当前活跃坏态已经不依赖显式 `tool_failed` 才会复现：同窗只有高频 `data_fetch`，没有本地文件检索失败，但最终答案仍把 24 支标的统一降成 `待确认`。
+- 但 `2026-04-30 21:35` 与 `2026-05-01 21:35` 的连续复现说明，当前活跃坏态已经不再依赖相同的工具失败形态：最新窗口只看到高频 `data_fetch` 与 `skill_tool`，没有再出现 `local_search_files` / `tool_failed`，最终仍把绝大多数击球区降成“待确认”。
+- 因此当前更可能是“观察池固定击球区记忆/配置注入在模板或答案拼装阶段继续缺失”，而不只是本地目录检索被单个坏文件打断。
+- 同一症状已经连续影响 `核心观察池早间简报` 与 `科技核心股池 · 晚间击球区快报`，说明问题不局限于单个 scheduler 模板，而是观察池区间恢复链路仍未稳定。
+
+## 修复情况（2026-05-01，已不足以覆盖当前坏态）
+
+- `crates/hone-tools/src/local_files.rs` 已加固 `local_search_files` 的目录递归搜索：遇到单个二进制、非 UTF-8 或不可读文件时跳过该文件并继续搜索其它文本文件，不再让整次本地配置检索直接失败。
+- 搜索结果新增 `skipped_binary_files`、`skipped_non_utf8_files`、`skipped_unreadable_files` 计数，保留可观测性，便于后续判断是否仍有坏文件污染 actor sandbox。
+- 单文件读取 / 单文件搜索仍保持严格错误边界，避免把非文本文件内容误当成有效配置。
+- 回归验证：
+  - `cargo test -p hone-tools directory_search_skips_non_text_files_without_aborting --lib -- --nocapture`
+  - `cargo test -p hone-tools local_files --lib -- --nocapture`
+  - `cargo check -p hone-tools --tests`
+- 当前回看 `2026-04-30 21:35` 与 `2026-05-01 21:35` 两个真实晚间窗口，这组修复并没有恢复固定击球区输出；它至多解释了 `2026-04-29` 的单一放大器，但没有覆盖当前仍在生产中出现的退化形态。
+
+## 修复情况（2026-05-07 11:06 CST）
+
+- 本轮确认当前坏态已经不再只由 `local_search_files` 的单文件检索失败触发：多个最新样本只有高频 `data_fetch`，但最终仍把既有击球区统一降级为 `待确认`。
+- `crates/hone-channels/src/scheduler.rs` 对包含“观察池 + 击球区 / hit zone”的普通定时任务补充稳定本地字段契约：
+  - 观察池、击球区、策略纪律等固定配置属于用户本地状态，不属于行情工具结果。
+  - `data_fetch` 只校验最新价格和财报日期，不应因为行情工具没有返回击球区字段而覆盖或清空已存在的本地区间。
+  - 只有任务正文和已恢复上下文都没有给出某个标的区间时，才允许标注该标的击球区待确认。
+- `crates/hone-channels/src/runners/multi_agent.rs` 的 search-stage guidance 同步要求 watchlist 报告优先保留当前任务正文、恢复上下文、portfolio/local state 或本地文件里的稳定字段，再用 `data_fetch` 补新鲜行情与财报日期。
+- 新增/更新回归测试：
+  - `scheduled_watchlist_hit_zone_prompt_keeps_stable_local_fields`
+  - `search_input_guidance_allows_direct_replies_for_greetings`
+- 验证通过：
+  - `cargo test -p hone-channels scheduled_watchlist_hit_zone_prompt_keeps_stable_local_fields -- --nocapture`
+  - `cargo test -p hone-channels search_input_guidance_allows_direct_replies_for_greetings -- --nocapture`
+- 状态更新为 `Fixed`；后续若仍出现“任务正文或恢复上下文已有区间，但最终答复仍统一写待确认”，应优先检查该轮是否实际恢复了历史 compact summary / session context，而不是继续修改行情工具。
+
+## 修复情况（2026-05-10 03:07 CST）
+
+- 本轮把修复点从“继续提示模型保留本地字段”下沉到 scheduler 输入构造层：
+  - `build_scheduled_prompt_with_recovered_local_context(...)` 会在普通观察池击球区任务上，从当前 actor session 的 `compact summary` / `session.summary` 里恢复本地击球区。
+  - 恢复结果以显式 bullet 列表追加到本轮 prompt，减少 search/answer 阶段遗漏历史区间的概率，不再依赖模型自行翻历史或自行决定是否读取本地文件。
+  - 恢复逻辑优先匹配 compact summary 里的表格行（例如 `| MSFT | ... | $335–$350 |`），并兼容 `MSFT ... 击球区：...` 这类行内表述；`待确认` 和非区间值不会被当作稳定字段回灌。
+- 新增回归证明：
+  - `scheduled_watchlist_prompt_recovers_hit_zones_from_compact_summary`：验证 scheduler 能把 compact summary 中的 `MSFT / TSM / LITE` 击球区恢复到本轮 prompt。
+  - `scheduled_watchlist_hit_zone_prompt_keeps_stable_local_fields`：继续覆盖 2026-05-07 的稳定字段契约。
+- 验证通过：
+  - `cargo test -p hone-channels scheduled_watchlist_hit_zone_prompt_keeps_stable_local_fields -- --nocapture`
+  - `cargo test -p hone-channels scheduled_watchlist_prompt_recovers_hit_zones_from_compact_summary -- --nocapture`
+  - `cargo check -p hone-channels --tests`
+- 本轮未做：
+  - 不重启服务，不重建 desktop，不制造新的晚间/早间运行态窗口。
+- 当前结论：
+  - 代码层已补上“显式恢复稳定击球区”的缺口，因此状态先更新为 `Fixed`。
+  - 下一次 `核心观察池早间简报` / `科技核心股池 · 晚间击球区快报` / `核心观察股池晚间快报` 的真实窗口若仍把已知区间批量写成 `待确认`，应优先检查 live runtime 是否已加载本轮代码，而不是继续追加 prompt 约束。
+
+## 下一步建议
+
+- 下个早间/晚间观察池窗口复核最终答复是否保留历史区间，同时只刷新价格与财报日期。
+- 若 `skipped_non_utf8_files` 长期非零，仍建议清理或隔离 actor sandbox 内的坏编码文件，降低本地检索噪声。

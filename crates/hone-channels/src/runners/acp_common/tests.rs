@@ -23,11 +23,26 @@ struct CollectingEmitter {
     deltas: Arc<Mutex<Vec<String>>>,
 }
 
+struct ProgressEmitter {
+    details: Arc<Mutex<Vec<String>>>,
+}
+
 #[async_trait]
 impl AgentRunnerEmitter for CollectingEmitter {
     async fn emit(&self, event: AgentRunnerEvent) {
         if let AgentRunnerEvent::StreamDelta { content } = event {
             self.deltas.lock().await.push(content);
+        }
+    }
+}
+
+#[async_trait]
+impl AgentRunnerEmitter for ProgressEmitter {
+    async fn emit(&self, event: AgentRunnerEvent) {
+        if let AgentRunnerEvent::Progress { detail, .. } = event
+            && let Some(detail) = detail
+        {
+            self.details.lock().await.push(detail);
         }
     }
 }
@@ -38,6 +53,14 @@ fn collecting_emitter() -> (Arc<dyn AgentRunnerEmitter>, Arc<Mutex<Vec<String>>>
         deltas: deltas.clone(),
     });
     (emitter, deltas)
+}
+
+fn progress_emitter() -> (Arc<dyn AgentRunnerEmitter>, Arc<Mutex<Vec<String>>>) {
+    let details = Arc::new(Mutex::new(Vec::new()));
+    let emitter: Arc<dyn AgentRunnerEmitter> = Arc::new(ProgressEmitter {
+        details: details.clone(),
+    });
+    (emitter, details)
 }
 
 /// codex-acp 内置 compact 触发后单独发一条 `agent_message_chunk text="Context compacted\n"`。
@@ -64,6 +87,66 @@ async fn handle_acp_session_update_marks_codex_compact_literal_chunk_without_dro
         deltas.lock().await.clone() == vec!["Context compacted\n".to_string()],
         "compact literal should be forwarded to sink"
     );
+}
+
+#[tokio::test]
+async fn handle_acp_session_update_drops_internal_prompt_echo_chunk() {
+    let mut state = AcpPromptState::default();
+    let (emitter, deltas) = collecting_emitter();
+    let params = json!({
+        "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+                "text": "### System Instructions ###\nYou are Codex.\n### Skill Context ###\nturn-0 可用技能索引"
+            }
+        }
+    });
+
+    handle_acp_session_update(&params, &emitter, Some(&mut state)).await;
+
+    assert!(state.full_reply.is_empty());
+    assert!(state.pending_assistant_content.is_empty());
+    assert!(deltas.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn handle_acp_session_update_drops_invoked_skill_context_chunk() {
+    let mut state = AcpPromptState::default();
+    let (emitter, deltas) = collecting_emitter();
+    let params = json!({
+        "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+                "text": "【Invoked Skill Context】\nBase directory for this skill: /Users/fengming2/Desktop/honeclaw/skills/scheduled_task\nrawOutput={\"job\":\"secret\"}"
+            }
+        }
+    });
+
+    handle_acp_session_update(&params, &emitter, Some(&mut state)).await;
+
+    assert!(state.full_reply.is_empty());
+    assert!(state.pending_assistant_content.is_empty());
+    assert!(deltas.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn handle_acp_session_update_keeps_visible_prefix_before_prompt_echo() {
+    let mut state = AcpPromptState::default();
+    let (emitter, deltas) = collecting_emitter();
+    let params = json!({
+        "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+                "text": "OK\n### System Instructions ###\nYou are Codex.\n【Session 上下文】"
+            }
+        }
+    });
+
+    handle_acp_session_update(&params, &emitter, Some(&mut state)).await;
+
+    assert_eq!(state.full_reply, "OK");
+    assert_eq!(state.pending_assistant_content, "OK");
+    assert_eq!(deltas.lock().await.clone(), vec!["OK".to_string()]);
 }
 
 /// opencode 不推 compact 字面量，但内置 compact 后 session 体积 >50% 骤降。
@@ -231,7 +314,7 @@ async fn acp_event_log_records_identity_for_grep() {
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     ));
-    let ctx = AcpEventLogContext {
+    let log_context = AcpEventLogContext {
         runner_label: "codex",
         log_path: acp_event_log_path(&temp_root.to_string_lossy()),
         session_id: "session-1".to_string(),
@@ -242,7 +325,7 @@ async fn acp_event_log_records_identity_for_grep() {
     };
 
     log_acp_payload(
-        Some(&ctx),
+        Some(&log_context),
         "recv",
         &json!({
             "jsonrpc": "2.0",
@@ -252,7 +335,7 @@ async fn acp_event_log_records_identity_for_grep() {
     )
     .await;
 
-    let content = tokio::fs::read_to_string(&ctx.log_path)
+    let content = tokio::fs::read_to_string(&log_context.log_path)
         .await
         .expect("read log");
     assert!(content.contains("\"identity\":\"Actor_feishu__group-1__alice\""));
@@ -368,6 +451,157 @@ async fn acp_permission_request_preserves_string_jsonrpc_id() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"id\":\"0e68dcc2-6a6b-4d1e-a49d-cb6dd179beb7\""));
     assert!(stdout.contains("\"optionId\":\"approved-for-session\""));
+}
+
+#[tokio::test]
+async fn acp_permission_progress_redacts_tool_title() {
+    let mut child = tokio::process::Command::new("cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn cat");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let (emitter, details) = progress_emitter();
+    let line = json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "session-1",
+            "options": [
+                {
+                    "kind": "reject_once",
+                    "name": "Reject",
+                    "optionId": "reject"
+                }
+            ],
+            "toolCall": {
+                "title": "run token=tool-secret auth=Bearer bearer-secret"
+            }
+        }
+    })
+    .to_string();
+
+    let result = process_acp_payload(
+        "codex",
+        &mut stdin,
+        4,
+        &line,
+        Some(&emitter),
+        None,
+        None,
+        None,
+        None,
+        AcpPermissionDecision::RejectOnce,
+        None,
+    )
+    .await
+    .expect("process permission request");
+
+    assert!(result.is_none());
+    let details = details.lock().await.clone();
+    assert_eq!(details.len(), 1);
+    assert!(details[0].contains("token=<redacted>"));
+    assert!(details[0].contains("Bearer <redacted>"));
+    assert!(!details[0].contains("tool-secret"));
+    assert!(!details[0].contains("bearer-secret"));
+    drop(stdin);
+    let _ = child.kill().await;
+}
+
+#[tokio::test]
+async fn acp_error_response_uses_bounded_redacted_stderr() {
+    let mut child = tokio::process::Command::new("cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn cat");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let stderr = Arc::new(Mutex::new(
+        "request failed https://api.test/path?api_key=secret&token=secret2 auth=Bearer bearer-secret"
+            .to_string(),
+    ));
+    let line = json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "error": {
+            "message": "upstream failed"
+        }
+    })
+    .to_string();
+
+    let err = process_acp_payload(
+        "codex",
+        &mut stdin,
+        4,
+        &line,
+        None,
+        None,
+        Some(&stderr),
+        None,
+        None,
+        AcpPermissionDecision::RejectOnce,
+        None,
+    )
+    .await
+    .expect_err("error response should fail");
+
+    assert!(err.message.contains("codex acp request failed"));
+    assert!(err.message.contains("api_key=<redacted>"));
+    assert!(err.message.contains("token=<redacted>"));
+    assert!(err.message.contains("Bearer <redacted>"));
+    assert!(!err.message.contains("secret"));
+    assert!(
+        err.message.chars().count() < 540,
+        "stderr detail should be bounded: {}",
+        err.message
+    );
+    drop(stdin);
+    let _ = child.kill().await;
+}
+
+#[tokio::test]
+async fn acp_error_response_redacts_payload_error_message() {
+    let mut child = tokio::process::Command::new("cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn cat");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let line = json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "error": {
+            "message": "upstream failed token=plain-secret auth=Bearer bearer-secret {\"api_key\":\"json-secret\"}"
+        }
+    })
+    .to_string();
+
+    let err = process_acp_payload(
+        "codex",
+        &mut stdin,
+        4,
+        &line,
+        None,
+        None,
+        None,
+        None,
+        None,
+        AcpPermissionDecision::RejectOnce,
+        None,
+    )
+    .await
+    .expect_err("error response should fail");
+
+    assert!(err.message.contains("codex acp request failed"));
+    assert!(err.message.contains("token=<redacted>"));
+    assert!(err.message.contains("Bearer <redacted>"));
+    assert!(err.message.contains("\"api_key\":\"<redacted>\""));
+    assert!(!err.message.contains("plain-secret"));
+    assert!(!err.message.contains("bearer-secret"));
+    assert!(!err.message.contains("json-secret"));
+    drop(stdin);
+    let _ = child.kill().await;
 }
 
 #[test]

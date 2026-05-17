@@ -1,7 +1,7 @@
-// public-portfolio.tsx — 用户的"投资上下文"页:展示系统蒸馏的 thesis、整体投资风格、
+// public-portfolio.tsx — 用户的"投资上下文"页:展示系统蒸馏的投资主线、整体投资风格、
 // sandbox 里的公司画像列表(read-only)。编辑画像走 /chat 与 agent 对话(company_portrait skill)。
 
-import { createSignal, For, onMount, Show } from "solid-js"
+import { createEffect, createSignal, For, onMount, Show } from "solid-js"
 import { useNavigate } from "@solidjs/router"
 import { marked } from "marked"
 import DOMPurify from "dompurify"
@@ -14,25 +14,17 @@ import {
   getPublicAuthMe,
   type DigestContext,
 } from "@/lib/api"
+import { firstProfileTicker, profileTickerSet } from "@/lib/mainline-context-model"
+import {
+  canRefreshPublicMainline,
+  formatPublicMainlineTimestamp,
+  publicRefreshMessage,
+} from "./public-portfolio-model"
 import "./public-site.css"
 
-function formatTimestamp(iso: string | null): string {
-  if (!iso) return "尚未蒸馏"
-  try {
-    const dt = new Date(iso)
-    const days = Math.floor((Date.now() - dt.getTime()) / (24 * 3600 * 1000))
-    if (days === 0) return `今天 ${dt.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`
-    if (days === 1) return "1 天前"
-    if (days < 7) return `${days} 天前`
-    return dt.toLocaleDateString("zh-CN", { year: "numeric", month: "short", day: "numeric" })
-  } catch {
-    return iso
-  }
-}
-
-function ThesisCard(props: {
+function MainlineCard(props: {
   ticker: string
-  thesis: string | undefined
+  mainline: string | undefined
   hasProfile: boolean
   onView: () => void
   isSkipped: boolean
@@ -42,10 +34,10 @@ function ThesisCard(props: {
       style={{
         padding: "20px 22px",
         "border-radius": "12px",
-        border: props.thesis
+        border: props.mainline
           ? "1px solid rgba(0,0,0,0.08)"
           : "1px dashed rgba(245,158,11,0.30)",
-        background: props.thesis ? "#fff" : "rgba(245,158,11,0.04)",
+        background: props.mainline ? "#fff" : "rgba(245,158,11,0.04)",
         display: "flex",
         "flex-direction": "column",
         gap: "10px",
@@ -82,20 +74,20 @@ function ThesisCard(props: {
         </Show>
       </div>
       <Show
-        when={props.thesis}
+        when={props.mainline}
         fallback={
           <div style={{ "font-size": "13px", color: "#94a3b8", "line-height": "1.6" }}>
             <Show
               when={props.hasProfile}
               fallback={
                 <>
-                  <strong style={{ color: "#d97706" }}>没有公司画像</strong> —— 在 chat 里对 agent 说
-                  "建立 {props.ticker} 的公司画像",蒸馏会在下次 cron 自动跑。
+                  <strong style={{ color: "#d97706" }}>暂无公司画像</strong> —— 跟 Hone 说
+                  “建立 {props.ticker} 的公司画像”，下次自动更新就会带上它。
                 </>
               }
             >
-              <strong style={{ color: "#d97706" }}>画像存在但 thesis 蒸馏失败 / 跳过</strong>
-              {props.isSkipped ? "(上次跳过)" : ""}—— 点"立即刷新"重试。
+              <strong style={{ color: "#d97706" }}>画像存在，但投资主线生成失败 / 跳过</strong>
+              {props.isSkipped ? "（上次跳过）" : ""}—— 点击「立即更新」重试。
             </Show>
           </div>
         }
@@ -107,7 +99,7 @@ function ThesisCard(props: {
             "line-height": "1.7",
           }}
         >
-          {props.thesis}
+          {props.mainline}
         </div>
       </Show>
     </div>
@@ -119,14 +111,13 @@ function ProfileModal(props: { open: boolean; ticker: string | null; onClose: ()
   const [loading, setLoading] = createSignal(false)
   const [error, setError] = createSignal<string | null>(null)
 
-  // 当 ticker 改变时拉数据
   const fetchProfile = async (ticker: string) => {
     setLoading(true)
     setError(null)
     setMarkdown(null)
     try {
-      const data = await getCompanyProfileMarkdown(ticker)
-      setMarkdown(data.markdown)
+      const profile = await getCompanyProfileMarkdown(ticker)
+      setMarkdown(profile.markdown)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -134,20 +125,18 @@ function ProfileModal(props: { open: boolean; ticker: string | null; onClose: ()
     }
   }
 
-  // 监听 ticker 变化(使用 createEffect 风格)
   let lastTicker = ""
-  const maybeFetch = () => {
-    const t = props.ticker
-    if (props.open && t && t !== lastTicker) {
-      lastTicker = t
-      fetchProfile(t)
-    }
+  createEffect(() => {
+    const selectedTicker = props.ticker
     if (!props.open) {
       lastTicker = ""
+      return
     }
-  }
-  // SolidJS reactivity:每次 render 都会调用,且 props 是 reactive
-  maybeFetch()
+    if (selectedTicker && selectedTicker !== lastTicker) {
+      lastTicker = selectedTicker
+      void fetchProfile(selectedTicker)
+    }
+  })
 
   const renderedHtml = () => {
     const md = markdown()
@@ -194,7 +183,7 @@ function ProfileModal(props: { open: boolean; ticker: string | null; onClose: ()
             }}
           >
             <div style={{ "font-weight": "700", color: "#0f172a" }}>
-              {props.ticker} · 公司画像 (read-only)
+              {props.ticker} · 公司画像（只读）
             </div>
             <button
               type="button"
@@ -238,7 +227,7 @@ function ProfileModal(props: { open: boolean; ticker: string | null; onClose: ()
               color: "#64748b",
             }}
           >
-            画像由 chat 里 company_portrait skill 维护。如需修改,请在 /chat 与 agent 对话。
+            画像由 Hone 维护。如需修改，请回到对话页跟 Hone 说一声。
           </div>
         </div>
       </div>
@@ -247,7 +236,8 @@ function ProfileModal(props: { open: boolean; ticker: string | null; onClose: ()
 }
 
 function PortfolioContextView() {
-  const [ctx, setCtx] = createSignal<DigestContext | null>(null)
+  const navigate = useNavigate()
+  const [digestContext, setDigestContext] = createSignal<DigestContext | null>(null)
   const [loading, setLoading] = createSignal(true)
   const [error, setError] = createSignal<string | null>(null)
   const [refreshing, setRefreshing] = createSignal(false)
@@ -259,8 +249,8 @@ function PortfolioContextView() {
     setLoading(true)
     setError(null)
     try {
-      const data = await getDigestContext()
-      setCtx(data)
+      const context = await getDigestContext()
+      setDigestContext(context)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -274,13 +264,11 @@ function PortfolioContextView() {
     setRefreshing(true)
     setRefreshMsg(null)
     try {
-      const r = await refreshDigestContext()
-      setRefreshMsg(
-        `蒸馏完成:${r.theses_count} 条 thesis,跳过 ${r.skipped_tickers.length} 只`,
-      )
+      const refreshResult = await refreshDigestContext()
+      setRefreshMsg(publicRefreshMessage(refreshResult))
       await load()
     } catch (e) {
-      setRefreshMsg(`蒸馏失败:${e instanceof Error ? e.message : String(e)}`)
+      setRefreshMsg(`更新失败：${e instanceof Error ? e.message : String(e)}`)
     } finally {
       setRefreshing(false)
     }
@@ -292,31 +280,13 @@ function PortfolioContextView() {
   }
 
   const profileTickers = () => {
-    const c = ctx()
-    if (!c) return new Set<string>()
-    const set = new Set<string>()
-    for (const p of c.profile_list) {
-      for (const t of p.tickers) set.add(t)
-    }
-    return set
+    return profileTickerSet(digestContext())
   }
 
   return (
     <div style={{ "padding-top": "56px", "min-height": "100vh", background: "#f8fafc" }}>
       <div style={{ "max-width": "920px", margin: "0 auto", padding: "48px 32px" }}>
         <div style={{ "margin-bottom": "32px" }}>
-          <div
-            style={{
-              "font-size": "11px",
-              "font-weight": "700",
-              "letter-spacing": "0.30em",
-              "text-transform": "uppercase",
-              color: "#f59e0b",
-              "margin-bottom": "8px",
-            }}
-          >
-            DIGEST CONTEXT
-          </div>
           <h1
             style={{
               "font-size": "28px",
@@ -329,7 +299,7 @@ function PortfolioContextView() {
             投资上下文
           </h1>
           <p style={{ "font-size": "13px", color: "#64748b", "margin-top": "8px", "line-height": "1.7" }}>
-            系统每周自动从你的公司画像蒸馏 thesis,用于过滤全球 digest 的相关性。画像编辑请通过 /chat。
+            Hone 每周自动从你的公司画像里整理出投资主线，用来过滤每日推送的相关性。要修改画像，直接跟 Hone 对话即可。
           </p>
         </div>
 
@@ -348,12 +318,12 @@ function PortfolioContextView() {
               "margin-bottom": "16px",
             }}
           >
-            加载失败:{error()}
+            加载失败：{error()}
           </div>
         </Show>
 
-        <Show when={ctx()}>
-          {(c) => (
+        <Show when={digestContext()}>
+          {(context) => (
             <>
               {/* Meta + 操作 */}
               <div
@@ -367,12 +337,12 @@ function PortfolioContextView() {
                 }}
               >
                 <div style={{ "font-size": "13px", color: "#64748b" }}>
-                  上次蒸馏:<strong style={{ color: "#0f172a" }}>{formatTimestamp(c().last_thesis_distilled_at)}</strong>
-                  <Show when={c().thesis_distill_skipped.length > 0}>
+                  上次更新：<strong style={{ color: "#0f172a" }}>{formatPublicMainlineTimestamp(context().last_mainline_distilled_at)}</strong>
+                  <Show when={context().mainline_distill_skipped.length > 0}>
                     <span style={{ "margin-left": "16px" }}>
-                      跳过 {c().thesis_distill_skipped.length} 只:
+                      跳过 {context().mainline_distill_skipped.length} 只：
                       <span style={{ color: "#d97706", "font-family": "monospace" }}>
-                        {c().thesis_distill_skipped.join(", ")}
+                        {context().mainline_distill_skipped.join(", ")}
                       </span>
                     </span>
                   </Show>
@@ -380,20 +350,31 @@ function PortfolioContextView() {
                 <button
                   type="button"
                   onClick={handleRefresh}
-                  disabled={refreshing()}
+                  disabled={refreshing() || !canRefreshPublicMainline(context().profile_list.length)}
                   style={{
                     padding: "8px 16px",
                     "border-radius": "8px",
                     border: "1px solid #f59e0b",
-                    background: refreshing() ? "rgba(245,158,11,0.5)" : "#f59e0b",
+                    background:
+                      refreshing() || !canRefreshPublicMainline(context().profile_list.length)
+                        ? "rgba(245,158,11,0.4)"
+                        : "#f59e0b",
                     color: "#fff",
-                    cursor: refreshing() ? "not-allowed" : "pointer",
+                    cursor:
+                      refreshing() || !canRefreshPublicMainline(context().profile_list.length)
+                        ? "not-allowed"
+                        : "pointer",
                     "font-family": "inherit",
                     "font-size": "13px",
                     "font-weight": "600",
                   }}
+                  title={
+                    !canRefreshPublicMainline(context().profile_list.length)
+                      ? "先建立至少 1 个公司画像才能更新"
+                      : ""
+                  }
                 >
-                  {refreshing() ? "蒸馏中…" : "立即刷新"}
+                  {refreshing() ? "更新中…" : "立即更新"}
                 </button>
               </div>
               <Show when={refreshMsg()}>
@@ -436,19 +417,19 @@ function PortfolioContextView() {
                 </div>
                 <div style={{ "font-size": "14px", color: "#0f172a", "line-height": "1.7" }}>
                   <Show
-                    when={c().investment_global_style}
+                    when={context().mainline_style}
                     fallback={
                       <span style={{ color: "#94a3b8" }}>
-                        尚未蒸馏 —— 至少要有 1 个公司画像才能产出整体风格。
+                        暂无数据 —— 需要先建立至少 1 个公司画像。
                       </span>
                     }
                   >
-                    {c().investment_global_style}
+                    {context().mainline_style}
                   </Show>
                 </div>
               </div>
 
-              {/* Per-ticker thesis */}
+              {/* Per-ticker mainline */}
               <h2
                 style={{
                   "font-size": "16px",
@@ -457,10 +438,10 @@ function PortfolioContextView() {
                   margin: "24px 0 12px",
                 }}
               >
-                各持仓 Thesis ({c().holdings.length} 只)
+                各持仓投资主线 ({context().holdings.length} 只)
               </h2>
               <Show
-                when={c().holdings.length > 0}
+                when={context().holdings.length > 0}
                 fallback={
                   <div
                     style={{
@@ -470,9 +451,30 @@ function PortfolioContextView() {
                       "text-align": "center",
                       color: "#94a3b8",
                       "font-size": "13px",
+                      display: "flex",
+                      "flex-direction": "column",
+                      "align-items": "center",
+                      gap: "14px",
                     }}
                   >
-                    持仓为空 —— 请在 /chat 里告诉 agent 你持有什么。
+                    <span>暂无持仓。跟 Hone 说一声你持有什么就行。</span>
+                    <button
+                      type="button"
+                      onClick={() => navigate("/chat")}
+                      style={{
+                        padding: "8px 18px",
+                        "border-radius": "999px",
+                        background: "#0f172a",
+                        color: "#fff",
+                        border: "none",
+                        "font-family": "inherit",
+                        "font-size": "13px",
+                        "font-weight": "600",
+                        cursor: "pointer",
+                      }}
+                    >
+                      去对话 →
+                    </button>
                   </div>
                 }
               >
@@ -484,13 +486,13 @@ function PortfolioContextView() {
                     "margin-bottom": "32px",
                   }}
                 >
-                  <For each={c().holdings}>
+                  <For each={context().holdings}>
                     {(ticker) => (
-                      <ThesisCard
+                      <MainlineCard
                         ticker={ticker}
-                        thesis={c().investment_theses[ticker]}
+                        mainline={context().mainline_by_ticker[ticker]}
                         hasProfile={profileTickers().has(ticker)}
-                        isSkipped={c().thesis_distill_skipped.includes(ticker)}
+                        isSkipped={context().mainline_distill_skipped.includes(ticker)}
                         onView={() => openProfile(ticker)}
                       />
                     )}
@@ -498,7 +500,7 @@ function PortfolioContextView() {
                 </div>
               </Show>
 
-              {/* 画像 inventory */}
+              {/* 公司画像列表 */}
               <h2
                 style={{
                   "font-size": "16px",
@@ -507,10 +509,10 @@ function PortfolioContextView() {
                   margin: "32px 0 12px",
                 }}
               >
-                公司画像 inventory ({c().profile_list.length})
+                公司画像 ({context().profile_list.length})
               </h2>
               <Show
-                when={c().profile_list.length > 0}
+                when={context().profile_list.length > 0}
                 fallback={
                   <div
                     style={{
@@ -520,71 +522,97 @@ function PortfolioContextView() {
                       "text-align": "center",
                       color: "#94a3b8",
                       "font-size": "13px",
+                      display: "flex",
+                      "flex-direction": "column",
+                      "align-items": "center",
+                      gap: "14px",
                     }}
                   >
-                    sandbox 里还没有任何公司画像。在 /chat 里说"建立 X 的公司画像"开始。
+                    <span>还没有公司画像。跟 Hone 说「建立 X 的公司画像」就能开始。</span>
+                    <button
+                      type="button"
+                      onClick={() => navigate("/chat")}
+                      style={{
+                        padding: "8px 18px",
+                        "border-radius": "999px",
+                        background: "#0f172a",
+                        color: "#fff",
+                        border: "none",
+                        "font-family": "inherit",
+                        "font-size": "13px",
+                        "font-weight": "600",
+                        cursor: "pointer",
+                      }}
+                    >
+                      去对话 →
+                    </button>
                   </div>
                 }
               >
                 <div style={{ display: "flex", "flex-direction": "column", gap: "10px" }}>
-                  <For each={c().profile_list}>
-                    {(p) => (
-                      <div
-                        style={{
-                          padding: "14px 18px",
-                          "border-radius": "10px",
-                          background: "#fff",
-                          border: "1px solid rgba(0,0,0,0.06)",
-                          display: "flex",
-                          "align-items": "center",
-                          "justify-content": "space-between",
-                          gap: "12px",
-                        }}
-                      >
-                        <div style={{ flex: "1" }}>
-                          <div style={{ "font-size": "14px", "font-weight": "600", color: "#0f172a" }}>
-                            {p.title || p.dir}
-                            <span
+                  <For each={context().profile_list}>
+                    {(profile) => {
+                      const viewTicker = () => firstProfileTicker(profile)
+                      return (
+                        <div
+                          style={{
+                            padding: "14px 18px",
+                            "border-radius": "10px",
+                            background: "#fff",
+                            border: "1px solid rgba(0,0,0,0.06)",
+                            display: "flex",
+                            "align-items": "center",
+                            "justify-content": "space-between",
+                            gap: "12px",
+                          }}
+                        >
+                          <div style={{ flex: "1" }}>
+                            <div style={{ "font-size": "14px", "font-weight": "600", color: "#0f172a" }}>
+                              {profile.title || profile.dir}
+                              <span
+                                style={{
+                                  "margin-left": "8px",
+                                  "font-family": "monospace",
+                                  "font-size": "12px",
+                                  color: "#64748b",
+                                }}
+                              >
+                                {profile.tickers.join(" / ")}
+                              </span>
+                            </div>
+                            <div
                               style={{
-                                "margin-left": "8px",
-                                "font-family": "monospace",
                                 "font-size": "12px",
-                                color: "#64748b",
+                                color: "#94a3b8",
+                                "margin-top": "4px",
                               }}
                             >
-                              {p.tickers.join(" / ")}
-                            </span>
+                              {(profile.bytes / 1024).toFixed(1)} KB · {profile.dir}
+                            </div>
                           </div>
-                          <div
-                            style={{
-                              "font-size": "12px",
-                              color: "#94a3b8",
-                              "margin-top": "4px",
-                            }}
-                          >
-                            {(p.bytes / 1024).toFixed(1)} KB · {p.dir}
-                          </div>
+                          <Show when={viewTicker()}>
+                            {(ticker) => (
+                              <button
+                                type="button"
+                                onClick={() => openProfile(ticker())}
+                                style={{
+                                  padding: "6px 12px",
+                                  "border-radius": "6px",
+                                  border: "1px solid rgba(0,0,0,0.10)",
+                                  background: "#fff",
+                                  color: "#475569",
+                                  cursor: "pointer",
+                                  "font-family": "inherit",
+                                  "font-size": "12px",
+                                }}
+                              >
+                                查看
+                              </button>
+                            )}
+                          </Show>
                         </div>
-                        <Show when={p.tickers.length > 0}>
-                          <button
-                            type="button"
-                            onClick={() => openProfile(p.tickers[0])}
-                            style={{
-                              padding: "6px 12px",
-                              "border-radius": "6px",
-                              border: "1px solid rgba(0,0,0,0.10)",
-                              background: "#fff",
-                              color: "#475569",
-                              cursor: "pointer",
-                              "font-family": "inherit",
-                              "font-size": "12px",
-                            }}
-                          >
-                            查看
-                          </button>
-                        </Show>
-                      </div>
-                    )}
+                      )
+                    }}
                   </For>
                 </div>
               </Show>
@@ -592,7 +620,10 @@ function PortfolioContextView() {
               <ProfileModal
                 open={modalOpen()}
                 ticker={modalTicker()}
-                onClose={() => setModalOpen(false)}
+                onClose={() => {
+                  setModalOpen(false)
+                  setModalTicker(null)
+                }}
               />
             </>
           )}

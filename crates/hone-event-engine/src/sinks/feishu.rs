@@ -11,6 +11,7 @@
 //! 为什么不走 Go facade:facade 主要承接交互式对话的复杂路径(卡片 / thread /
 //! placeholder),engine 只需要最朴素的一段 text,多一跳 JSON-RPC 反而引入依赖。
 
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,7 @@ use crate::digest::DigestPayload;
 use crate::renderer::RenderFormat;
 use crate::router::OutboundSink;
 use crate::sinks::feishu_card::build_feishu_card;
+use crate::sinks::http_error::{format_transport_error, format_upstream_http_error};
 
 const FEISHU_TOKEN_URL: &str =
     "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal";
@@ -34,20 +36,15 @@ pub struct FeishuSink {
     app_secret: String,
     client: reqwest::Client,
     token_cache: Arc<RwLock<Option<(String, Instant)>>>,
-    direct_contact: Option<FeishuDirectContact>,
-    direct_open_id_cache: Arc<RwLock<Option<String>>>,
+    direct_contacts: Option<FeishuDirectContacts>,
+    direct_actor_contacts: HashMap<String, FeishuDirectContacts>,
+    direct_open_id_cache: Arc<RwLock<HashMap<String, String>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum FeishuDirectContactKind {
-    Email,
-    Mobile,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FeishuDirectContact {
-    kind: FeishuDirectContactKind,
-    value: String,
+struct FeishuDirectContacts {
+    emails: Vec<String>,
+    mobiles: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -74,8 +71,9 @@ impl FeishuSink {
                 .build()
                 .expect("reqwest client"),
             token_cache: Arc::new(RwLock::new(None)),
-            direct_contact: None,
-            direct_open_id_cache: Arc::new(RwLock::new(None)),
+            direct_contacts: None,
+            direct_actor_contacts: HashMap::new(),
+            direct_open_id_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -84,17 +82,36 @@ impl FeishuSink {
         allow_emails: &[String],
         allow_mobiles: &[String],
     ) -> Self {
-        self.direct_contact = single_direct_contact(allow_emails, allow_mobiles);
+        self.direct_contacts = stable_direct_contacts(allow_emails, allow_mobiles);
+        self
+    }
+
+    pub fn with_direct_actor_contact_targets<I, A, T>(mut self, targets: I) -> Self
+    where
+        I: IntoIterator<Item = (A, T)>,
+        A: Into<String>,
+        T: Into<String>,
+    {
+        self.direct_actor_contacts = targets
+            .into_iter()
+            .filter_map(|(actor_user_id, target)| {
+                let actor_user_id = actor_user_id.into().trim().to_string();
+                if actor_user_id.is_empty() {
+                    return None;
+                }
+                direct_contact_from_target(&target.into()).map(|contacts| (actor_user_id, contacts))
+            })
+            .collect();
         self
     }
 
     async fn token(&self) -> anyhow::Result<String> {
         {
             let cache = self.token_cache.read().await;
-            if let Some((t, exp)) = &*cache {
-                if Instant::now() < *exp {
-                    return Ok(t.clone());
-                }
+            if let Some((t, exp)) = &*cache
+                && Instant::now() < *exp
+            {
+                return Ok(t.clone());
             }
         }
         let resp = self
@@ -105,10 +122,14 @@ impl FeishuSink {
                 "app_secret": &self.app_secret,
             }))
             .send()
-            .await?;
+            .await
+            .map_err(|err| anyhow::anyhow!(format_transport_error("feishu", "token", &err)))?;
         let status = resp.status();
         if !status.is_success() {
-            anyhow::bail!("feishu token HTTP {status}");
+            let detail = resp.text().await.unwrap_or_default();
+            anyhow::bail!(format_upstream_http_error(
+                "feishu", "token", status, &detail
+            ));
         }
         let parsed: TokenResp = resp.json().await?;
         if parsed.code != 0 {
@@ -144,6 +165,16 @@ impl FeishuSink {
                 Ok(("chat_id", chat_id))
             }
             _ => {
+                if let Some(contacts) = self.direct_actor_contacts.get(actor.user_id.trim())
+                    && let Some(open_id) = self
+                        .resolve_direct_open_id_for_contacts(
+                            &format!("actor:{}", actor.user_id.trim()),
+                            contacts,
+                        )
+                        .await?
+                {
+                    return Ok(("open_id", open_id));
+                }
                 if let Some(open_id) = self.resolve_direct_open_id().await? {
                     Ok(("open_id", open_id))
                 } else {
@@ -154,28 +185,58 @@ impl FeishuSink {
     }
 
     async fn resolve_direct_open_id(&self) -> anyhow::Result<Option<String>> {
-        let Some(contact) = &self.direct_contact else {
+        let Some(contacts) = &self.direct_contacts else {
             return Ok(None);
         };
-        if let Some(cached) = self.direct_open_id_cache.read().await.clone() {
+        self.resolve_direct_open_id_for_contacts("config:single_direct_contact", contacts)
+            .await
+    }
+
+    async fn resolve_direct_open_id_for_contacts(
+        &self,
+        cache_key: &str,
+        contacts: &FeishuDirectContacts,
+    ) -> anyhow::Result<Option<String>> {
+        if let Some(cached) = self
+            .direct_open_id_cache
+            .read()
+            .await
+            .get(cache_key)
+            .cloned()
+        {
             return Ok(Some(cached));
         }
         let token = self.token().await?;
-        let body = match contact.kind {
-            FeishuDirectContactKind::Email => serde_json::json!({ "emails": [&contact.value] }),
-            FeishuDirectContactKind::Mobile => serde_json::json!({ "mobiles": [&contact.value] }),
-        };
+        let mut body = serde_json::Map::new();
+        if !contacts.emails.is_empty() {
+            body.insert("emails".to_string(), serde_json::json!(contacts.emails));
+        }
+        if !contacts.mobiles.is_empty() {
+            body.insert("mobiles".to_string(), serde_json::json!(contacts.mobiles));
+        }
         let resp = self
             .client
             .post("https://open.feishu.cn/open-apis/contact/v3/users/batch_get_id?user_id_type=open_id")
             .bearer_auth(&token)
-            .json(&body)
+            .json(&Value::Object(body))
             .send()
-            .await?;
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(format_transport_error(
+                    "feishu",
+                    "resolve direct contact",
+                    &err
+                ))
+            })?;
         let status = resp.status();
         if !status.is_success() {
             let detail = resp.text().await.unwrap_or_default();
-            anyhow::bail!("feishu resolve direct contact HTTP {status}: {detail}");
+            anyhow::bail!(format_upstream_http_error(
+                "feishu",
+                "resolve direct contact",
+                status,
+                &detail
+            ));
         }
         let parsed: BatchGetIdResp = resp.json().await?;
         if parsed.code != 0 {
@@ -185,9 +246,13 @@ impl FeishuSink {
                 parsed.msg
             );
         }
-        let open_id = first_batch_get_open_id(parsed.data)
-            .ok_or_else(|| anyhow::anyhow!("feishu direct contact did not resolve to open_id"))?;
-        *self.direct_open_id_cache.write().await = Some(open_id.clone());
+        let Some(open_id) = unique_batch_get_open_id(parsed.data) else {
+            return Ok(None);
+        };
+        self.direct_open_id_cache
+            .write()
+            .await
+            .insert(cache_key.to_string(), open_id.clone());
         Ok(Some(open_id))
     }
 }
@@ -199,44 +264,83 @@ struct BatchGetIdResp {
     data: Option<Value>,
 }
 
-fn single_direct_contact(
+fn stable_direct_contacts(
     allow_emails: &[String],
     allow_mobiles: &[String],
-) -> Option<FeishuDirectContact> {
+) -> Option<FeishuDirectContacts> {
     let emails: Vec<_> = allow_emails
         .iter()
         .map(|value| value.trim())
         .filter(|value| !value.is_empty() && *value != "*")
+        .map(str::to_string)
         .collect();
     let mobiles: Vec<_> = allow_mobiles
         .iter()
         .map(|value| value.trim())
         .filter(|value| !value.is_empty() && *value != "*")
+        .map(str::to_string)
         .collect();
-    match (emails.as_slice(), mobiles.as_slice()) {
-        ([email], []) => Some(FeishuDirectContact {
-            kind: FeishuDirectContactKind::Email,
-            value: (*email).to_string(),
-        }),
-        ([], [mobile]) => Some(FeishuDirectContact {
-            kind: FeishuDirectContactKind::Mobile,
-            value: (*mobile).to_string(),
-        }),
-        _ => None,
+    if emails.is_empty() && mobiles.is_empty() {
+        None
+    } else {
+        Some(FeishuDirectContacts { emails, mobiles })
     }
 }
 
-fn first_batch_get_open_id(data: Option<Value>) -> Option<String> {
-    data.and_then(|data| data.get("user_list").cloned())
+fn direct_contact_from_target(target: &str) -> Option<FeishuDirectContacts> {
+    let target = target.trim();
+    if target.is_empty() || target == "*" {
+        return None;
+    }
+    if target.contains('@') {
+        return Some(FeishuDirectContacts {
+            emails: vec![target.to_string()],
+            mobiles: Vec::new(),
+        });
+    }
+    if looks_like_mobile(target) {
+        return Some(FeishuDirectContacts {
+            emails: Vec::new(),
+            mobiles: vec![target.to_string()],
+        });
+    }
+    None
+}
+
+fn looks_like_mobile(target: &str) -> bool {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || matches!(ch, '+' | ' ' | '-' | '(' | ')'))
+    {
+        return false;
+    }
+    trimmed.chars().filter(|ch| ch.is_ascii_digit()).count() >= 7
+}
+
+fn unique_batch_get_open_id(data: Option<Value>) -> Option<String> {
+    let ids: BTreeSet<String> = data
+        .and_then(|data| data.get("user_list").cloned())
         .and_then(|value| value.as_array().cloned())
-        .and_then(|list| {
-            list.into_iter().next().and_then(|entry| {
-                entry
-                    .get("user_id")
-                    .and_then(|value| value.as_str())
-                    .map(|value| value.to_string())
-            })
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .get("user_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
         })
+        .collect();
+    if ids.len() == 1 {
+        ids.into_iter().next()
+    } else {
+        None
+    }
 }
 
 impl FeishuSink {
@@ -260,11 +364,14 @@ impl FeishuSink {
                 "content": content,
             }))
             .send()
-            .await?;
+            .await
+            .map_err(|err| anyhow::anyhow!(format_transport_error("feishu", "send", &err)))?;
         let status = resp.status();
         if !status.is_success() {
             let detail = resp.text().await.unwrap_or_default();
-            anyhow::bail!("feishu send HTTP {status}: {detail}");
+            anyhow::bail!(format_upstream_http_error(
+                "feishu", "send", status, &detail
+            ));
         }
         let parsed: SendResp = resp.json().await?;
         if parsed.code != 0 {
@@ -332,51 +439,115 @@ mod tests {
     }
 
     #[test]
-    fn direct_contact_fallback_only_uses_single_stable_contact() {
+    fn direct_contact_fallback_uses_stable_contacts() {
         assert_eq!(
-            single_direct_contact(&["alice@example.com".to_string()], &[]),
-            Some(FeishuDirectContact {
-                kind: FeishuDirectContactKind::Email,
-                value: "alice@example.com".to_string(),
+            stable_direct_contacts(&["alice@example.com".to_string()], &[]),
+            Some(FeishuDirectContacts {
+                emails: vec!["alice@example.com".to_string()],
+                mobiles: vec![],
             })
         );
         assert_eq!(
-            single_direct_contact(&[], &["+8613800138000".to_string()]),
-            Some(FeishuDirectContact {
-                kind: FeishuDirectContactKind::Mobile,
-                value: "+8613800138000".to_string(),
+            stable_direct_contacts(&[], &["+8613800138000".to_string()]),
+            Some(FeishuDirectContacts {
+                emails: vec![],
+                mobiles: vec!["+8613800138000".to_string()],
             })
         );
         assert_eq!(
-            single_direct_contact(
+            stable_direct_contacts(
                 &["alice@example.com".to_string()],
                 &["+8613800138000".to_string()]
             ),
-            None
+            Some(FeishuDirectContacts {
+                emails: vec!["alice@example.com".to_string()],
+                mobiles: vec!["+8613800138000".to_string()],
+            })
         );
         assert_eq!(
-            single_direct_contact(
+            stable_direct_contacts(
                 &[
                     "alice@example.com".to_string(),
                     "bob@example.com".to_string()
                 ],
                 &[]
             ),
-            None
+            Some(FeishuDirectContacts {
+                emails: vec![
+                    "alice@example.com".to_string(),
+                    "bob@example.com".to_string()
+                ],
+                mobiles: vec![],
+            })
         );
+        assert_eq!(stable_direct_contacts(&["*".to_string()], &[]), None);
     }
 
     #[test]
-    fn first_batch_get_open_id_extracts_user_id() {
+    fn direct_actor_contact_targets_keep_only_resolvable_contacts() {
+        let sink = FeishuSink::new("app", "secret").with_direct_actor_contact_targets(vec![
+            ("ou_email", "alice@example.com"),
+            ("ou_mobile", "+8613800138000"),
+            ("ou_open", "ou_stale"),
+            ("", "bob@example.com"),
+        ]);
+        assert_eq!(
+            sink.direct_actor_contacts.get("ou_email"),
+            Some(&FeishuDirectContacts {
+                emails: vec!["alice@example.com".to_string()],
+                mobiles: vec![],
+            })
+        );
+        assert_eq!(
+            sink.direct_actor_contacts.get("ou_mobile"),
+            Some(&FeishuDirectContacts {
+                emails: vec![],
+                mobiles: vec!["+8613800138000".to_string()],
+            })
+        );
+        assert!(!sink.direct_actor_contacts.contains_key("ou_open"));
+        assert!(!sink.direct_actor_contacts.contains_key(""));
+    }
+
+    #[tokio::test]
+    async fn receive_target_prefers_actor_contact_cache() {
+        let sink = FeishuSink::new("app", "secret")
+            .with_direct_actor_contact_targets(vec![("ou_stale", "+8613800138000")]);
+        sink.direct_open_id_cache
+            .write()
+            .await
+            .insert("actor:ou_stale".to_string(), "ou_current".to_string());
+        let actor = ActorIdentity::new("feishu", "ou_stale", None::<String>).unwrap();
+
+        let (ty, id) = sink.receive_target(&actor).await.unwrap();
+
+        assert_eq!(ty, "open_id");
+        assert_eq!(id, "ou_current");
+    }
+
+    #[test]
+    fn unique_batch_get_open_id_extracts_single_user_id() {
         let data = serde_json::json!({
             "user_list": [
+                { "user_id": "ou_current" },
                 { "user_id": "ou_current" }
             ]
         });
         assert_eq!(
-            first_batch_get_open_id(Some(data)).as_deref(),
+            unique_batch_get_open_id(Some(data)).as_deref(),
             Some("ou_current")
         );
+    }
+
+    #[test]
+    fn unique_batch_get_open_id_rejects_ambiguous_users() {
+        let data = serde_json::json!({
+            "user_list": [
+                { "user_id": "ou_a" },
+                { "user_id": "ou_b" }
+            ]
+        });
+        assert_eq!(unique_batch_get_open_id(Some(data)), None);
     }
 
     #[test]

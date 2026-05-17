@@ -29,9 +29,12 @@ pub struct EventEngineConfig {
     pub earnings: EarningsConfig,
 
     #[serde(default)]
+    pub sec_filings: SecFilingsConfig,
+
+    #[serde(default)]
     pub global_digest: GlobalDigestConfig,
 
-    /// 全局禁用的 event kind 标签列表（`kind_tag` 字符串，如 `"press_release"`）。
+    /// 全局禁用的 event kind 标签列表（`kind_tag` 字符串，如 `"social_post"`）。
     /// Router 在 per-user prefs 之前先过一遍；入库仍然发生（便于日报统计），
     /// 只是不分发给任何 actor。部署方用于关闭噪音类事件。
     #[serde(default)]
@@ -43,10 +46,13 @@ pub struct EventEngineConfig {
     #[serde(default = "default_news_importance_prompt")]
     pub news_importance_prompt: String,
 
-    /// 不确定来源新闻 LLM 仲裁模型。走 OpenRouter 兼容 chat completions。
-    /// 留空时装配层回退到默认值。
+    /// 不确定来源新闻 LLM 仲裁的 legacy OpenRouter 模型。
+    /// 仅在 `news_classifier_llm` 留空时使用;留空则装配层回退到默认值。
     #[serde(default = "default_news_classifier_model")]
     pub news_classifier_model: String,
+    /// 可选 LLM profile 名称。配置后优先于 `news_classifier_model`。
+    #[serde(default)]
+    pub news_classifier_llm: String,
 }
 
 impl Default for EventEngineConfig {
@@ -59,10 +65,12 @@ impl Default for EventEngineConfig {
             renderer: RendererConfig::default(),
             sources: Sources::default(),
             earnings: EarningsConfig::default(),
+            sec_filings: SecFilingsConfig::default(),
             global_digest: GlobalDigestConfig::default(),
             disabled_kinds: Vec::new(),
             news_importance_prompt: default_news_importance_prompt(),
             news_classifier_model: default_news_classifier_model(),
+            news_classifier_llm: String::new(),
         }
     }
 }
@@ -72,7 +80,7 @@ fn default_news_importance_prompt() -> String {
 }
 
 fn default_news_classifier_model() -> String {
-    "amazon/nova-lite-v1".to_string()
+    "x-ai/grok-4.1-fast".to_string()
 }
 
 /// 财报 poller 特有参数。
@@ -87,12 +95,15 @@ fn default_news_classifier_model() -> String {
 pub struct EarningsConfig {
     #[serde(default = "default_earnings_window_days")]
     pub window_days: i64,
+    #[serde(default)]
+    pub quality_review: EarningsQualityReviewConfig,
 }
 
 impl Default for EarningsConfig {
     fn default() -> Self {
         Self {
             window_days: default_earnings_window_days(),
+            quality_review: EarningsQualityReviewConfig::default(),
         }
     }
 }
@@ -101,39 +112,191 @@ fn default_earnings_window_days() -> i64 {
     14
 }
 
-/// 全局 digest 配置 —— LLM 精读后每天 N 次推送的"今日全球要闻"。
+/// 财报发布后的综合质量判断配置。
 ///
-/// 与 per-actor digest 完全独立:per-actor 走 ticker 命中 → buffer → flush;
-/// 全局 digest 则不挂 ticker,从 store 取候选池(trusted-source High/Medium news +
-/// macro_event) → Pass 1 廉价模型批量打分聚类 → Pass 2 抓原文 + 强模型精读
-/// → 渲染单条 broadcast 给所有 direct actor(prefs.global_digest_enabled=true)。
+/// `EarningsSurprisePoller` 的原始数据只有 EPS actual vs estimate。该 review
+/// 路径会在存在近期 SEC 8-K 财报新闻稿上下文时,用 LLM 综合收入、指引、backlog、
+/// GAAP/non-GAAP 利润、EBIT/EBITA/EBITDA、现金流与风险,决定是否保持即时推或降入
+/// digest。失败、缺少上下文或低置信时直接跳过 candidate,不再产出 EPS-only 推送。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EarningsQualityReviewConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 可选 LLM profile 名称。配置后优先于 `model`。
+    #[serde(default)]
+    pub llm: String,
+    #[serde(default = "default_earnings_quality_review_model")]
+    pub model: String,
+    #[serde(default = "default_earnings_quality_review_max_tokens")]
+    pub max_review_tokens: u32,
+    #[serde(default = "default_earnings_quality_review_min_confidence")]
+    pub min_review_confidence: f64,
+    #[serde(default = "default_earnings_quality_review_min_immediate_confidence")]
+    pub min_immediate_confidence: f64,
+    #[serde(default = "default_earnings_quality_review_sec_recent_hours")]
+    pub sec_recent_hours: i64,
+    #[serde(default = "default_earnings_quality_review_context_max_chars")]
+    pub context_max_chars: usize,
+}
+
+impl Default for EarningsQualityReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            llm: String::new(),
+            model: default_earnings_quality_review_model(),
+            max_review_tokens: default_earnings_quality_review_max_tokens(),
+            min_review_confidence: default_earnings_quality_review_min_confidence(),
+            min_immediate_confidence: default_earnings_quality_review_min_immediate_confidence(),
+            sec_recent_hours: default_earnings_quality_review_sec_recent_hours(),
+            context_max_chars: default_earnings_quality_review_context_max_chars(),
+        }
+    }
+}
+
+fn default_earnings_quality_review_model() -> String {
+    "x-ai/grok-4.1-fast".into()
+}
+
+fn default_earnings_quality_review_max_tokens() -> u32 {
+    1800
+}
+
+fn default_earnings_quality_review_min_confidence() -> f64 {
+    0.65
+}
+
+fn default_earnings_quality_review_min_immediate_confidence() -> f64 {
+    0.90
+}
+
+fn default_earnings_quality_review_sec_recent_hours() -> i64 {
+    72
+}
+
+fn default_earnings_quality_review_context_max_chars() -> usize {
+    9_000
+}
+
+/// SEC filings poller 配置。
 ///
-/// 默认 `enabled=false`,需要先设 `schedules` 才会触发。
+/// `forms` 决定 `SecFilingsPoller` 每 tick 对每只 watchlist ticker 拉哪些 form 类型。
+/// 默认覆盖 8-K(突发披露,High)/ 10-Q(季报,Medium)/ 10-K(年报,Medium)/
+/// S-1(IPO 或追加发行,High)/ DEF 14A(委托书,Low)。Severity 由 `events_from_sec_filings`
+/// 在事件构造时按 form 类型映射,**不是**在 config 里配置。
+///
+/// `enrichment` 子配置控制是否调 LLM 给每条 filing 生成 ~200 字业务摘要(长期主线投资者
+/// 视角,跳过 GAAP 数字、抓 backlog/资本配置/风险)。POC 实证 grok-4.1-fast 在 11 持仓
+/// 一年 ~70 条 filing × $0.012 ≈ $0.82/年,质量、成本、延迟均第一。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecFilingsConfig {
+    #[serde(default = "default_sec_forms")]
+    pub forms: Vec<String>,
+    #[serde(default)]
+    pub enrichment: SecFilingsEnrichmentConfig,
+}
+
+impl Default for SecFilingsConfig {
+    fn default() -> Self {
+        Self {
+            forms: default_sec_forms(),
+            enrichment: SecFilingsEnrichmentConfig::default(),
+        }
+    }
+}
+
+fn default_sec_forms() -> Vec<String> {
+    vec![
+        "8-K".into(),
+        "10-Q".into(),
+        "10-K".into(),
+        "S-1".into(),
+        "DEF 14A".into(),
+    ]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecFilingsEnrichmentConfig {
+    /// 是否给 SEC filing 事件调 LLM 生成业务摘要;关闭则只走原始 form/link body。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 可选 LLM profile 名称。配置后优先于 `model`。
+    #[serde(default)]
+    pub llm: String,
+    /// LLM 模型名(OpenRouter 风格)。POC 验证 `x-ai/grok-4.1-fast` 质量、成本、延迟均最佳。
+    #[serde(default = "default_sec_summary_model")]
+    pub model: String,
+    /// 摘要 max_tokens 上限。grok-4.1-fast 在 ~200 字目标下,800 token 充足且不会被截断。
+    #[serde(default = "default_sec_summary_max_tokens")]
+    pub max_summary_tokens: u32,
+    /// fetch SEC.gov 时使用的 User-Agent。**SEC 强制要求格式包含联系邮箱**,否则会被
+    /// 限流或拒绝。空字符串则不调 enrichment(关闭通道)。
+    #[serde(default = "default_sec_user_agent")]
+    pub user_agent: String,
+}
+
+impl Default for SecFilingsEnrichmentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            llm: String::new(),
+            model: default_sec_summary_model(),
+            max_summary_tokens: default_sec_summary_max_tokens(),
+            user_agent: default_sec_user_agent(),
+        }
+    }
+}
+
+fn default_sec_summary_model() -> String {
+    "x-ai/grok-4.1-fast".into()
+}
+
+fn default_sec_summary_max_tokens() -> u32 {
+    800
+}
+
+fn default_sec_user_agent() -> String {
+    // 占位邮箱:部署方应改成自己的联系邮箱。SEC 不要求邮箱真实可达,但要求格式有
+    // 公司/产品名 + 邮箱;长期不改有被 rate-limit 的风险。
+    "honeclaw event-engine ops@honeclaw.local".into()
+}
+
+/// 全局 digest LLM 子配置,由 unified pipeline 复用来承载 curator / fetcher /
+/// event_dedupe 旋钮。触发由 per-actor `prefs.digest_slots` 驱动。
+///
+/// 候选池(trusted-source High/Medium news + macro_event)由 unified scheduler
+/// 在每个 slot 触发时拉取,经 Pass 1 聚类 + Pass 2 精读后,与 buffer/synth 候选
+/// 在 per-actor fan-out 阶段合流。
+///
+/// 默认 `enabled=false`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalDigestConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// admin 视角时区,用于解释 `schedules` 里的本地时刻。
+    /// admin 视角时区,目前仅用于历史日志解释;实际触发时刻由 actor `prefs.digest_slots` 决定。
     #[serde(default = "default_global_digest_tz")]
     pub timezone: String,
-
-    /// 一天 N 次的本地时刻列表(`"HH:MM"`,按 `timezone` 解释)。
-    /// 空数组 = 即使 `enabled=true` 也不会触发。
-    #[serde(default)]
-    pub schedules: Vec<String>,
 
     /// 候选池的回看窗口(小时)。第一次推送 / 兜底用;后续以"距上次成功推送"为准。
     #[serde(default = "default_global_digest_lookback_hours")]
     pub lookback_hours: u32,
 
-    /// Pass 1 模型 —— 候选池批量打分 + cluster + 一句话 takeaway。便宜模型即可。
+    /// Pass 1 legacy OpenRouter 模型 —— 仅在 `pass1_llm` 留空时使用。
+    /// 候选池批量打分 + cluster + 一句话 takeaway,便宜模型即可。
     #[serde(default = "default_global_digest_pass1_model")]
     pub pass1_model: String,
+    /// 可选 Pass 1 LLM profile 名称。配置后优先于 `pass1_model`。
+    #[serde(default)]
+    pub pass1_llm: String,
 
-    /// Pass 2 模型 —— 抓原文后精读、最终排序、写短评。需要相对聪明。
+    /// Pass 2 legacy OpenRouter 模型 —— 仅在 `pass2_llm` 留空时使用。
+    /// 抓原文后精读、最终排序、写短评,需要相对聪明。
     #[serde(default = "default_global_digest_pass2_model")]
     pub pass2_model: String,
+    /// 可选 Pass 2 LLM profile 名称。配置后优先于 `pass2_model`。
+    #[serde(default)]
+    pub pass2_llm: String,
 
     /// Pass 1 排序后送 Pass 2 精读的候选数上限。
     #[serde(default = "default_global_digest_pass2_top_n")]
@@ -148,16 +311,32 @@ pub struct GlobalDigestConfig {
     #[serde(default = "default_true")]
     pub fetch_full_text: bool,
 
-    /// **事件级去重**(POC 验证 2026-04-26 修):collector 之后、Pass1 之前,用强
+    /// **事件级去重**(POC 验证 2026-04-26):collector 之后、Pass1 之前,用强
     /// LLM 把同一具体事件的多源报道合成 1 条代表,避免 picks 被同事件不同包装挤满。
     /// 关闭(false)时退回 Pass1 自带的 cluster id dedup(已知不可靠)。
     #[serde(default = "default_true")]
     pub event_dedupe_enabled: bool,
 
-    /// 事件级 dedup 用的 LLM 模型。POC 验证 grok-4.1-fast 在 17-236 候选量级上
-    /// 稳定保守(只合明显同事件)。务必用强模型,nova-lite 这种会过度归类成 theme。
+    /// 事件级 dedup 的 legacy OpenRouter 模型 —— 仅在 `event_dedupe_llm` 留空时使用。
+    /// POC 验证 grok-4.1-fast 在 17-236 候选量级上稳定保守(只合明显同事件)。
+    /// 务必用强模型,nova-lite 这种会过度归类成 theme。
     #[serde(default = "default_event_dedupe_model")]
     pub event_dedupe_model: String,
+    /// 可选 event-dedupe LLM profile 名称。配置后优先于 `event_dedupe_model`。
+    #[serde(default)]
+    pub event_dedupe_llm: String,
+
+    /// 可选投资主线蒸馏 LLM profile 名称。留空时复用 event-dedupe 的 profile/model。
+    #[serde(default)]
+    pub mainline_distill_llm: String,
+
+    /// Jina Reader API key。Pass 2 直抓原文返回非 2xx(典型 reuters/wsj/barrons 401)
+    /// 时,带 key 走 `https://r.jina.ai/<url>` 二次抓取;Jina 用无头浏览器渲染 + 抽
+    /// 正文,对付费墙站点能拿到试读段落,对 Reuters 类反爬站点直接拿全文。空 / None
+    /// 时跳过这一层 fallback,直接落到事件本体的 FMP `text`。免费层 1M tokens/月,
+    /// jina.ai 邮箱注册即得。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jina_api_key: Option<String>,
 }
 
 impl Default for GlobalDigestConfig {
@@ -165,15 +344,19 @@ impl Default for GlobalDigestConfig {
         Self {
             enabled: false,
             timezone: default_global_digest_tz(),
-            schedules: Vec::new(),
             lookback_hours: default_global_digest_lookback_hours(),
             pass1_model: default_global_digest_pass1_model(),
+            pass1_llm: String::new(),
             pass2_model: default_global_digest_pass2_model(),
+            pass2_llm: String::new(),
             pass2_top_n: default_global_digest_pass2_top_n(),
             final_pick_n: default_global_digest_final_pick_n(),
             fetch_full_text: true,
             event_dedupe_enabled: true,
             event_dedupe_model: default_event_dedupe_model(),
+            event_dedupe_llm: String::new(),
+            mainline_distill_llm: String::new(),
+            jina_api_key: None,
         }
     }
 }
@@ -205,12 +388,12 @@ fn default_enabled() -> bool {
     false
 }
 
-/// **v0.1.46 破坏性简化**:只保留 `news_secs` / `price_secs` 这两类**真实时效性敏感**
+/// 只保留 `news_secs` / `price_secs` 这两类**真实时效性敏感**
 /// 的 poller 配置。原来的 `earnings_secs` / `corp_action_secs` / `macro_secs` /
-/// `analyst_grade_secs` / `earnings_surprise_secs` 5 个 24h 间隔字段被删除——对应
-/// poller 改成 **cron-aligned**:在 `digest.pre_market` / `digest.post_market` 的前
-/// `digest.prefetch_offset_mins` 分钟各执行一次拉取,这样推送的数据永远是 flush 之前
-/// 刚拉的,不会因为用户重启时机而漂到几小时前。
+/// `analyst_grade_secs` / `earnings_surprise_secs` 5 个 24h 间隔字段已被删除；这些日频来源
+/// （后来拆出的 sec filings 也一样）改成 **cron-aligned**:在 `digest.default_slots` 各 slot
+/// 前 `digest.prefetch_offset_mins` 分钟执行一次拉取,这样推送的数据永远是 flush 之前刚拉的,
+/// 不会因为用户重启时机而漂到几小时前。
 ///
 /// 旧 config 里这 5 个字段即使仍存在也会被 `#[serde(default)]` + unknown-field tolerant
 /// 悄悄忽略(serde 默认 deny_unknown_fields=false),YAML 不用改就能继续工作。
@@ -238,30 +421,32 @@ fn default_price_interval() -> u64 {
     5 * 60
 }
 
+/// 单个默认 digest slot 时刻。`label` 缺省时,scheduler 渲染成 `定时摘要 · HH:MM`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefaultDigestSlot {
+    pub time: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 /// Digest 触发窗口配置。
 ///
-/// `timezone` 默认 Asia/Shanghai（UTC+8）。两条固定窗口：
-/// * `pre_market` — 本地"早班"窗口，默认 08:30，用于在 CN 用户开工前把待推送的
-///   Medium/Low 事件合并推一条。
-/// * `post_market` — 本地"盘后"窗口，默认 09:00。因为美股盘后收于北京时间凌晨，
-///   直接在收盘时推送会把人吵醒；改到早上 8~10 点（可配置），让用户起床后看到
-///   隔夜美股汇总。
+/// `timezone` 默认 Asia/Shanghai（UTC+8）。`default_slots` 是 actor 没自定义
+/// `prefs.digest_slots` 时的兜底触发时刻。默认两个槽:
+/// * 08:30 "盘前摘要" — CN 用户开工前合并推送一条。
+/// * 09:00 "晨间摘要" — 美股盘后收于北京凌晨,延后到早上推送以免半夜打扰。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DigestConfig {
     #[serde(default = "default_tz")]
     pub timezone: String,
-    #[serde(default = "default_pre_market")]
-    pub pre_market: String,
-    #[serde(default = "default_post_market")]
-    pub post_market: String,
+    #[serde(default = "default_default_slots")]
+    pub default_slots: Vec<DefaultDigestSlot>,
     /// 单条摘要最多渲染多少事件，超出截断并附"另 N 条已省略"。0 = 不限制。
     #[serde(default = "default_max_items_per_batch")]
     pub max_items_per_batch: u32,
-    /// **cron-aligned poller** 在 flush 窗口前多少分钟执行拉取。v0.1.46 新增:
-    /// earnings / corp_action / macro / analyst_grade / earnings_surprise 这 5 个
-    /// 24h 节奏的 poller 不再用固定 interval 轮询,而是在 `pre_market - offset` /
-    /// `post_market - offset` 各跑一次,保证推送数据永远是 flush 前刚拉的。
-    /// 默认 30min;数值越小,数据越新但留给 EventStore/Router 处理的缓冲越紧。
+    /// **cron-aligned poller** 在 flush 窗口前多少分钟执行拉取。日频来源不再用
+    /// 固定 24h interval 轮询,而是在每个 default slot - offset 跑一次,保证推送数据
+    /// 永远是 flush 前刚拉的。默认 30min。
     #[serde(default = "default_prefetch_offset_mins")]
     pub prefetch_offset_mins: u32,
     /// 同一 actor 两次 digest 之间的最小间隔。用于用户配置了很多窗口时避免
@@ -274,8 +459,7 @@ impl Default for DigestConfig {
     fn default() -> Self {
         Self {
             timezone: default_tz(),
-            pre_market: default_pre_market(),
-            post_market: default_post_market(),
+            default_slots: default_default_slots(),
             max_items_per_batch: default_max_items_per_batch(),
             prefetch_offset_mins: default_prefetch_offset_mins(),
             min_gap_minutes: default_min_gap_minutes(),
@@ -293,19 +477,25 @@ fn default_min_gap_minutes() -> u32 {
 fn default_tz() -> String {
     "Asia/Shanghai".into()
 }
-fn default_pre_market() -> String {
-    "08:30".into()
-}
-fn default_post_market() -> String {
-    // 美股隔夜收盘摘要延后到北京时间早上 9 点推送，避免半夜打扰。
-    "09:00".into()
+fn default_default_slots() -> Vec<DefaultDigestSlot> {
+    vec![
+        DefaultDigestSlot {
+            time: "08:30".into(),
+            label: Some("盘前摘要".into()),
+        },
+        DefaultDigestSlot {
+            // 美股隔夜收盘摘要延后到北京时间早上 9 点推送,避免半夜打扰。
+            time: "09:00".into(),
+            label: Some("晨间摘要".into()),
+        },
+    ]
 }
 fn default_max_items_per_batch() -> u32 {
     20
 }
 
 /// 粗粒度 IANA 时区名 → UTC 偏移小时数。不识别的名字返回 0（UTC）。
-/// MVP 阶段不接 chrono-tz，夏令时按常用区域做固定近似。
+/// 这是 config 层的轻量 fallback helper；夏令时按常用区域做固定近似。
 pub fn tz_offset_hours(tz: &str) -> i32 {
     match tz.trim() {
         "Asia/Shanghai" | "Asia/Hong_Kong" | "Asia/Singapore" | "Asia/Taipei" | "PRC" => 8,
@@ -354,14 +544,19 @@ pub struct Thresholds {
     /// +6/+8/+10 或 -6/-8/-10 会形成独立 band 事件。
     #[serde(default = "default_price_realert_step_pct")]
     pub price_realert_step_pct: f64,
-    /// 同一 actor + symbol + direction 两次价格 band 即时推的最小间隔。
-    /// 0 = 不启用。用于替代通用同 ticker cooldown 对价格 band 的误伤。
-    #[serde(default = "default_price_intraday_min_gap_minutes")]
-    pub price_intraday_min_gap_minutes: u32,
-    /// 同一 actor + symbol + direction 每个本地日最多即时推多少个价格 band。
-    /// 0 = 不启用。
-    #[serde(default = "default_price_symbol_direction_daily_cap")]
-    pub price_symbol_direction_daily_cap: u32,
+    /// **价格 band 单一推送规则(v0.5.2 起替代旧 cap+gap 双保险)**:
+    /// 同 actor + symbol + direction 内,新到 band 的档位 pct 必须比当日已 sink-sent
+    /// 的最大档 pct 至少高出本字段值,才被允许直推;否则降级进 digest。
+    ///
+    /// 与旧机制相比:band id 已自带「同档位 INSERT IGNORE」,所以不需要时间 gap 兜底
+    /// 防重;daily cap 在 N=2 时退化为「监控所有 monotone 新高」—— 既不会在大行情
+    /// 长尾失声,也不会被同档位震荡刷屏。POC(2026-05-02)实证 AAOI 6→8→10→12→14→16
+    /// 序列下,N=2 给出全部 6 档(用户原 cap=2 仅 6/8 严重失声)。
+    ///
+    /// 0 = 关闭推送限制(等于无脑全推);默认 2.0 与 `price_realert_step_pct`
+    /// 一致,意为「每跨一个新 band 必推」。
+    #[serde(default = "default_price_band_min_advance_pct")]
+    pub price_band_min_advance_pct: f64,
     /// 收盘 price_close 是否允许即时推。默认 false,避免美股收盘在北京凌晨打扰。
     #[serde(default = "default_price_close_direct_enabled")]
     pub price_close_direct_enabled: bool,
@@ -388,8 +583,7 @@ impl Default for Thresholds {
             news_upgrade_per_tick: default_news_upgrade_per_tick(),
             price_min_direct_pct: default_price_min_direct_pct(),
             price_realert_step_pct: default_price_realert_step_pct(),
-            price_intraday_min_gap_minutes: default_price_intraday_min_gap_minutes(),
-            price_symbol_direction_daily_cap: default_price_symbol_direction_daily_cap(),
+            price_band_min_advance_pct: default_price_band_min_advance_pct(),
             price_close_direct_enabled: default_price_close_direct_enabled(),
             large_position_weight_pct: default_large_position_weight_pct(),
             macro_immediate_lookahead_hours: default_macro_immediate_lookahead_hours(),
@@ -434,11 +628,8 @@ fn default_price_min_direct_pct() -> f64 {
 fn default_price_realert_step_pct() -> f64 {
     2.0
 }
-fn default_price_intraday_min_gap_minutes() -> u32 {
-    30
-}
-fn default_price_symbol_direction_daily_cap() -> u32 {
-    2
+fn default_price_band_min_advance_pct() -> f64 {
+    2.0
 }
 fn default_price_close_direct_enabled() -> bool {
     false
@@ -457,38 +648,48 @@ fn default_macro_immediate_grace_hours() -> i64 {
 pub struct RendererConfig {
     #[serde(default)]
     pub llm_polish_for: Vec<String>,
+    /// 可选 LLM profile 名称。留空时沿用 legacy OpenRouter auxiliary model。
+    #[serde(default)]
+    pub polish_llm: String,
     #[serde(default)]
     pub template_dir: Option<String>,
 }
 
-/// Per-poller 开关。每个字段对应 `crates/hone-event-engine/src/lib.rs::start`
-/// 里的一个 spawn_*_poller 调用,关闭即直接 skip 该 poller 的 tick(最省 FMP 配额)。
+/// Per-source 开关。每个字段对应 `crates/hone-event-engine/src/engine.rs`
+/// 里构造的一个 `EventSource`;关闭即不 spawn 该 source(最省 FMP 配额)。
 ///
 /// 想要更细粒度的"跑 poller 但不分发某 kind"的兜底关法,用 `EventEngineConfig.disabled_kinds`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sources {
-    /// `spawn_news_poller` —— FMP /v3/stock_news,产出 NewsCritical
+    /// `NewsPoller` —— FMP /v3/stock_news,产出 NewsCritical
     #[serde(default = "default_true")]
     pub news: bool,
-    /// `spawn_price_poller` —— FMP /v3/quote 按 watch pool 拉,产出 PriceAlert/52W/VolumeSpike
+    /// `PricePoller` —— FMP /v3/quote 按 watch pool 拉,产出 PriceAlert/52W
     #[serde(default = "default_true")]
     pub price: bool,
-    /// `spawn_earnings_poller` —— FMP /v3/earning_calendar,产出 EarningsUpcoming
+    /// `ExtendedHoursPoller` —— FMP /v3/historical-chart/1min?extended=true 按
+    /// watch pool 拉,30min cadence,只在 ET 04:00-09:30 / 16:00-20:00 工作。盘前/盘后
+    /// 振幅 ≥ 用户阈值时产出 PriceAlert{window: "pre"|"post"}。FMP 常规 quote endpoint
+    /// 不在 extended hours 更新 timestamp,会被 PricePoller 判 stale 跳过(根因:GOOGL
+    /// 财报夜整夜无推送),本通道补这块盲区。
+    #[serde(default = "default_true")]
+    pub extended_hours: bool,
+    /// `EarningsPoller` —— FMP /v3/earning_calendar,产出 EarningsUpcoming
     #[serde(default = "default_true")]
     pub earnings_calendar: bool,
-    /// `corp_action_poller` 内部的 dividend/split 全局日历分支
+    /// `CorpActionCalendarPoller` —— dividend/split 全局日历分支
     #[serde(default = "default_true")]
     pub corp_action: bool,
-    /// `corp_action_poller` 内部的 SEC 8-K per-ticker 分支
+    /// `SecFilingsPoller` —— 按 watch pool 拉 SEC filing forms whitelist
     #[serde(default = "default_true")]
     pub sec_filings: bool,
-    /// `spawn_macro_poller` —— FMP /v3/economic_calendar,产出 MacroEvent
+    /// `MacroPoller` —— FMP /v3/economic_calendar,产出 MacroEvent
     #[serde(default = "default_true")]
     pub macro_calendar: bool,
-    /// `spawn_analyst_grade_poller` —— 按 watch pool 拉,产出 AnalystGrade
+    /// `AnalystGradePoller` —— 按 watch pool 拉,产出 AnalystGrade
     #[serde(default = "default_true")]
     pub analyst_grade: bool,
-    /// `spawn_earnings_surprise_poller` —— 按 watch pool 拉,产出 EarningsReleased
+    /// `EarningsSurprisePoller` —— 按 watch pool 拉,产出 EarningsReleased
     #[serde(default = "default_true")]
     pub earnings_surprise: bool,
 
@@ -509,6 +710,7 @@ impl Default for Sources {
         Self {
             news: true,
             price: true,
+            extended_hours: true,
             earnings_calendar: true,
             corp_action: true,
             sec_filings: true,

@@ -3,8 +3,52 @@
 - **发现时间**: 2026-04-15 18:02 CST
 - **Bug Type**: System Error
 - **严重等级**: P1
-- **状态**: Fixing
+- **状态**: Fixed
+- **GitHub Issue**: [#29](https://github.com/B-M-Capital-Research/honeclaw/issues/29)
 - **证据来源**:
+  - 2026-05-15 21:48-22:07 最新真实直聊样本：
+    - `session_id=Actor_feishu__direct__ou_5f64ee7ca7af22d44a83a31054e6fb92a3`
+    - `2026-05-15T21:48:24.221814+08:00` 用户输入：`我建仓了这只股票`
+    - 同轮日志显示 `Tool: hone/skill_tool` 已执行，随后 `data/runtime/logs/hone-feishu.runtime-recovery.log` 在 `21:48:53.068 CST` 记录 `transitional planning sentence detected, treating as empty ... chars=120` 与 `step=agent.run.fallback ... detail=planning_sentence_suppressed`。
+    - `2026-05-15T21:48:53.068790+08:00` assistant 最终落库并发送：`这次没有成功产出完整回复。我已经自动重试过了，请再发一次，或换个问法。`
+    - 同轮 `MsgFlow/feishu done ... success=true ... tools=1(Tool: hone/skill_tool) reply.chars=35`，随后 `reply.send ... segments.sent=1/1`。
+    - `2026-05-15T22:06:56.166595+08:00` 用户再次输入：`我新建仓了一只股票 我直接发图给你`
+    - `2026-05-15T22:07:17.258 CST` 日志再次记录 `transitional planning sentence detected, treating as empty ... chars=70` 与 `step=agent.run.fallback ... detail=planning_sentence_suppressed`；同轮没有工具调用，仍按 `success=true`、`reply.chars=35`、`segments.sent=1/1` 收口。
+    - 结论：这是同一根因的持续复发，不新建重复文档。当前坏态不只遮蔽已发生的 `cron_job` / `portfolio` 副作用，也会把本应澄清“请上传图片 / 请提供标的”的短答吞掉并改发通用失败。
+    - 影响：用户正在表达新增持仓并准备发图，系统没有给出可执行的下一步确认或附件接收说明，导致 Feishu 直聊主链路继续无法承接持仓录入 / 图片后续任务。该问题仍影响功能链路，维持 `P1 / New`。
+  - 当前状态结论：
+    - 2026-05-16 03:05 CST：状态更新为 `Fixed`。
+    - 关联 GitHub Issue [#29](https://github.com/B-M-Capital-Research/honeclaw/issues/29) 已存在，本轮不重复创建。
+    - 本轮修复已同时覆盖两条剩余入口：成功 `portfolio` 工具副作用恢复确认，以及“把图发给我 / 上传截图”类用户下一步指引保留，不再统一替换成“没有成功产出完整回复”。
+  - 2026-05-15 17:36-17:37 最新真实直聊样本：
+    - `session_id=Actor_feishu__direct__ou_5f9f2cd3505aab8fed0a6ffd582df285b1`
+    - `2026-05-15T17:36:53.261646+08:00` 用户输入：`我持有RDW，成本价12，继续帮我跟踪`
+    - 同轮日志显示 runner 已执行 `Tool: hone/skill_tool`、`Tool: hone/data_fetch` 和两次 `Tool: hone/portfolio`，说明链路进入了持仓 / 跟踪工具路径，而不是完全没有开始处理。
+    - `data/runtime/logs/web.log.2026-05-15` 在 `17:37:23.963 CST` 记录 `transitional planning sentence detected, treating as empty ... chars=178`，随后 `step=agent.run.fallback ... detail=planning_sentence_suppressed`。
+    - `2026-05-15T17:37:23.963599+08:00` 最终 assistant 落库并发送：`这次没有成功产出完整回复。我已经自动重试过了，请再发一次，或换个问法。`
+    - 同轮 `MsgFlow/feishu done ... success=true ... tools=4(Tool: hone/data_fetch,Tool: hone/portfolio,Tool: hone/skill_tool) reply.chars=35`，随后 `reply.send ... segments.sent=1/1`。
+    - 结论：这是同一根因的复发，不新建重复文档。2026-05-14 的修复只覆盖成功 `cron_job` 副作用恢复确认；本轮 `portfolio` / 持仓跟踪工具路径仍会在 planning sentence 被抑制后外发通用失败，并且整轮仍被记为成功。
+    - 影响：用户明确要求继续跟踪 RDW，但可见回复无法说明跟踪是否已建立、持仓是否已记录、还缺哪些字段或是否需要重试。该问题影响 Feishu 直聊主链路任务完成确认，维持 `P1 / New`。
+  - 2026-05-15 19:03 当前状态结论：
+    - 2026-05-15 19:03 CST：状态从 `Fixed` 调回 `New`。
+    - 关联 GitHub Issue [#29](https://github.com/B-M-Capital-Research/honeclaw/issues/29) 已存在，本轮不重复创建。
+    - 新修复需要覆盖 `portfolio` / 文件写入 / 画像创建等非 `cron_job` 工具副作用：如果工具已成功执行，应恢复为具体确认；如果不能确认，应返回明确的业务失败原因，不能用通用“没有成功产出完整回复”遮蔽。
+  - 2026-05-14 17:17 最新真实直聊样本：
+    - `session_id=Actor_feishu__direct__ou_5ff0946a82698f7d16d9a5684696c84185`
+    - `2026-05-14T17:17:38.611922+08:00` 用户要求创建每日 20:00 北京时间的大盘监控，内容包括纳指、标普 500、Fear & Greed、VIX 和大盘分析结论。
+    - `data/runtime/logs/web.log.2026-05-14` 显示同轮先执行 `Tool: hone/skill_tool`，随后执行 `Tool: hone/cron_job`，两次工具均有 `status=done`，说明链路已经进入任务创建工具路径。
+    - `2026-05-14 17:18:12.945 CST` 日志记录 `transitional planning sentence detected, treating as empty ... chars=198`，随后 `step=agent.run.fallback ... detail=planning_sentence_suppressed`。
+    - `2026-05-14T17:18:12.945477+08:00` 最终 assistant 落库并发送的仍是通用 fallback：`这次没有成功产出完整回复。我已经自动重试过了，请再发一次，或换个问法。`
+    - 同轮 `MsgFlow/feishu done ... success=true ... tools=2(Tool: hone/cron_job,Tool: hone/skill_tool) reply.chars=35`，说明这不是显式失败态，而是有效工具链后的可见答复被判空并以成功路径收口。
+    - 这不是独立新缺陷：根因仍是 Feishu 直聊 Answer 阶段把空/无效可见输出伪装成成功；只是本轮影响对象从澄清/画像确认扩展到用户可见的定时任务创建确认。
+  - 2026-05-02 16:59 最新真实直聊样本：
+    - `session_id=Actor_feishu__direct__ou_5f0e57a9914d61ae96d437cdeb65e43593`
+    - `2026-05-02T16:59:25.533704+08:00` 用户提问：`toto估值是否合理`
+    - `data/runtime/logs/acp-events.log` 显示同轮先正常完成 `skill_tool`、`local_search_files`、`local_read_file`、`data_fetch`、`web_search`，随后在 `2026-05-02T08:59:44.892377Z-08:59:45.142219Z` 连续输出用户可见 `agent_message_chunk`，正文已经形成一段真实答复/澄清句：`...请先确认具体是哪只股票/资产的 ticker？确认标的后我再校验当前价格、财报、估值倍数和同业，再判断估值是否合理。`
+    - 但 `data/runtime/logs/sidecar.log` 在 `2026-05-02T08:59:45.525818Z` 紧接着记录 `transitional planning sentence detected, treating as empty ... chars=136`，随后 `step=agent.run.fallback ... detail=planning_sentence_suppressed`
+    - `2026-05-02T16:59:45.526498+08:00` 最终 assistant 落库并发送的仍是通用 fallback：`这次没有成功产出完整回复。我已经自动重试过了，请再发一次，或换个问法。`
+    - 同轮 `sidecar.log` 继续记录 `done ... success=true ... reply.chars=35` 与 `step=reply.send ... segments.sent=1/1`，说明这不是 runner 显式失败，而是 Answer 输出被净化后判空并被伪成功收口
+    - 这不是独立新缺陷：根因仍是 Feishu 直聊 Answer 阶段把空/无效可见输出伪装成成功，只是最近一小时的坏态从“零字节 reply”漂移成“planning sentence 被判空后统一 fallback”
   - 2026-04-26 13:10-13:11 最新真实直聊样本：
     - `session_id=Actor_feishu__direct__ou_5f39103ac18cf70a98afc6cfc7529120e5`
     - `2026-04-26T13:10:39.109557+08:00` 用户追问：`我现在有哪些定时任务`
@@ -103,6 +147,10 @@
 
 ## 当前实现效果
 
+- `2026-05-14 17:17` 的最新样本说明，本缺陷在 README 已标记 `Fixed` 后再次活跃：用户明确要求创建定时任务，`cron_job` 工具已经执行，但最终可见回复被 `planning_sentence_suppressed` 替换成通用失败文案。
+- 这会让用户无法确认每日 20:00 大盘监控是否创建成功，可能重复创建或放弃任务；因此状态从 `Fixed` 调回 `New`。
+- `2026-05-02 16:59` 的最新样本说明，本缺陷在 README 已标记 `Fixed` 后仍然活跃，只是坏态继续演化：Answer 阶段不再一定是 `reply_chars=0`，而是先吐出一段计划/澄清句，再被 `response_finalizer` 认定为 `planning_sentence_suppressed` 并统一替换成 fallback。
+- 这意味着链路已经拿到了可消费的用户态文本，但当前“过渡句净化”规则仍会把它整体当作空答复处理，结果用户既没拿到实际澄清问题，也没拿到正式分析。
 - `2026-04-26 08:35` 的最新样本说明，即使用户只是发起一条普通的港股对比请求，链路仍会在两次 answer 都 `reply_chars=0` 后直接退化成通用 fallback；这不是“复杂画像/附件排查”的特例。
 - `2026-04-21 23:34` 的最新样本说明，问题已经从“空字符串直接外发”缓解为“无效 Answer 被判空并返回 fallback”，但底层仍不能稳定为简单直聊生成可消费答复。
 - `2026-04-23 10:36` 的最新样本进一步说明，fallback 止血会掩盖已经发生的业务副作用：画像文件实际已创建，但最终可见回复仍被替换成“没有成功产出完整回复”，用户无法确认任务完成情况，甚至可能重复请求造成画像重复写入或状态混乱。
@@ -115,15 +163,62 @@
 
 ## 用户影响
 
+- `2026-05-14 17:17` 的定时任务创建样本进一步说明，fallback 不只是提示用户“再试一次”：它会遮蔽可能已经发生的 `cron_job` 副作用，使用户无法知道监控任务是否存在，进而可能重复建任务或错过大盘提醒。
 - 这是功能性缺陷，不是单纯回答质量波动。用户明确要求的投研报告完全没有返回，任务实际失败。
+- `2026-05-02 16:59` 这条样本进一步说明，哪怕用户问题本身只是一个应该先澄清 ticker 的短问句，系统也会把本来应直接发给用户的澄清句吞掉并改发通用失败提示，用户无法继续当前任务。
 - 问题发生在 Feishu 直聊主链路，而不是边缘后台任务，直接影响用户能否完成一次正常问答，因此定级为 `P1`。
 - 该问题不属于 `P3` 质量类问题，因为它不是“答得不够好”，而是最终根本没有可消费内容。
 
 ## 根因判断
 
 - `opencode_acp` 能识别 `reply_chars=0` 和 `empty reply`，但当前没有把这类结果升级为硬失败。
+- 最新样本说明另一条同根因分支也仍然活跃：`response_finalizer` 会把某些真实用户态澄清/计划句直接判成 `transitional planning sentence`，随后走与空回复相同的 fallback 收口。
 - 多代理封装层把空回复继续当作 `answer.done success=true`，导致上层消息流无法区分“正常完成”和“零字节完成”。
 - Feishu 发送侧只看分段流程是否跑完，没有拦截空正文，因此把空 assistant 消息照常投递。
+
+## 修复进展（2026-05-16 03:05 CST）
+
+- 本轮继续补齐 `planning_sentence_suppressed` 的两条剩余复发入口：
+  - `response_finalizer` 现在会从成功 `portfolio` 工具结果恢复用户可见确认，覆盖 `add/update/remove/watch/unwatch` 五类写操作，不再把 RDW 持仓记录 / 跟踪建立这类已发生副作用遮蔽成通用失败。
+  - `is_transitional_planning_sentence(...)` 新增“发给我 / 发图给我 / 发截图给我 / 上传图片 / 上传截图”等用户可执行附件引导白名单，保留“你把持仓图片发给我，我再帮你整理建仓信息”这类短答，不再误杀成内部计划句。
+- 新增回归：
+  - `finalize_agent_response_recovers_portfolio_confirmation_from_tool_result`
+  - `transitional_image_upload_guidance_is_not_treated_as_planning_sentence`
+  - `finalize_agent_response_keeps_user_facing_image_upload_guidance`
+- 验证：
+  - `cargo test -p hone-channels finalize_agent_response_ -- --nocapture`
+  - `cargo test -p hone-channels transitional_ -- --nocapture`
+  - `cargo check -p hone-channels --tests`
+  - `rustfmt --edition 2024 --check crates/hone-channels/src/response_finalizer.rs crates/hone-channels/src/runtime.rs crates/hone-channels/src/agent_session/tests.rs`
+- 状态维持 `Fixed`。本轮不重启 live 服务；后续若部署后仍出现 `portfolio success + planning_sentence_suppressed + 通用失败提示` 或“发图给你”类短答再次被压成 fallback，应继续在本单追加新日志窗口。
+
+## 修复进展（2026-05-16 00:06 CST）
+
+- 本轮针对 2026-05-15 17:37 CST 的 `RDW` 持仓 / 继续跟踪复发样本补齐 `portfolio` 副作用确认兜底：
+  - `response_finalizer` 在抑制 `transitional planning sentence` 前，除既有 `cron_job` 外，也会检查本轮成功的 `portfolio add/update/remove/watch/unwatch` 工具结果。
+  - 若 `portfolio` 已明确写入、更新、删除或加入关注，会从工具结果合成用户可见确认，例如 `已记录持仓：RDW，成本价 12。后续跟踪会优先参考这条持仓记录。`。
+  - 该逻辑只覆盖工具结果 `success=true` 的写操作；`view`、失败结果、真正空输出和没有副作用证明的 planning sentence 仍继续走失败兜底。
+- 新增回归：
+  - `finalize_agent_response_recovers_portfolio_confirmation_from_tool_result`
+- 验证：
+  - `rustfmt --edition 2024 --config skip_children=true --check crates/hone-channels/src/response_finalizer.rs crates/hone-channels/src/agent_session/tests.rs`
+  - `cargo test -p hone-channels finalize_agent_response -- --nocapture`
+  - `cargo check -p hone-channels --tests`
+- 修复提交：`fbba5342`
+- 状态更新为 `Fixed`。本轮不重启 live 服务；后续若部署后仍出现 `portfolio success + planning_sentence_suppressed + 通用失败提示`，应继续在本单追加证据或拆出更具体的副作用恢复缺口。
+
+## 修复进展（2026-05-14 20:12 CST）
+
+- 本轮针对 17:17 CST 最新定时任务创建样本补齐副作用确认兜底：
+  - `response_finalizer` 在抑制 `transitional planning sentence` 前，会先检查本轮 `cron_job` 工具是否已经成功执行 `add` / `update` / `remove`。
+  - 若 `cron_job` 已返回成功结果，finalizer 会从工具结果合成用户可见确认，例如 `已创建定时任务：每日大盘监控（每天 20:00）。任务 ID：...。`，不再把已发生的任务变更遮蔽成“没有成功产出完整回复”。
+  - 该逻辑只覆盖明确成功的定时任务副作用；真正空输出、内部-only 输出和没有副作用证明的 planning sentence 仍继续走失败兜底。
+- 新增回归：
+  - `finalize_agent_response_recovers_cron_job_confirmation_from_tool_result`
+- 验证：
+  - `rustfmt --edition 2024 --config skip_children=true --check crates/hone-channels/src/response_finalizer.rs crates/hone-channels/src/agent_session/tests.rs`
+  - `cargo test -p hone-channels finalize_agent_response_recovers_cron_job_confirmation_from_tool_result -- --nocapture`
+- 状态更新为 `Fixed`。本轮不重启 live 服务；后续若部署后仍出现 `cron_job success + planning_sentence_suppressed + 通用失败提示`，应继续在本单追加证据。
 
 ## 修复情况（2026-04-16）
 
@@ -142,8 +237,66 @@
 
 ## 下一步建议
 
+- 复核 `planning_sentence_suppressed` 在工具副作用已发生后的收口策略：如果 `cron_job` / 文件写入 / 画像创建等工具已成功执行，最终答复至少应说明任务状态或失败原因，不能只返回通用 fallback。
+- 先复核 `response_finalizer` 对 `transitional planning sentence` 的判定边界，确认哪些“用户应该看到的澄清/确认句”被误杀；至少不能把要求确认 ticker 的可执行澄清句与内部计划句混为一类。
 - 重新比对 `reply_chars=0` 但 `success=true` 的最新日志路径，确认当前 Feishu 直聊链路为何没有落到 `EMPTY_SUCCESS_FALLBACK_MESSAGE`。
 - 在 bug 修复前，继续把 `reply.chars=0`、`empty reply`、`segments.sent=1/1` 组合视为高优先级回归信号；若 scheduler 或其它渠道也出现同类模式，再分别更新对应文档状态。
+
+## 修复进展（2026-05-02 17:35 CST）
+
+- 已在 `crates/hone-channels/src/runtime.rs` 收紧 `is_transitional_planning_sentence(...)` 的误杀边界：
+  - 只有明显以内部执行态起手的短句，才继续视为过渡计划句；
+  - 含 `?` / `？` 的用户可见澄清问句不再被压成空成功；
+  - 含 `请先确认` / `请提供` / `告诉我` / `发我` 等面向用户补充信息的短澄清，也不再因为句内出现 `我再` 被误判成内部计划。
+- 已补自动化回归，直接覆盖本轮 `toto估值是否合理` 的最新复现形态：
+  - `transitional_clarification_question_is_not_treated_as_planning_sentence`
+  - `finalize_agent_response_keeps_user_facing_clarification_question`
+- 本轮只收紧了 `planning_sentence_suppressed` 这一路径，没有放宽 `sanitized_empty_success` 或其它真正空输出的失败收口；纯内部执行态短句仍会继续被 fallback 拦下。
+- 由于当前任务不允许重启现有服务，也没有新的真实 Feishu 样本可直接复核，本单先更新为 `Fixing` 而不是 `Fixed`；下一条同类直聊若能把澄清句直接送达用户，再考虑转 `Fixed`。
+
+## 修复进展（2026-05-04 21:15 CST）
+
+- 本轮继续补 `crates/hone-channels/src/runners/multi_agent.rs` 的搜索阶段直返边界，覆盖“本地文件确认本身已足够回答用户，但仍被硬送进 answer 阶段”的剩余入口：
+  - `local_list_files` / `local_search_files` / `local_read_file` 这三类只读本地工具，如果搜索阶段已经产出简短、单段、用户可直接消费的确认答复，现在允许直接返回；
+  - 仍然保留对多行本地检索摘要、工作笔记和其它长文本的 answer 阶段要求，避免把原始文件枚举或不成形的检索摘要直接外发。
+- 这次收口直接针对 `2026-04-23 18:53-18:55` 那类“附件/本地状态已能在搜索阶段确认，但 answer 阶段空/无效回复又把结果打回统一 fallback”的坏态。
+- 由于当前任务不允许重启现有服务，也没有新的真实 Feishu 运行态样本，本单继续维持 `Fixing`；但这条剩余入口现在已有明确代码收口和自动化证明。
+
+## 修复进展（2026-05-05 07:03 CST）
+
+- 本轮继续补 `crates/hone-channels/src/runners/multi_agent.rs` 的搜索阶段直返判定，覆盖 `2026-05-02 16:59` 样本里的剩余误杀形态：
+  - 搜索阶段若已经产出用户可见澄清句，例如 `请先确认具体是哪只股票/资产的 ticker？确认标的后我再校验...`，不再因为命中 `先确认` / `我再` 等内部工作笔记 marker 被强制送入 answer 阶段。
+  - 这次只放宽用户可见澄清句；含 `web_search` / `data_fetch` 的 live market/news 检索摘要仍必须进入 answer 阶段，避免未成形材料直接外发。
+- 新增回归 `user_facing_clarification_can_return_directly`，与既有 `finalize_agent_response_keeps_user_facing_clarification_question` 一起覆盖“澄清句生成后不被 finalizer 或 multi-agent search 直返边界吞掉”。
+- 当前结论：已针对本缺陷已知的三条可本地收口入口完成代码闭环：
+  - 空 / 净化后空成功不再以 `success=true` 直接落库或发送；
+  - 用户可见澄清句不再被 `planning_sentence_suppressed` 误杀；
+  - 本地状态确认与澄清类 search 输出不再被硬送进更容易空回复的 answer 阶段。
+- 状态更新为 `Fixed`。后续若真实 Feishu 再出现新的 `empty_success_exhausted` 或 `planning_sentence_suppressed` 样本，应以新日志窗口重新打开本单或拆出更具体的 runner 缺陷。
+
+## 当前验证（2026-05-02 17:35 CST）
+
+- 已通过：
+  - `cargo test -p hone-channels finalize_agent_response_marks_planning_sentence_as_failure -- --nocapture`
+  - `cargo test -p hone-channels transitional_clarification_question_is_not_treated_as_planning_sentence -- --nocapture`
+  - `cargo test -p hone-channels finalize_agent_response_keeps_user_facing_clarification_question -- --nocapture`
+  - `cargo check -p hone-channels --tests`
+  - `rustfmt --edition 2024 crates/hone-channels/src/runtime.rs crates/hone-channels/src/agent_session/tests.rs`
+
+## 当前验证（2026-05-04 21:15 CST）
+
+- 已通过：
+  - `cargo test -p hone-channels concise_local_file_answer_can_return_directly -- --nocapture`
+  - `cargo test -p hone-channels multiline_local_file_summary_still_requires_answer_stage -- --nocapture`
+  - `cargo test -p hone-channels runners::multi_agent::tests -- --nocapture`
+  - `cargo check -p hone-channels --tests`
+
+## 当前验证（2026-05-05 07:03 CST）
+
+- 已通过：
+  - `cargo test -p hone-channels user_facing_clarification_can_return_directly -- --nocapture`
+  - `cargo test -p hone-channels runners::multi_agent::tests -- --nocapture`
+  - `cargo check -p hone-channels --tests`
 
 ## 回归验证
 
@@ -258,6 +411,38 @@
   - `handler.session_run completed success=true reply.chars=35` 这一层伪成功台账不应再继续出现在上述两类坏态上；
   - scheduler / outbound / 渠道侧会把它们当成失败收口，而不是正常完成；
   - 后续巡检可以更准确地区分“真实完成”与“fallback 遮蔽的无效 Answer”。
+
+## 修复进展（2026-04-29 18:02 CST）
+
+- 针对 `2026-04-26 09:52` / `13:10` 两次“我的定时任务 / 我现在有哪些定时任务”真实样本，本轮继续收紧上游 multi-agent 搜索阶段，而不是只在下游继续兜底 fallback：
+  - `crates/hone-channels/src/runners/multi_agent.rs` 的 search guidance 现在显式要求：涉及列出 / 查看 / 更新 / 删除用户定时任务或提醒时，优先调用 `cron_job`，不要先误用 `data_fetch` / `web_search`
+  - 对 `这个` / `那个` / `上一条` 这类短澄清，search guidance 现在要求“直接答或只问一个简短澄清问题”，避免继续产出会被 `planning_sentence_suppressed` 判空的过渡句
+  - 当 search 阶段已经通过可信本地状态工具拿到足够答案时，multi-agent 现在允许 `cron_job` / `portfolio` 结果直接短路返回，不再强制进入更容易空回复的 ACP answer 阶段
+- 新增自动化回归：
+  - `trusted_local_tool_answer_can_return_directly`
+  - `live_market_tool_answer_still_requires_answer_stage`
+  - 并保留现有 `local_file_tool_calls_also_force_answer_stage`，确认普通本地文件检索不会被误放宽成直返
+
+## 当前验证（2026-04-29 18:02 CST）
+
+- 已通过：
+  - `cargo test -p hone-channels trusted_local_tool_answer_can_return_directly -- --nocapture`
+  - `cargo test -p hone-channels live_market_tool_answer_still_requires_answer_stage -- --nocapture`
+  - `cargo test -p hone-channels search_input_guidance_allows_direct_replies_for_greetings -- --nocapture`
+  - `cargo test -p hone-channels local_file_tool_calls_also_force_answer_stage -- --nocapture`
+  - `cargo test -p hone-channels runners::multi_agent::tests -- --nocapture`
+  - `cargo check -p hone-channels`
+- 尚缺真实窗口复核：
+  - 下一条 Feishu 直聊“我的定时任务 / 我现在有哪些定时任务”样本，确认是否不再误跑行情工具，也不再落回统一 fallback
+  - 下一条短澄清样本（如“这个”），确认是否不再因为过渡句被判空
+
+## 当前结论（2026-04-29 18:02 CST）
+
+- 本轮修复把当前最可证实的上游误路由问题收口到了 multi-agent：
+  - 先减少“本该是任务治理 / 本地状态查询，却被搜索阶段带去行情工具”的概率；
+  - 再减少“本地状态答案已经齐备，却仍被强制送进 answer 阶段”的概率。
+- 这能直接覆盖最新活跃样本里最明确的一类失败入口，但还没有新的真实 Feishu 样本证明全部空/无效 Answer 根因已消失。
+- 因此本单状态继续维持 `Fixing`，暂不更新为 `Fixed`；若下一条真实 task-list / 短澄清样本恢复正常，可再评估是否降级或关闭。
 - 已补自动化回归：
   - `cargo test -p hone-channels finalize_agent_response_marks_sanitized_empty_success_as_failure -- --nocapture`
   - `cargo test -p hone-channels finalize_agent_response_marks_planning_sentence_as_failure -- --nocapture`
@@ -284,3 +469,30 @@
 - Feishu scheduler 也会把同类 fallback 记为 `execution_failed`，与 `feishu_scheduler_empty_reply_false_success` 的台账修复一致。
 - 已验证：`cargo test -p hone-channels empty_success_with_tool_calls_uses_fallback_after_retries`。
 - `2026-04-26 13:10-13:11` 同一用户再次追问“我现在有哪些定时任务”仍直接落成统一 fallback，说明止血没有把 Feishu 直聊主链路恢复到可消费答复；状态改回 `New`。
+
+## 修复进展（2026-04-30 18:08 CST）
+
+- 本轮继续修 `crates/hone-channels/src/runners/multi_agent.rs` 的“搜索阶段直返”判定，而不是只在 answer 失败后继续兜底：
+  - 只要 search 阶段返回的是 `cron_job` / `portfolio` 这类可信本地状态工具结果，即便正文是多行任务列表或长度超过 240 字，也允许直接返回；
+  - 仍然保留对 working note / 过渡句的拦截，也没有放宽 `web_search`、`data_fetch` 或普通本地文件检索的 answer 阶段要求。
+- 这直接覆盖了 `2026-04-26 09:52` / `13:10` 两条“我的定时任务 / 我现在有哪些定时任务”样本的核心断点：
+  - 之前 search 已经有机会拿到本地任务列表，但因为“多行/较长正文”不满足直返门槛，结果仍被硬送进更容易 `reply_chars=0` 的 ACP answer 阶段；
+  - 现在同类任务列表正文不再因为长度或换行被降级回 answer。
+
+## 当前验证（2026-04-30 18:08 CST）
+
+- 已通过：
+  - `cargo test -p hone-channels runners::multi_agent::tests`
+  - `cargo test -p hone-channels empty_success_with_tool_calls_uses_fallback_after_retries`
+  - `cargo check -p hone-channels`
+- 新增回归覆盖：
+  - `multiline_trusted_local_tool_answer_can_return_directly`
+  - `long_trusted_local_tool_answer_can_return_directly`
+- 仍未做的运行态复核：
+  - 下一条真实 Feishu “我的定时任务 / 我现在有哪些定时任务”样本
+  - 下一条真实短澄清样本（如“这个”）
+
+## 当前结论（2026-04-30 18:08 CST）
+
+- 该缺陷最新活跃样本里最明确、最可安全闭环的代码缺口已补齐：可信本地任务列表不会再因多行/长正文被误送 answer 阶段。
+- 因此本单从活跃 `Fixing` 转为 `Fixed`，移出活跃队列；若后续真实 Feishu 样本再次出现同类 fallback，可基于新证据重新改回 `New`。

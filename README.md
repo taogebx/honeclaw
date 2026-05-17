@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="./resources/logo.svg" alt="Hone honepage - Your Financial Assistant" width="30%">
+  <img src="./resources/logo.svg" alt="Hone homepage - Your Financial Assistant" width="30%">
 </p>
 <p align="center">
   <strong> Hone </strong><br>
   <strong>“Not a chat toy designed to indulge you, but a ruthless defender of your investment discipline.”</strong><br>
-  <em>HoneClaw is dedicated to being a professional investment assistant that truly understands you.</em>
+  <em>Honeclaw is dedicated to being a professional investment assistant that truly understands you.</em>
 
 Why the name Hone:
 
@@ -38,7 +38,7 @@ The public product website is now live at **[hone-claw.com](https://hone-claw.co
 
 - 🧠 **An Absolutely Rational Core**: It does not flatter and does not follow blindly. When you make investment decisions, it cross-checks them against data and predefined discipline, identifying flaws in your reasoning.
 - 📱 **Seamless Cross-Platform Access**: Supports Web, iMessage, Lark, Telegram, and Discord, so you can engage with your investment brain anytime, anywhere.
-- 🗂️ **Company Portraits & Long-term Memory**: Hone can continuously accumulate company profiles and event timelines in Markdown, helping you preserve thesis, key operating metrics, risks, and major developments as a reusable long-term research asset.
+- 🗂️ **Company Portraits & Long-term Memory**: Hone can continuously accumulate company profiles and event timelines in Markdown, helping you preserve investment mainline, key operating metrics, risks, and major developments as a reusable long-term research asset.
 - 📊 **Position Monitoring & Discipline**: Set your take-profit and stop-loss levels, add-to-position logic, and key indicators to watch, and Hone will monitor the market for you like a cold, vigilant sentinel.
 - ⏰ **Powerful Scheduled Tasks (Cron Jobs)**: Supports complex scheduled monitoring tasks, such as pre-market briefings, post-market summaries, and automatic analysis after specific earnings releases.
 - ⚡ **Rust-powered Extreme Performance**: Built entirely in Rust at the core, ensuring millisecond-level responsiveness for messages across multiple platforms with minimal footprint.
@@ -66,7 +66,7 @@ The public product website is now live at **[hone-claw.com](https://hone-claw.co
   <img src="./resources/company_profile.png" alt="Company Portraits - Long-Term Research Memory Dashboard" width="100%">
 </p>
 <p align="center">
-  <em>Company Portraits Dashboard: A centralized UI to manage long-term research memories, sync thesis developments from chats, and review your customized company knowledge base.</em>
+  <em>Company Portraits Dashboard: A centralized UI to manage long-term research memories, sync investment mainline developments from chats, and review your customized company knowledge base.</em>
 </p>
 
 # 3. 🏗️ Getting Started
@@ -100,6 +100,9 @@ curl -fsSL https://raw.githubusercontent.com/B-M-Capital-Research/honeclaw/main/
 hone-cli doctor
 hone-cli onboard
 hone-cli start
+# In another terminal, open or start the bundled Web interfaces:
+hone-cli web admin-ui
+hone-cli web user-ui
 ```
 
 ### Option B. Homebrew (macOS/Linux)
@@ -109,6 +112,9 @@ brew install B-M-Capital-Research/honeclaw/honeclaw
 hone-cli doctor
 hone-cli onboard
 hone-cli start
+# In another terminal, open or start the bundled Web interfaces:
+hone-cli web admin-ui
+hone-cli web user-ui
 ```
 
 ### Option C. Development Mode
@@ -116,7 +122,10 @@ hone-cli start
 ```shell
 git clone https://github.com/B-M-Capital-Research/honeclaw.git
 cd honeclaw
-./launch.sh --desktop
+cargo run -p hone-cli -- start --build
+# In separate terminals:
+cargo run -p hone-cli -- web admin-ui --dev
+cargo run -p hone-cli -- web user-ui --dev
 ```
 
 ---
@@ -152,7 +161,7 @@ If you are interested in accessing these capabilities, feel free to reach out to
 
 # 6. 🤝 Contributing
 
-We welcome all forms of contributions! Whether it's Rust backend dev, LLM prompt engineering, or financial data analysis.
+We welcome all forms of contributions, including Rust backend development, LLM prompt engineering, and financial data analysis.
 
 📄 License
 
@@ -160,10 +169,10 @@ This project is open-sourced under the MIT license.
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=B-M-Capital-Research%2Fhoneclaw&type=date&logscale=&legend=top-left">
+<a href="https://www.star-history.com/?repos=B-M-Capital-Research%2Fhoneclaw&type=timeline&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=B-M-Capital-Research/honeclaw&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=B-M-Capital-Research/honeclaw&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=B-M-Capital-Research/honeclaw&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=B-M-Capital-Research/honeclaw&type=timeline&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=B-M-Capital-Research/honeclaw&type=timeline&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=B-M-Capital-Research/honeclaw&type=timeline&legend=top-left" />
  </picture>
 </a>

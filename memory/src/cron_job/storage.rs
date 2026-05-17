@@ -1,9 +1,9 @@
 //! CronJobStorage JSON 存储层：按 actor 的定时任务 CRUD + 触发判定。
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use chrono::{Datelike, Timelike};
+use chrono::{Datelike, FixedOffset, NaiveDate, Timelike};
 use hone_core::ActorIdentity;
 use tracing::warn;
 use uuid::Uuid;
@@ -15,9 +15,114 @@ use super::schedule::{
     validate_schedule, validate_schedule_date,
 };
 use super::types::{
-    CronJob, CronJobData, CronJobUpdate, CronSchedule, MAX_ENABLED_JOBS_PER_ACTOR,
-    cron_enabled_limit_error,
+    ChannelTargetRecord, CronJob, CronJobData, CronJobUpdate, CronSchedule,
+    MAX_ENABLED_JOBS_PER_ACTOR, cron_enabled_limit_error,
 };
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    let trimmed = value.trim();
+    if !trimmed.is_empty() && !values.iter().any(|existing| existing == trimmed) {
+        values.push(trimmed.to_string());
+    }
+}
+
+fn newer_optional_string(left: Option<String>, right: Option<String>) -> Option<String> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn job_channel_allowed(job: &CronJob, channels: &[&str]) -> bool {
+    channels.is_empty() || channels.contains(&job.channel.as_str())
+}
+
+fn heartbeat_due_in_current_window(current_total: i32) -> bool {
+    let slot_minute = (current_total / 30) * 30;
+    slot_minute <= current_total && current_total <= slot_minute + DUE_WINDOW_MINUTES
+}
+
+fn scheduled_job_due_in_current_window(
+    job: &CronJob,
+    current_total: i32,
+    current_day: NaiveDate,
+) -> bool {
+    let job_total = (job.schedule.hour as i32) * 60 + (job.schedule.minute as i32);
+    let due_in_window =
+        current_total - DUE_WINDOW_MINUTES <= job_total && job_total <= current_total;
+    let due_by_catch_up = current_total > job_total && job_existed_before_slot(job, current_day);
+    due_in_window || due_by_catch_up
+}
+
+fn job_due_in_current_window(job: &CronJob, current_total: i32, current_day: NaiveDate) -> bool {
+    if job.is_heartbeat() {
+        heartbeat_due_in_current_window(current_total)
+    } else {
+        scheduled_job_due_in_current_window(job, current_total, current_day)
+    }
+}
+
+fn once_job_matches_current_day(job: &CronJob, current_day: NaiveDate) -> bool {
+    let Some(date) = job.schedule.date.as_deref() else {
+        return true;
+    };
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map(|scheduled_day| scheduled_day == current_day)
+        .unwrap_or(false)
+}
+
+fn repeat_matches_current_day(
+    job: &CronJob,
+    repeat_kind: &str,
+    current_day: NaiveDate,
+    current_weekday: u32,
+) -> bool {
+    if repeat_kind == "once" && !once_job_matches_current_day(job, current_day) {
+        return false;
+    }
+
+    match repeat_kind {
+        "weekly" => job.schedule.weekday == Some(current_weekday),
+        "workday" => is_workday(current_day),
+        "trading_day" => is_trading_day(current_day),
+        "holiday" => is_holiday(current_day),
+        _ => true,
+    }
+}
+
+fn already_ran_in_current_period(
+    job: &CronJob,
+    repeat_kind: &str,
+    now: chrono::DateTime<FixedOffset>,
+    current_total: i32,
+) -> bool {
+    let Some(last_run) = job.last_run_at.as_deref() else {
+        return false;
+    };
+    let Ok(last_dt) = chrono::DateTime::parse_from_rfc3339(last_run) else {
+        return false;
+    };
+
+    match repeat_kind {
+        "heartbeat" => {
+            let current_slot_start_minute = (current_total / 30) * 30;
+            let current_slot_hour = current_slot_start_minute / 60;
+            let current_slot_minute = current_slot_start_minute % 60;
+            last_dt.date_naive() == now.date_naive()
+                && last_dt.hour() as i32 == current_slot_hour
+                && (last_dt.minute() as i32 / 30) == (current_slot_minute / 30)
+        }
+        "weekly" => last_dt.iso_week() == now.iso_week() && last_dt.year() == now.year(),
+        "once" => true,
+        _ => last_dt.date_naive() == now.date_naive(),
+    }
+}
+
+fn due_job_dedup_key(job: &CronJob) -> String {
+    format!("{}:{}:{}", job.channel, job.id, job.channel_target)
+}
 
 impl CronJobStorage {
     pub(super) fn get_actor_file(&self, actor: &ActorIdentity) -> PathBuf {
@@ -115,6 +220,85 @@ impl CronJobStorage {
             .find(|(_, job)| job.id == job_id)
     }
 
+    pub fn list_channel_targets(&self) -> Vec<ChannelTargetRecord> {
+        let mut records: BTreeMap<(String, Option<String>, String), ChannelTargetRecord> =
+            BTreeMap::new();
+
+        for (actor, job) in self.list_all_jobs() {
+            let target = job.channel_target.trim();
+            if target.is_empty() {
+                continue;
+            }
+            let channel = if job.channel.trim().is_empty() {
+                actor.channel.clone()
+            } else {
+                job.channel.trim().to_string()
+            };
+            let channel_scope = job
+                .channel_scope
+                .clone()
+                .or_else(|| actor.channel_scope.clone())
+                .filter(|scope| !scope.trim().is_empty());
+            let key = (channel.clone(), channel_scope.clone(), target.to_string());
+            let record = records.entry(key).or_insert_with(|| ChannelTargetRecord {
+                channel,
+                channel_scope,
+                target: target.to_string(),
+                actor_user_ids: Vec::new(),
+                sources: Vec::new(),
+                scheduled_jobs: 0,
+                enabled_jobs: 0,
+                last_seen_at: None,
+            });
+            push_unique(&mut record.actor_user_ids, &actor.user_id);
+            push_unique(&mut record.sources, "cron_job");
+            record.scheduled_jobs += 1;
+            if job.enabled {
+                record.enabled_jobs += 1;
+            }
+            record.last_seen_at =
+                newer_optional_string(record.last_seen_at.clone(), job.created_at);
+        }
+
+        let executions = self
+            .list_recent_executions(&super::ExecutionFilter {
+                limit: 1000,
+                ..super::ExecutionFilter::default()
+            })
+            .unwrap_or_default();
+        for execution in executions {
+            let target = execution.channel_target.trim();
+            if target.is_empty() {
+                continue;
+            }
+            let channel = execution.channel.trim().to_string();
+            if channel.is_empty() {
+                continue;
+            }
+            let channel_scope = execution
+                .channel_scope
+                .clone()
+                .filter(|scope| !scope.trim().is_empty());
+            let key = (channel.clone(), channel_scope.clone(), target.to_string());
+            let record = records.entry(key).or_insert_with(|| ChannelTargetRecord {
+                channel,
+                channel_scope,
+                target: target.to_string(),
+                actor_user_ids: Vec::new(),
+                sources: Vec::new(),
+                scheduled_jobs: 0,
+                enabled_jobs: 0,
+                last_seen_at: None,
+            });
+            push_unique(&mut record.actor_user_ids, &execution.user_id);
+            push_unique(&mut record.sources, "cron_execution");
+            record.last_seen_at =
+                newer_optional_string(record.last_seen_at.clone(), Some(execution.executed_at));
+        }
+
+        records.into_values().collect()
+    }
+
     /// 添加定时任务
     pub fn add_job(
         &self,
@@ -133,6 +317,13 @@ impl CronJobStorage {
         bypass_limits: bool,
     ) -> serde_json::Value {
         let mut data = self.load_jobs(actor);
+        let channel_target = channel_target.trim();
+        if channel_target.is_empty() {
+            return serde_json::json!({
+                "success": false,
+                "error": "channel_target 不能为空；定时任务必须保存创建它的来源渠道目标"
+            });
+        }
 
         let enabled_count = data.jobs.iter().filter(|j| j.enabled).count();
         if enabled && !bypass_limits && enabled_count >= MAX_ENABLED_JOBS_PER_ACTOR {
@@ -178,11 +369,7 @@ impl CronJobStorage {
             enabled,
             channel: actor.channel.clone(),
             channel_scope: actor.channel_scope.clone(),
-            channel_target: if channel_target.is_empty() {
-                actor.user_id.clone()
-            } else {
-                channel_target.to_string()
-            },
+            channel_target: channel_target.to_string(),
             tags,
             created_at: Some(now),
             last_run_at: None,
@@ -299,15 +486,7 @@ impl CronJobStorage {
             return self.delete_job_for_actor(job_id, actor);
         }
 
-        let mut actors = self
-            .list_all_jobs()
-            .into_iter()
-            .map(|(actor, _)| actor)
-            .collect::<Vec<_>>();
-        actors.sort_by(|left, right| left.storage_key().cmp(&right.storage_key()));
-        actors.dedup_by(|left, right| left.storage_key() == right.storage_key());
-
-        for actor in actors {
+        for actor in self.list_unique_cron_actors() {
             if let Some(removed) = self.delete_job_for_actor(job_id, &actor)? {
                 return Ok(Some(removed));
             }
@@ -373,7 +552,7 @@ impl CronJobStorage {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let data: CronJobData = match serde_json::from_str(&content) {
+            let mut data: CronJobData = match serde_json::from_str(&content) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
@@ -389,115 +568,41 @@ impl CronJobStorage {
                 );
                 continue;
             }
+            let repaired_mismatches = repair_legacy_prompt_schedule_mismatches(&mut data);
+            if repaired_mismatches > 0
+                && let Err(err) = self.save_jobs(&actor, &data)
+            {
+                warn!(
+                    "failed to persist repaired cron schedule/prompt mismatches actor={} repairs={} error={}",
+                    actor.storage_key(),
+                    repaired_mismatches,
+                    err
+                );
+            }
 
             for job in &data.jobs {
                 if !job.enabled {
                     continue;
                 }
 
-                // Channel 过滤：每个 scheduler 只处理属于自己渠道的任务，
-                // 避免多进程共享存储时跨渠道误标记（cross-process mark race）。
-                if !channels.is_empty() && !channels.contains(&job.channel.as_str()) {
-                    continue;
-                }
-                if let Some((declared_hour, declared_minute)) = prompt_schedule_conflict(job) {
-                    warn!(
-                        "skipping cron job with schedule/prompt mismatch: job_id={} job={} schedule={:02}:{:02} prompt={:02}:{:02}",
-                        job.id,
-                        job.name,
-                        job.schedule.hour,
-                        job.schedule.minute,
-                        declared_hour,
-                        declared_minute
-                    );
+                if !job_channel_allowed(job, channels) {
                     continue;
                 }
 
-                let job_total = (job.schedule.hour as i32) * 60 + (job.schedule.minute as i32);
-                let is_heartbeat = job.is_heartbeat();
-                if is_heartbeat {
-                    // Heartbeat 任务按每半小时的整点槽触发；只在槽起点及其后的 DUE_WINDOW 分钟
-                    // 内视为「当前槽内」,其它时刻一律跳过。
-                    let slot_minute = (current_total / 30) * 30;
-                    if !(slot_minute <= current_total
-                        && current_total <= slot_minute + DUE_WINDOW_MINUTES)
-                    {
-                        continue;
-                    }
-                } else {
-                    // 普通任务：
-                    // - `due_in_window`: 处在计划时刻前 DUE_WINDOW 分钟到计划时刻之间
-                    // - `due_by_catch_up`: 已经过了计划时刻,但任务在当天的计划时刻之前就存在,
-                    //   说明是当天错过的那次调用,允许同日内补跑一次
-                    let due_in_window = current_total - DUE_WINDOW_MINUTES <= job_total
-                        && job_total <= current_total;
-                    let due_by_catch_up =
-                        current_total > job_total && job_existed_before_slot(job, current_day);
-                    if !(due_in_window || due_by_catch_up) {
-                        continue;
-                    }
+                if !job_due_in_current_window(job, current_total, current_day) {
+                    continue;
                 }
 
                 let repeat_kind = normalized_repeat(&job.schedule.repeat, &job.tags);
-                if repeat_kind == "once"
-                    && let Some(date) = job.schedule.date.as_deref()
-                    && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-                        .map(|scheduled_day| scheduled_day != current_day)
-                        .unwrap_or(true)
-                {
+                if !repeat_matches_current_day(job, repeat_kind, current_day, current_weekday) {
                     continue;
                 }
-                match repeat_kind {
-                    "weekly" => {
-                        if job.schedule.weekday != Some(current_weekday) {
-                            continue;
-                        }
-                    }
-                    "workday" => {
-                        if !is_workday(current_day) {
-                            continue;
-                        }
-                    }
-                    "trading_day" => {
-                        if !is_trading_day(current_day) {
-                            continue;
-                        }
-                    }
-                    "holiday" => {
-                        if !is_holiday(current_day) {
-                            continue;
-                        }
-                    }
-                    _ => {}
+
+                if already_ran_in_current_period(job, repeat_kind, now, current_total) {
+                    continue;
                 }
 
-                // 去抖：已经在当前周期内跑过一次就跳过。各 repeat 类型用不同的粒度比较：
-                // heartbeat 以「当日 + 同一 30 分钟槽」；weekly 以 ISO 周编号;
-                // once 跑完就永久视为已跑；其它(daily/workday/trading_day/holiday)以自然日。
-                if let Some(ref last_run) = job.last_run_at
-                    && let Ok(last_dt) = chrono::DateTime::parse_from_rfc3339(last_run)
-                {
-                    let already_ran = match repeat_kind {
-                        "heartbeat" => {
-                            let current_slot_start_minute = (current_total / 30) * 30;
-                            let current_slot_hour = current_slot_start_minute / 60;
-                            let current_slot_minute = current_slot_start_minute % 60;
-                            last_dt.date_naive() == now.date_naive()
-                                && last_dt.hour() as i32 == current_slot_hour
-                                && (last_dt.minute() as i32 / 30) == (current_slot_minute / 30)
-                        }
-                        "weekly" => {
-                            last_dt.iso_week() == now.iso_week() && last_dt.year() == now.year()
-                        }
-                        "once" => true,
-                        _ => last_dt.date_naive() == now.date_naive(),
-                    };
-                    if already_ran {
-                        continue;
-                    }
-                }
-
-                let dedup_key = format!("{}:{}:{}", job.channel, job.id, job.channel_target);
+                let dedup_key = due_job_dedup_key(job);
                 if !seen_due_keys.insert(dedup_key) {
                     warn!(
                         "skipping duplicate due cron job actor={} job_id={} target={}",
@@ -529,15 +634,7 @@ impl CronJobStorage {
             return self.mutate_job_for_actor(job_id, actor, bypass_limits, &mut mutator);
         }
 
-        let mut actors = self
-            .list_all_jobs()
-            .into_iter()
-            .map(|(actor, _)| actor)
-            .collect::<Vec<_>>();
-        actors.sort_by(|left, right| left.storage_key().cmp(&right.storage_key()));
-        actors.dedup_by(|left, right| left.storage_key() == right.storage_key());
-
-        for actor in actors {
+        for actor in self.list_unique_cron_actors() {
             if let Some(updated) =
                 self.mutate_job_for_actor(job_id, &actor, bypass_limits, &mut mutator)?
             {
@@ -546,6 +643,17 @@ impl CronJobStorage {
         }
 
         Ok(None)
+    }
+
+    fn list_unique_cron_actors(&self) -> Vec<ActorIdentity> {
+        let mut actors = self
+            .list_all_jobs()
+            .into_iter()
+            .map(|(actor, _)| actor)
+            .collect::<Vec<_>>();
+        actors.sort_by_key(|actor| actor.storage_key());
+        actors.dedup_by_key(|actor| actor.storage_key());
+        actors
     }
 
     fn mutate_job_for_actor<F>(
@@ -624,4 +732,26 @@ fn cron_filename_storage_key(path: &Path) -> Option<String> {
             .strip_suffix(".json")?
             .to_string(),
     )
+}
+
+fn repair_legacy_prompt_schedule_mismatches(data: &mut CronJobData) -> usize {
+    let mut repaired = 0;
+    for job in &mut data.jobs {
+        let Some((declared_hour, declared_minute)) = prompt_schedule_conflict(job) else {
+            continue;
+        };
+        warn!(
+            "repairing legacy cron job schedule/prompt mismatch: job_id={} job={} schedule={:02}:{:02} prompt={:02}:{:02}",
+            job.id,
+            job.name,
+            job.schedule.hour,
+            job.schedule.minute,
+            declared_hour,
+            declared_minute
+        );
+        job.schedule.hour = declared_hour;
+        job.schedule.minute = declared_minute;
+        repaired += 1;
+    }
+    repaired
 }

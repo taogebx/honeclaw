@@ -9,20 +9,15 @@ import {
   For,
 } from "solid-js"
 import { useNavigate } from "@solidjs/router"
+import { fetchGithubStars } from "@/lib/github-stars"
 import { CONTENT } from "@/lib/public-content"
 import { setLocale, useLocale } from "@/lib/i18n"
+import {
+  PUBLIC_BILIBILI_URL,
+  PUBLIC_YOUTUBE_URL,
+  PublicContactMenu,
+} from "@/components/public-contact-menu"
 import "./public-site.css"
-
-// ── GitHub Star Fetching ─────────────────────────────────────────────────────
-async function fetchGithubStars() {
-  try {
-    const res = await fetch("https://api.github.com/repos/B-M-Capital-Research/honeclaw")
-    const data = await res.json()
-    return data.stargazers_count || "..."
-  } catch (e) {
-    return "..."
-  }
-}
 
 // ── Icons ────────────────────────────────────────────────────────────────────
 const ICONS = {
@@ -68,9 +63,7 @@ function Header() {
       </div>
 
       <div class="header-actions">
-        <div class="header-socials mobile-hide">
-          <a href="https://www.youtube.com/@HoneFinancial" target="_blank" class="icon-btn-ghost" title="YouTube"><ICONS.Youtube /></a>
-          <a href="https://www.bilibili.com/video/BV1ByXNBGET5/" target="_blank" class="icon-btn-ghost" title="Bilibili"><ICONS.Bilibili /></a>
+        <div class="header-socials header-github-stars">
           <a href="https://github.com/B-M-Capital-Research/honeclaw" target="_blank" class="star-badge">
             <ICONS.Github />
             <span>{stars() || "..."}</span>
@@ -79,26 +72,7 @@ function Header() {
 
         <div class="divider-v mobile-hide" />
 
-        <a
-          href={`mailto:${C.contact_email}`}
-          class="header-contact-link"
-          title={`${C.contact_wechat_label}: ${C.contact_wechat}`}
-          aria-label={`${C.contact_email_label}: ${C.contact_email}`}
-          style={{
-            padding: "0 12px",
-            height: "34px",
-            "border-radius": "999px",
-            border: "1.5px solid #e2e8f0",
-            background: "rgba(255,255,255,0.72)",
-            color: "#334155",
-            "text-decoration": "none",
-            "font-size": "12px",
-            "font-weight": "700",
-            "white-space": "nowrap",
-          }}
-        >
-          <span class="header-contact-text">{C.contact_email}</span>
-        </a>
+        <PublicContactMenu />
 
         <div class="lang-switch">
           <button onClick={() => setLocale("zh")} class={useLocale() === "zh" ? "active" : ""}>中</button>
@@ -107,7 +81,7 @@ function Header() {
 
         <div style={{ display: "flex", gap: "8px" }}>
           <button onClick={() => navigate("/roadmap")} class="btn-roadmap-nav mobile-hide">
-            {useLocale() === 'zh' ? '产品路线图' : 'Roadmap'}
+            {CONTENT.home_page.roadmap_button}
           </button>
           <button onClick={() => navigate("/chat")} class="btn-chat-nav">{C.chat}</button>
         </div>
@@ -130,7 +104,7 @@ export default function PublicHomePage() {
       link: null,
     })),
     {
-      tag: useLocale() === "zh" ? "路线图" : "ROADMAP",
+      tag: CONTENT.home_page.roadmap_slide_tag,
       title: CONTENT.roadmap.hero_title,
       body: CONTENT.roadmap.hero_sub,
       image: useLocale() === "zh" ? "/hone_solution_zh.jpg" : "/hone_solution.jpg",
@@ -176,33 +150,31 @@ export default function PublicHomePage() {
           <div class="hero-logo-tag">
             <img src="/logo.svg" class="hero-logo" />
             <h1 class="hero-tagline">
-              {useLocale() === "zh" 
-                ? "并非迎合你的聊天玩具，而是你投资纪律的无情捍卫者。" 
-                : "Not a chatbot that flatters you, but a ruthless defender of your investment discipline."}
+              {CONTENT.home_page.hero_slogan}
             </h1>
           </div>
 
           <div class="hero-btns">
             <button onClick={() => navigate("/chat")} class="btn-primary refined">
               <ICONS.Chat />
-              <span>{useLocale() === "zh" ? "开始试用" : "Start Now"}</span>
+              <span>{CONTENT.home_page.start_trial}</span>
             </button>
             <a href="https://github.com/B-M-Capital-Research/honeclaw" target="_blank" class="btn-secondary refined">
               <ICONS.Github />
               <span>GitHub</span>
             </a>
-            <a href="https://www.bilibili.com/video/BV1ByXNBGET5/" target="_blank" class="btn-secondary refined bilibili-btn mobile-hide">
+            <a href={PUBLIC_BILIBILI_URL} target="_blank" class="btn-secondary refined bilibili-btn mobile-hide">
               <ICONS.Bilibili />
               <span>Bilibili</span>
             </a>
-            <a href="https://www.youtube.com/@HoneFinancial" target="_blank" class="btn-secondary refined youtube-btn mobile-hide">
+            <a href={PUBLIC_YOUTUBE_URL} target="_blank" class="btn-secondary refined youtube-btn mobile-hide">
               <ICONS.Youtube />
               <span>YouTube</span>
             </a>
           </div>
 
           <div class="video-container">
-            <div class="video-label">{useLocale() === "zh" ? "视频演示" : "VIDEO DEMO"}</div>
+            <div class="video-label">{CONTENT.home_page.video_demo}</div>
             <div class="video-wrapper">
               <iframe src={videoUrl()} allowfullscreen />
             </div>
@@ -238,7 +210,7 @@ export default function PublicHomePage() {
                   onClick={() => navigate(current().link!)}
                   class="btn-feature-link"
                 >
-                  <span>{useLocale() === 'zh' ? '完整路线图' : 'View Full Roadmap'}</span>
+                  <span>{CONTENT.home_page.view_full_roadmap}</span>
                   <ICONS.ArrowRight />
                 </button>
               </Show>
@@ -250,7 +222,7 @@ export default function PublicHomePage() {
 
             <div class="carousel-image" onClick={() => current().image && setEnlargeImg(current().image)}>
               <img src={current().image || undefined} class="feature-img" />
-              <div class="zoom-hint">{useLocale() === 'zh' ? '查看详情' : 'Zoom In'}</div>
+              <div class="zoom-hint">{CONTENT.home_page.zoom_hint}</div>
             </div>
           </div>
         </section>
@@ -289,9 +261,9 @@ export default function PublicHomePage() {
         .star-badge { display: flex; align-items: center; gap: 6px; color: #1e293b; text-decoration: none; font-size: 14px; font-weight: 700; background: #f1f5f9; padding: 6px 12px; border-radius: 8px; transition: all 0.2s; }
         .star-badge:hover { background: #e2e8f0; }
         .divider-v { width: 1px; height: 20px; background: #e2e8f0; }
-        .lang-switch { display: flex; background: #f1f5f9; padding: 3px; border-radius: 10px; }
-        .lang-switch button { padding: 4px 14px; border: none; background: transparent; cursor: pointer; font-size: 13px; font-weight: 700; color: #64748b; }
-        .lang-switch button.active { background: #fff; color: #000; border-radius: 7px; box-shadow: 0 2px 4px rgba(0,0,0,0.06); }
+        .lang-switch { display: inline-flex; align-items: center; background: rgba(255,255,255,0.72); border: 1px solid #e2e8f0; padding: 3px; border-radius: 999px; gap: 2px; }
+        .lang-switch button { min-width: 34px; min-height: 28px; padding: 0 12px; border: none; border-radius: 999px; background: transparent; cursor: pointer; font-size: 12px; font-weight: 700; color: #64748b; }
+        .lang-switch button.active { background: #000; color: #fff; border-radius: 999px; }
         .btn-chat-nav { background: #000; color: #fff; border: none; padding: 8px 20px; border-radius: 100px; font-size: 14px; font-weight: 700; cursor: pointer; }
         .btn-roadmap-nav { background: transparent; color: #64748b; border: 1.5px solid #e2e8f0; padding: 8px 20px; border-radius: 100px; font-size: 14px; font-weight: 700; cursor: pointer; transition: all 0.2s; }
         .btn-roadmap-nav:hover { background: #f8fafc; border-color: #cbd5e1; color: #1e293b; }
@@ -314,14 +286,46 @@ export default function PublicHomePage() {
         .youtube-btn:hover { color: #ff0000; border-color: #ff0000; }
 
         .video-container { width: 100%; max-width: 960px; display: flex; flex-direction: column; align-items: center; gap: 12px; margin-top: 20px; }
-        .video-label { font-size: 12px; font-weight: 800; color: #94a3b8; letter-spacing: 0.2em; text-transform: uppercase; }
+        .video-label {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          padding: 6px 14px;
+          border-radius: 999px;
+          background: #0f172a;
+          color: #f8fafc;
+          font-size: 12px;
+          font-weight: 700;
+          letter-spacing: 0.12em;
+          text-transform: uppercase;
+        }
+        .video-label::before {
+          content: '';
+          display: inline-block;
+          width: 0;
+          height: 0;
+          border-left: 7px solid #f59e0b;
+          border-top: 4px solid transparent;
+          border-bottom: 4px solid transparent;
+        }
         .video-wrapper { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 28px; overflow: hidden; box-shadow: 0 30px 60px rgba(0,0,0,0.1); border: 1px solid #f1f5f9; }
         .video-wrapper iframe { width: 100%; height: 100%; border: none; }
 
         /* Carousel Nav */
         .section-separator { width: 100%; margin: 80px 0 48px; display: flex; align-items: center; gap: 32px; }
         .section-separator .line { flex: 1; height: 1px; background: #f1f5f9; }
-        .carousel-nav { display: flex; gap: 24px; overflow-x: auto; padding: 4px; }
+        .carousel-nav {
+          display: flex;
+          gap: 24px;
+          overflow-x: auto;
+          padding: 4px;
+          scrollbar-width: none;
+          scroll-snap-type: x proximity;
+          -webkit-mask-image: linear-gradient(to right, transparent 0, #000 16px, #000 calc(100% - 24px), transparent 100%);
+          mask-image: linear-gradient(to right, transparent 0, #000 16px, #000 calc(100% - 24px), transparent 100%);
+        }
+        .carousel-nav::-webkit-scrollbar { display: none; }
+        .nav-item { scroll-snap-align: center; }
         .nav-item { border: none; background: transparent; color: #94a3b8; font-size: 14px; font-weight: 800; cursor: pointer; white-space: nowrap; transition: all 0.2s; position: relative; padding: 4px 0; }
         .nav-item:hover { color: #64748b; }
         .nav-item.active { color: #000; }
@@ -362,12 +366,17 @@ export default function PublicHomePage() {
         @media (max-width: 640px) {
           .hero-logo { height: 90px; }
           .hero-tagline { font-size: 26px; }
+          .hero-btns { display: grid; grid-template-columns: 1fr 1fr; width: 100%; gap: 10px; }
           .btn-primary.refined, .btn-secondary.refined { width: 100%; padding: 14px 24px; font-size: 16px; }
           .page-header { padding: 0 20px; }
           .carousel-nav { gap: 16px; }
           .nav-item { font-size: 13px; }
           .feature-title { font-size: 28px; }
           .feature-body { font-size: 16px; }
+        }
+        @media (max-width: 480px) {
+          .hero-btns { grid-template-columns: 1fr; }
+          .page-header { padding: 0 14px; }
         }
       `}</style>
     </div>

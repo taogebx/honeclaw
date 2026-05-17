@@ -1,7 +1,7 @@
 //! 周期性任务的统一观测落盘 —— `data/runtime/task_runs.YYYY-MM-DD.jsonl`。
 //!
 //! 任何周期任务(EventSource poller / digest scheduler / daily_report /
-//! thesis_cron / cleanup 等)在每次 tick 末尾调一次 [`record_task_run`],
+//! mainline_cron / cleanup 等)在每次 tick 末尾调一次 [`record_task_run`],
 //! 把一条结构化记录追加到当日的 jsonl 文件。文件每天切一个,通过启动时
 //! 的清理保留 [`TASK_RUNS_RETENTION_DAYS`] 天。
 //!
@@ -34,7 +34,7 @@ pub const TASK_RUNS_RETENTION_DAYS: i64 = 14;
 /// 单次 tick 的成败结果。
 ///
 /// - `Ok` —— 命中并成功执行。
-/// - `Skipped` —— 按业务策略主动跳过(thesis cron staleness 没到 / digest 不在窗口内
+/// - `Skipped` —— 按业务策略主动跳过(mainline cron staleness 没到 / digest 不在窗口内
 ///   等),不是失败。
 /// - `Failed` —— 业务函数返回 Err。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,7 +59,7 @@ impl TaskOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRunRecord {
     /// 稳定标识,跟 tracing `task=` 字段一致。例:
-    /// `poller.fmp.earnings` / `internal.daily_report` / `thesis_cron`。
+    /// `poller.fmp.earnings` / `internal.daily_report` / `mainline_cron`。
     pub task: String,
     /// 本轮 tick 开始时刻 (UTC)。
     pub started_at: DateTime<Utc>,
@@ -133,13 +133,13 @@ pub fn purge_old_task_runs(runtime_dir: &Path, retention_days: i64) {
     };
     for entry in read.flatten() {
         let name = entry.file_name();
-        let s = match name.to_str() {
-            Some(s) => s,
+        let file_name = match name.to_str() {
+            Some(file_name) => file_name,
             None => continue,
         };
-        let date_str = match s
+        let date_str = match file_name
             .strip_prefix("task_runs.")
-            .and_then(|s| s.strip_suffix(".jsonl"))
+            .and_then(|name| name.strip_suffix(".jsonl"))
         {
             Some(d) => d,
             None => continue,
@@ -148,13 +148,13 @@ pub fn purge_old_task_runs(runtime_dir: &Path, retention_days: i64) {
             Ok(d) => d,
             Err(_) => continue,
         };
-        if date < cutoff {
-            if let Err(e) = fs::remove_file(entry.path()) {
-                warn!(
-                    file = %entry.path().display(),
-                    "task_runs purge: remove failed: {e:#}"
-                );
-            }
+        if date < cutoff
+            && let Err(e) = fs::remove_file(entry.path())
+        {
+            warn!(
+                file = %entry.path().display(),
+                "task_runs purge: remove failed: {e:#}"
+            );
         }
     }
 }
@@ -198,8 +198,11 @@ pub fn read_recent_task_runs(
 }
 
 /// 给 caller 一个把 `started_at` / `ended_at` / `outcome` 一次塞好的 helper,
-/// 减少调用点的样板。失败的 error 字符串截断到 `MAX_ERROR_LEN` 防止 jsonl 行过长。
+/// 减少调用点的样板。失败的 error 字符串会先脱敏再截断,防止 jsonl 行过长或
+/// 持久化常见 URL 凭证。
 const MAX_ERROR_LEN: usize = 500;
+const REDACTED_SECRET: &str = "<redacted>";
+const TRUNCATED_SUFFIX: &str = "…(truncated)";
 
 pub fn record_ok(runtime_dir: &Path, task: &str, started_at: DateTime<Utc>, items: u64) {
     record_task_run(
@@ -230,13 +233,7 @@ pub fn record_skipped(runtime_dir: &Path, task: &str, started_at: DateTime<Utc>)
 }
 
 pub fn record_failed(runtime_dir: &Path, task: &str, started_at: DateTime<Utc>, error: &str) {
-    let truncated = if error.len() > MAX_ERROR_LEN {
-        let mut s = error.chars().take(MAX_ERROR_LEN).collect::<String>();
-        s.push_str("…(truncated)");
-        s
-    } else {
-        error.to_string()
-    };
+    let sanitized = sanitize_task_error(error);
     record_task_run(
         runtime_dir,
         &TaskRunRecord {
@@ -245,9 +242,78 @@ pub fn record_failed(runtime_dir: &Path, task: &str, started_at: DateTime<Utc>, 
             ended_at: Utc::now(),
             outcome: TaskOutcome::Failed,
             items: 0,
-            error: Some(truncated),
+            error: Some(sanitized),
         },
     );
+}
+
+fn sanitize_task_error(error: &str) -> String {
+    truncate_task_error(&redact_common_secret_details(error))
+}
+
+fn truncate_task_error(error: &str) -> String {
+    if error.chars().count() <= MAX_ERROR_LEN {
+        return error.to_string();
+    }
+    let mut s = error.chars().take(MAX_ERROR_LEN).collect::<String>();
+    s.push_str(TRUNCATED_SUFFIX);
+    s
+}
+
+fn redact_common_secret_details(text: &str) -> String {
+    let mut output = redact_bearer_tokens(text);
+    for key in [
+        "access_token",
+        "accessToken",
+        "api_key",
+        "apiKey",
+        "apikey",
+        "token",
+        "app_secret",
+        "appSecret",
+        "password",
+    ] {
+        output = redact_query_value(&output, key);
+    }
+    output
+}
+
+fn redact_bearer_tokens(text: &str) -> String {
+    const MARKER: &str = "Bearer ";
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find(MARKER) {
+        let value_start = index + MARKER.len();
+        output.push_str(&remaining[..value_start]);
+        output.push_str(REDACTED_SECRET);
+        let value_tail = remaining[value_start..]
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                (ch.is_whitespace() || matches!(ch, ')' | ',' | '"')).then_some(idx)
+            })
+            .unwrap_or(remaining[value_start..].len());
+        remaining = &remaining[value_start + value_tail..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn redact_query_value(text: &str, key: &str) -> String {
+    let needle = format!("{key}=");
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find(&needle) {
+        let value_start = index + needle.len();
+        output.push_str(&remaining[..value_start]);
+        output.push_str(REDACTED_SECRET);
+        let value_tail = remaining[value_start..]
+            .char_indices()
+            .find_map(|(idx, ch)| (ch == '&' || ch == ')' || ch.is_whitespace()).then_some(idx))
+            .unwrap_or(remaining[value_start..].len());
+        remaining = &remaining[value_start + value_tail..];
+    }
+    output.push_str(remaining);
+    output
 }
 
 /// 仅在测试 / 自检时使用。把单条记录格式化成 jsonl 行,方便比对。
@@ -271,13 +337,13 @@ mod tests {
 
     #[test]
     fn append_creates_file_and_writes_one_line_per_record() {
-        let tmp = tempdir().unwrap();
-        let dir = tmp.path();
-        record_ok(dir, "poller.test", Utc::now(), 5);
-        record_skipped(dir, "thesis_cron", Utc::now());
-        record_failed(dir, "internal.cleanup", Utc::now(), "disk full");
+        let temp_dir = tempdir().unwrap();
+        let runtime_dir = temp_dir.path();
+        record_ok(runtime_dir, "poller.test", Utc::now(), 5);
+        record_skipped(runtime_dir, "mainline_cron", Utc::now());
+        record_failed(runtime_dir, "internal.cleanup", Utc::now(), "disk full");
 
-        let path = task_runs_path(dir, Utc::now().date_naive());
+        let path = task_runs_path(runtime_dir, Utc::now().date_naive());
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 3, "应写入 3 行");
@@ -296,16 +362,16 @@ mod tests {
 
     #[test]
     fn read_recent_returns_records_in_reverse_chrono() {
-        let tmp = tempdir().unwrap();
-        let dir = tmp.path();
-        let t0 = Utc::now() - chrono::Duration::seconds(3);
-        let t1 = Utc::now() - chrono::Duration::seconds(2);
-        let t2 = Utc::now() - chrono::Duration::seconds(1);
-        record_ok(dir, "a", t0, 1);
-        record_ok(dir, "b", t1, 1);
-        record_ok(dir, "c", t2, 1);
+        let temp_dir = tempdir().unwrap();
+        let runtime_dir = temp_dir.path();
+        let oldest_started_at = Utc::now() - chrono::Duration::seconds(3);
+        let middle_started_at = Utc::now() - chrono::Duration::seconds(2);
+        let newest_started_at = Utc::now() - chrono::Duration::seconds(1);
+        record_ok(runtime_dir, "a", oldest_started_at, 1);
+        record_ok(runtime_dir, "b", middle_started_at, 1);
+        record_ok(runtime_dir, "c", newest_started_at, 1);
 
-        let recent = read_recent_task_runs(dir, 1, 10);
+        let recent = read_recent_task_runs(runtime_dir, 1, 10);
         assert_eq!(recent.len(), 3);
         // 倒序:最近写入的在最前
         assert_eq!(recent[0].task, "c");
@@ -315,41 +381,58 @@ mod tests {
 
     #[test]
     fn read_recent_respects_limit() {
-        let tmp = tempdir().unwrap();
-        let dir = tmp.path();
+        let temp_dir = tempdir().unwrap();
+        let runtime_dir = temp_dir.path();
         for i in 0..5 {
-            record_ok(dir, &format!("task_{i}"), Utc::now(), i);
+            record_ok(runtime_dir, &format!("task_{i}"), Utc::now(), i);
         }
-        let recent = read_recent_task_runs(dir, 0, 3);
+        let recent = read_recent_task_runs(runtime_dir, 0, 3);
         assert_eq!(recent.len(), 3);
     }
 
     #[test]
     fn purge_removes_files_older_than_cutoff() {
-        let tmp = tempdir().unwrap();
-        let dir = tmp.path();
+        let temp_dir = tempdir().unwrap();
+        let runtime_dir = temp_dir.path();
         // 模拟 30 天前一个文件
         let old_date = Utc::now().date_naive() - chrono::Duration::days(30);
-        let old_path = task_runs_path(dir, old_date);
+        let old_path = task_runs_path(runtime_dir, old_date);
         std::fs::write(&old_path, "{}\n").unwrap();
         // 今天一个文件
-        record_ok(dir, "today", Utc::now(), 1);
+        record_ok(runtime_dir, "today", Utc::now(), 1);
 
-        purge_old_task_runs(dir, 14);
+        purge_old_task_runs(runtime_dir, 14);
 
         assert!(!old_path.exists(), "30 天前的文件应被清理");
-        let today_path = task_runs_path(dir, Utc::now().date_naive());
+        let today_path = task_runs_path(runtime_dir, Utc::now().date_naive());
         assert!(today_path.exists(), "今天的文件应保留");
     }
 
     #[test]
     fn long_error_is_truncated() {
-        let tmp = tempdir().unwrap();
+        let temp_dir = tempdir().unwrap();
         let long = "x".repeat(2000);
-        record_failed(tmp.path(), "task", Utc::now(), &long);
-        let recent = read_recent_task_runs(tmp.path(), 0, 1);
+        record_failed(temp_dir.path(), "task", Utc::now(), &long);
+        let recent = read_recent_task_runs(temp_dir.path(), 0, 1);
         let err = recent[0].error.as_deref().unwrap();
         assert!(err.len() < 1000, "超长错误应截断");
-        assert!(err.ends_with("…(truncated)"));
+        assert!(err.ends_with(TRUNCATED_SUFFIX));
+    }
+
+    #[test]
+    fn failed_error_redacts_common_secret_details() {
+        let temp_dir = tempdir().unwrap();
+        record_failed(
+            temp_dir.path(),
+            "poller.secret",
+            Utc::now(),
+            "request failed https://api.test/path?access_token=abc&apiKey=def auth=Bearer bearer-secret",
+        );
+        let recent = read_recent_task_runs(temp_dir.path(), 0, 1);
+        let err = recent[0].error.as_deref().unwrap();
+        assert_eq!(
+            err,
+            "request failed https://api.test/path?access_token=<redacted>&apiKey=<redacted> auth=Bearer <redacted>"
+        );
     }
 }

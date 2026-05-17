@@ -5,6 +5,190 @@
 - **严重等级**: P3
 - **状态**: Fixed
 - **证据来源**:
+  - `2026-05-08 11:06 CST` 复核当前代码后关闭本单：heartbeat 调度事件已加载同 actor 最近送达历史，且 `heartbeat_duplicate_preview_match(...)` 会基于事实 token 与实体 anchor 抑制跨 job / 跨窗口的同一旧事件重复投递，同时保留不同实体与同 ticker 新事件的通过路径。定向验证通过：`cargo test -p hone-scheduler heartbeat_history_includes_actor_cross_job_deliveries -- --nocapture`、`cargo test -p hone-channels heartbeat_ --lib -- --nocapture`、`cargo check -p hone-core -p hone-channels -p hone-scheduler --tests`。当前机器旧窗口重复样本不再作为仓库活跃判据。
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `2026-05-08 15:02 CST` 最新巡检样本：
+      - `job_name=Cerebras IPO与业务进展心跳监控`
+      - `run_id=16783`，`executed_at=2026-05-08T11:30:56.951260+08:00`，落成 `completed + sent + delivered=1`，正文围绕 `S-1/A / OpenAI MRA / 路演启动 / 发行区间 / 预计 5月13日定价 / 5月14日挂牌` 发送。
+      - `run_id=16852`，`executed_at=2026-05-08T14:31:08.289558+08:00`，同一 job 再次落成 `completed + sent + delivered=1`，继续发送 `路演已启动、S-1 Amendment No.1、发行 2800 万股、$115-$125 区间、5月13日前后定价、5月14日最早交易` 这一组已在 `11:30` 送达的事实。
+      - `job_name=持仓重大事件心跳检测` 与 `job_name=RKLB异动监控`
+      - `run_id=16846`，`executed_at=2026-05-08T14:30:57.207608+08:00`，聚合持仓 heartbeat 发送 `RKLB Q1财报超预期 / backlog $22亿 / Motiv Space Systems / Anduril $3000万 HASTE / Raytheon Space Based Interceptor / Neutron + Electron 订单`。
+      - `run_id=16842`，`executed_at=2026-05-08T14:31:05.863720+08:00`，单标的 `RKLB异动监控` 在 9 秒后再次发送同一组 RKLB Q1、backlog、Motiv、Anduril、Raytheon 和发射订单事实。
+      - 这说明本机旧 live window 在 `2026-05-08 15:02` 仍能看到重复提醒样本；但当前代码已在 `11:06` 增加跨 job 送达历史加载与事实 token / 实体 anchor 去重，本轮不把该旧运行态证据重新登记为活跃缺陷。
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `2026-05-04 08:04 CST` 最新巡检样本：
+      - `job_name=ORCL 大事件监控`
+      - `run_id=15464`，`executed_at=2026-05-04T08:00:45.191722+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 再次发送同一 `ORCL 171.83 / +6.47% / 当前时间为北京时间 2026-05-04 08:00 / 美股已收盘` 静态事实；而同一 job 在前一窗 `run_id=15442`（`07:30:33`）刚回落成 `noop + skipped_noop`
+      - `job_name=Cerebras IPO与业务进展心跳监控`
+      - `run_id=15465`，`executed_at=2026-05-04T08:01:27.029754+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把同一 `S-1/A pricing range = $22-$25 / 拟 5 月上市 / AWS Bedrock + OpenAI 协议` 旧事实重新包装成 `重大增量触发`；而同一 job 在前一窗 `run_id=15443`（`07:30:44`）刚回落成 `noop + skipped_noop`
+      - `job_name=持仓重大事件心跳检测`
+      - `run_id=15466`，`executed_at=2026-05-04T08:01:41.702191+08:00`，同窗再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把同一 `TEM 5月6日财报将至` 与 `ASTS BlueBird 7 deployments trouble（5月2日报道）` 组合成 `持仓事件提醒` 送达；而同一 job 在前一窗 `run_id=15444`（`07:30:44`）也刚回落成 `noop + skipped_noop`
+      - `data/runtime/logs/sidecar.log` 在 `2026-05-04 08:00:42.523-08:01:39.864 CST` 同步记录这三条 job 的 `parse_kind=JsonTriggered -> deliver`，同窗其它 heartbeat 大多仍回落成 `Empty` 或 `JsonNoop`
+      - 这说明重复提醒缺陷到 `2026-05-04 08:04` 仍稳定活跃：同一批停盘静态价格与已知旧催化在 `07:30` 窗口刚明确 `noop` 后，`08:00` 下一窗又被重新包装成提醒。它不阻断主功能链路，但持续制造重复提醒噪音，因此维持 `P3`
+  - `data/runtime/logs/sidecar.log`
+    - `2026-05-04 07:03 CST` 最新巡检样本：
+      - `job_name=小米30港元破位预警`
+      - `2026-05-04 06:30:13.831-06:30:13.832 CST` 同步记录 `run_finish success=true content_chars=0` 与 `parse_kind=Empty raw_preview=""`，对应 `cron_job_runs.run_id=15392` 同窗落成 `noop + skipped_noop`
+      - 仅约 31 分钟后，同一 job 在 `2026-05-04 07:01:11.204-07:01:11.205 CST` 又记录 `parse_kind=JsonTriggered -> deliver`；对应 `cron_job_runs.run_id=15422` 落成 `completed + sent + delivered=1`
+      - `deliver_preview` 再次发送同一 `29.02 港元 / 跌破 30 港元 / 港股尚未开盘 / 上述价格为上一交易日（4月28日）收盘数据` 周末静态条件；期间没有新的开盘、收盘、财报或独立公司催化
+      - 同一 `07:00` 窗口里的 `CAI / RKLB / TEM破位 / 原油 / ORCL / ASTS / Cerebras / TEM大事件 / 持仓重大事件 / Watchlist` 全部回落为 `Empty` 或 `JsonNoop`，说明这不是整批 heartbeat 普遍触发，而是小米单条旧事实再次在无新增增量时被重新包装成提醒
+      - 这说明重复提醒缺陷到 `2026-05-04 07:03` 仍稳定活跃：同一停盘静态破位事实在上一窗已明确 `noop/Empty` 后，下一窗仍会重新回摆成 `triggered + sent`。它不阻断主功能链路，但持续制造重复提醒噪音，因此维持 `P3`
+  - `data/runtime/logs/sidecar.log`
+    - `2026-05-04 02:02 CST` 最新巡检样本：
+      - `job_name=小米30港元破位预警`
+      - `2026-05-04 01:30:27.406-01:30:27.407 CST` 同步记录 `parse_kind=JsonTriggered -> deliver`，正文再次使用同一周末静态 `29.02 港元 / 低于 30 港元阈值 / 港股已停盘` 条件
+      - 仅约 30 分钟后，同一 job 在 `2026-05-04 02:00:23.219 CST` 又回落成 `parse_kind=JsonNoop raw_preview="{\"status\":\"noop\"}"`，期间没有新的开盘、收盘、财报或独立公司催化
+      - `job_name=ORCL 大事件监控`
+      - `2026-05-04 01:30:37.374-01:30:37.374 CST` 同步记录 `parse_kind=JsonTriggered -> deliver`，再次把同一 `161.39 -> 171.83 / +6.47% / 最新可得价格为停牌前上一交易日收盘价` 组织成触发提醒
+      - 仅约 30 分钟后，同一 job 在 `2026-05-04 02:00:48.937 CST` 又回落成 `parse_kind=JsonNoop`
+      - 同窗其它 heartbeat 仍大量落成 `Empty` 或 `JsonNoop`，说明这不是整批心跳统一触发，而是相同旧事实在相邻窗口继续 `triggered -> noop` 回摆
+      - 这说明重复提醒缺陷在 `01:30-02:00` 最新窗口仍稳定活跃：同一周末静态价格事实在没有新增增量的情况下，先被重新送达，随后下一窗又回落 `noop`。它不阻断主功能链路，但持续制造重复提醒噪音，因此维持 `P3`
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `2026-05-03 19:10 CST` 最新巡检样本：
+      - `job_name=小米30港元破位预警`
+        - `run_id=14870`，`executed_at=2026-05-03T19:00:26.644241+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 再次发送同一 `小米 29.02 港元 / 跌破 30 港元 / 日内高点 29.88 / 低点 28.80 / 成交量 2.84 亿股 / 周末静态港股数据` 条件；而同一 job 在前一窗 `run_id=14851`（`18:30:29`）刚回落成 `noop + skipped_noop`
+      - 同一 `19:00` 窗口里，`job_name=ORCL 大事件监控` 的 `run_id=14868` 已回落成 `noop + skipped_noop + parse_kind=Empty`，`job_name=持仓重大事件心跳检测` 的 `run_id=14874` 也回落成 `noop + skipped_noop + parse_kind=JsonEmptyStatus`，说明这不是整批 heartbeat 普遍触发，而是小米单条旧事实又在无新增增量窗口时被重新包装成提醒
+      - `data/runtime/logs/sidecar.log` 在 `2026-05-03 19:00:22.246 CST` 同步记录 `小米30港元破位预警` 的 `parse_kind=JsonTriggered -> deliver`，而同条 job 在 `18:30:29.464` 还刚记录 `parse_kind=JsonNoop`
+      - 这说明重复提醒缺陷在最新整点窗口继续活跃：同一周末静态跌破事实在上一窗已明确 `noop` 后，下一窗仍会重新回摆成 `triggered + sent`。它不阻断主功能链路，但持续制造重复提醒噪音，因此维持 `P3`
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `2026-05-03 16:02 CST` 最新巡检样本：
+      - `job_name=ORCL 大事件监控`
+      - `run_id=14739`，`executed_at=2026-05-03T16:00:36.129466+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 再次发送同一 `ORCL 171.83 / +6.47% / OpenAI 相关利好 / 市场当前已收盘` 静态事实；而同一 job 在前一窗 `run_id=14717`（`15:30:27`）刚回落成 `noop + skipped_noop`
+      - 同一 `16:00` 窗口里，`job_name=持仓重大事件心跳检测` 的 `run_id=14743` 已回落成 `noop + skipped_noop`，`小米30港元破位预警` 的 `run_id=14734` 也回落成 `noop + skipped_noop`，说明这不是整批 heartbeat 普遍触发，而是 ORCL 单条旧事实又在无新增交易窗口时被重新包装成提醒
+      - `data/runtime/logs/sidecar.log` 在 `2026-05-03 16:00:32.411-16:00:32.412 CST` 同步记录 `ORCL 大事件监控` 的 `parse_kind=JsonTriggered -> deliver`，而同条 job 在 `15:30:27.314-15:30:27.315` 还刚记录 `parse_kind=JsonNoop`
+      - 这说明重复提醒缺陷在最新整点窗口继续活跃：同一周末静态收盘事实在上一窗已明确 `noop` 后，下一窗仍会重新回摆成 `triggered + sent`。它不阻断主功能链路，但持续制造重复提醒噪音，因此维持 `P3`
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - `2026-05-03 15:02 CST` 最新巡检样本：
+      - `job_name=小米30港元破位预警`
+      - `run_id=14694`，`executed_at=2026-05-03T15:00:24.012718+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 再次发送同一 `小米 29.02 港元 / 跌破 30 港元 / 放量明显 / 周末静态港股数据` 条件；而同一 job 在前一窗 `run_id=14671`（`14:30:20`）刚回落成 `noop + skipped_noop`
+      - 同一 `15:00` 窗口里，`job_name=ORCL 大事件监控` 与 `job_name=持仓重大事件心跳检测` 已分别回落成 `run_id=14697`、`14699` 的 `noop + skipped_noop`，说明当前重复回摆并非整批 heartbeat 普遍触发，而是单条旧事实仍会在无新增增量时被重新包装成提醒
+      - `data/runtime/logs/sidecar.log` 在 `2026-05-03 15:00:21.192-15:00:21.193 CST` 同步记录 `小米30港元破位预警` 的 `parse_kind=JsonTriggered -> deliver`，而同条 job 在 `14:30:20.492` 还刚记录 `parse_kind=Empty raw_chars=0`
+      - 这说明重复提醒缺陷在最新整点窗口继续活跃：同一周末静态跌破事实在上一窗已明确 `noop/Empty` 后，下一窗仍会重新回摆成 `triggered + sent`。它不阻断主功能链路，但持续制造重复提醒噪音，因此维持 `P3`
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 2026-05-03 13:02 CST 最新巡检样本：
+      - `job_name=小米30港元破位预警`
+      - `run_id=14609`，`executed_at=2026-05-03T13:00:35.908647+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 再次发送同一 `小米 29.02 港元 / 跌破 30 港元 / 港股周末休市` 条件；而同一 job 在前一窗 `run_id=14588`（`12:30:44`）刚刚回落成 `noop + skipped_noop`
+      - 同一 `13:00` 窗口里，`job_name=持仓重大事件心跳检测` 的 `run_id=14611` 也再次落成 `completed + sent + delivered=1`，继续把同一 `ORCL 最新可得价格 171.83 / 较昨收 +6.47% / OpenAI 利好表态` 周末静态事实重新包装成触发提醒；而该链路在前一窗 `run_id=14583`（`12:30:25`）刚回落成 `noop + skipped_noop`
+      - `data/runtime/logs/sidecar.log` 在 `2026-05-03 13:00:32.534-13:00:32.535 CST`、`13:00:42.854-13:00:42.854 CST` 同步记录这两条 job 的 `parse_kind=JsonTriggered -> deliver`
+      - 这说明重复提醒缺陷在最新整点窗口继续活跃：同一批周末静态价格事实在上一窗已明确 `noop` 后，下一窗仍会重新回摆成 `triggered + sent`。它不阻断主功能链路，但持续制造重复提醒噪音，因此维持 `P3`
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 2026-05-03 12:04 CST 最新巡检样本：
+      - `job_name=小米30港元破位预警`
+      - `run_id=14564`，`executed_at=2026-05-03T12:00:46.348961+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把同一 `小米 29.02 港元 / 跌破 30 港元 / 港股周末休市` 条件重新包装成 `已触及心理止损/观察线` 送达；而同一 job 在更早的 `run_id=14475`（`10:00:38`）与 `run_id=14303`（`06:30:20`）已经发送过同一静态周末价格
+      - 更关键的是，中间相邻三窗 `run_id=14492`（`10:30:17`）、`14513`（`11:00:14`）、`14539`（`11:30:23`）都已明确回落成 `noop + skipped_noop`，说明 `12:00` 这次不是持续触发同一窗口的重复投递，而是在没有新开盘、没有新财报、没有新的独立阈值跨越时，把同一静态跌破事实重新当成增量事件送达
+      - `data/runtime/logs/sidecar.log` 在 `2026-05-03 12:00:43.875-12:00:43.878 CST` 同步记录 `parse_kind=JsonTriggered -> deliver`，而 `11:30:23.373-11:30:23.375` 还刚记录同一 job 的 `parse_kind=JsonNoop`
+      - 这说明重复提醒缺陷已不仅体现在 ORCL / TEM / RKLB 等事件线，连单 ticker 阈值 heartbeat 也会在周末静态价格上经历多窗 `noop` 后重新回摆成 `triggered + sent`。它不阻断主功能链路，但持续制造重复提醒噪音，因此维持 `P3`
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 2026-05-03 11:03 CST 最新巡检样本：
+      - `job_name=ORCL 大事件监控`
+      - `run_id=14521`，`executed_at=2026-05-03T11:01:07.558579+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 再次发送 `ORCL 171.83 / +6.47% / OpenAI 合作进展与市场预期提振`，并且正文自己注明“美股周末休市，当前时间（北京时间 2026-05-03 11:00:02）无实时交易，该价格为前一交易日（2026-05-01）收盘水平”
+      - 但同一批 `11:00` heartbeat started 行里，`持仓重大事件心跳检测` 的 `run_id=14519` 已在 `2026-05-03T11:00:46.544119+08:00` 回落成 `noop + skipped_noop`；同窗 `RKLB/TEM/ASTS/Cerebras/Watchlist/小米/CAI/TEM破位/原油` 也大多回落为 `noop`
+      - `data/runtime/logs/sidecar.log` 在 `2026-05-03 11:01:04.155-11:01:04.156 CST` 同步记录 `ORCL 大事件监控` 的 `parse_kind=JsonTriggered -> deliver`，而前一轮 `2026-05-03 10:30:18.304 CST` 同一 job 还刚回落成 `parse_kind=Empty`
+      - 这说明 ORCL 链路仍会在无新增交易窗口、无新增公司级独立催化的情况下，把同一静态收盘价与同一 OpenAI 叙事重新包装成“当前触发”再次送达。它不阻断主功能链路，但持续制造重复提醒噪音，因此维持 `P3`
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 2026-05-03 09:00-09:02 最新巡检样本：
+      - `job_name=ORCL 大事件监控`
+      - `run_id=14422`，`executed_at=2026-05-03T09:00:16.991227+08:00`，落成 `noop + skipped_noop`
+      - 同窗 `data/runtime/logs/sidecar.log` 记录 `parse_kind=Empty raw_chars=0 raw_preview=""`
+      - 约 67 秒后，同一用户目标下的 `job_name=持仓重大事件心跳检测`
+      - `run_id=14431`，`executed_at=2026-05-03T09:01:24.749068+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把同一 `ORCL 最新收盘价171.83美元（昨收161.39）、日内涨幅+6.47%、OpenAI 相关利好推动大幅反弹` 重新包装成 `【持仓心跳检测 - 北京时间2026-05-03 09:00】` 内的 `ORCL（甲骨文）：价格异动触发`
+      - 两轮之间没有新的价格窗口、公告落地或独立公司级新催化；单标的 ORCL job 已在本窗显式回落 `noop/Empty`，但聚合持仓 heartbeat 仍把同一事实当成新增提醒再次送达
+      - 这组最新样本说明“同一目标下跨 job 重复提醒旧事实”的缺陷在 `09:00` 整点窗口继续活跃复现；它不阻断主功能链路，但持续制造提醒噪音，因此保持 `P3`
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 2026-05-03 06:30-07:01 最新巡检样本：
+      - `job_name=ORCL 大事件监控`
+      - `run_id=14311`，`executed_at=2026-05-03T06:31:01.884246+08:00`，落成 `completed + sent + delivered=1`
+      - `response_preview` 发送 `ORCL 触发价格异动监控条件。当前最新可得价格 $171.83，相对昨收 $161.39 上涨 6.47%，已超过 5% 阈值。数据来源时间戳：北京时间 2026-05-03 05:20 前后（美股周五收盘后，当前市场已停盘）。同时期有 OpenAI 作为关键合作伙伴的积极表态新闻。`
+      - 约 29 分钟后，同一用户目标下的 `job_name=持仓重大事件心跳检测`
+      - `run_id=14333`，`executed_at=2026-05-03T07:00:40.355318+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把同一 `ORCL 收于 $171.83 / +6.47% / OpenAI 相关正面表态` 重新包装成 `【ORCL 持仓异动】+6.47% 触发监控阈值` 送达；两轮之间没有新的价格窗口、公告落地或独立公司级新催化，只是从单标的 job 切到聚合持仓 job 后再次重报同一事实。
+      - `data/runtime/logs/sidecar.log` 在 `2026-05-03 06:31:00.091-06:31:00.093` 记录 `ORCL 大事件监控` 的 `parse_kind=JsonTriggered -> deliver`，并在 `2026-05-03 07:00:37.757-07:00:37.758` 记录 `持仓重大事件心跳检测` 的 `parse_kind=JsonTriggered -> deliver`；同一窗口里 `07:00:14.994` 的 `ORCL 大事件监控` 又回落成 `parse_kind=JsonNoop`。
+      - 这组最新样本说明“同一目标下跨 job 重复提醒旧事实”的缺陷在最新一小时真实窗口再次活跃复现；它不阻断主功能链路，但持续制造提醒噪音，因此状态从 `Fixed` 回退为 `New`，严重等级维持 `P3`。
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 2026-05-01 21:00-21:02 最新巡检样本：
+      - `job_name=TEM大事件心跳监控`
+      - `run_id=12788`，`executed_at=2026-05-01T21:02:04.218459+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把 `5月5日财报`、`TIME 2026 健康与生命科学公司十强`、`USC 战略合作` 与同一轮 `+10.92%` 价格异动打包成 `【TEM大事件触发提醒】` 送达；这些持续性公司事件此前已在 `run_id=12174`（`08:02`）、`run_id=12618`（`17:31`）等窗口重复送达，期间没有新的独立公告、合作落地或财务更新。
+      - 同一批 heartbeat 在 `21:00:42` 的 `持仓重大事件心跳检测`、`21:00:57` 的 `RKLB异动监控` 已分别回落成 `noop + skipped_noop` 与 `parse_kind=JsonNoop`，说明这不是“整批行情普遍触发”，而是 TEM 单标的 heartbeat 再次把旧催化重新包装成当前提醒。
+      - `data/runtime/logs/sidecar.log` 在 `21:01:48.063-21:02:04.218` 同步记录 `parse_kind=JsonTriggered` 与成功 `deliver`，说明这不是台账重放，而是模型在 `21:00` 窗口再次把同一批旧事实判成当前触发。
+      - 这组最新样本说明重复提醒缺陷仍然活跃，并继续集中在 TEM 链路：中间已有多个窗口回到 `noop` 或 `Empty`，但旧催化仍会在数小时轮询里再次被包装成新提醒。它不阻断主功能链路，但持续制造提醒噪音，因此保持 `P3`。
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 2026-05-01 17:30-17:31 最新巡检样本：
+      - `job_name=TEM大事件心跳监控`
+      - `run_id=12618`，`executed_at=2026-05-01T17:31:01+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把 `4月28日 TIME 榜单`、`4月29日宣布 5月29 日 Investor Day` 与同一轮 `+10.92%` 价格异动重新打包成 `【TEM 价格异动触发提醒】` 送达；这些持续性公司事件此前已在 `run_id=12174`（`08:02`）送达，期间没有新的独立公告、合作落地或财务更新，而同一 job 在 `17:01:17` 还刚回落成 `parse_kind=Empty`
+      - `job_name=RKLB异动监控`
+      - `run_id=12616`，`executed_at=2026-05-01T17:30:47+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把 `4月29日 Rocket Lab 获批 1.9 亿美元国防合同` 包装成当前窗口的 `重大订单消息` 送达；同一合同此前已在 `4月30日 10:30/13:00/18:02` 与 `5月1日 15:02` 等多个窗口反复送达，本轮之间没有新的合同公告、金额更新或独立公司级新催化，而且同一 job 在 `17:02:04` 还刚回落成 `noop + skipped_noop`
+      - `data/runtime/logs/sidecar.log` 在 `17:30:44.956`、`17:30:59.593` 同步记录两条 job 的 `parse_kind=JsonTriggered` 与成功 `deliver`，说明这不是台账重放，而是模型在 `17:30` 窗口再次把同一批旧催化判成当前触发
+      - 这组最新样本说明重复提醒缺陷仍然活跃，并且已经同时覆盖 `TEM` 与 `RKLB`：两条单标的 heartbeat 都会在中间已出现 `noop` / `Empty` 的情况下，再把旧催化重新包装成新提醒。它不阻断主功能链路，但持续制造提醒噪音，因此保持 `P3`。
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 2026-05-01 08:00-08:02 最新巡检样本：
+      - `job_name=TEM大事件心跳监控`
+      - `run_id=12174`，`executed_at=2026-05-01T08:02:11+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把 `4月23日 USC 医学院合作`、`4月28日入选 TIME 2026 健康与生命科学公司`、`4月29日宣布 5月29 日 Investor Day` 与同一轮 `+10.92%` 价格异动打包成 `TEM重大事件心跳监控触发` 送达；这些持续性公司事件此前已在 `run_id=11826`（`01:00:53`）与 `run_id=11917`（`03:00:51`）送达，最近一轮 `run_id=12145`（`07:30:28`）刚回落成 `noop + skipped_noop`，期间没有新的独立公告、合作落地或财务更新。
+      - `data/runtime/logs/sidecar.log` 在 `08:02:08.730` 同步记录 `parse_kind=JsonTriggered` 与成功 `deliver`，说明这不是台账重放，而是模型在 `07:30` 刚跳过后，又在 `08:00` 窗口把同一批旧事件重新判成当前触发。
+      - 这组最新样本说明重复提醒缺陷仍然活跃，并且已经从 `01:00 -> 03:00` 继续延续到 `08:00` 窗口：同一 TEM 旧事件在中间没有新增独立催化的情况下，仍会在数小时轮询里反复重报。它不阻断主功能链路，但持续制造提醒噪音，因此保持 `P3`。
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 2026-05-01 03:00-03:01 最新巡检样本：
+      - `job_name=TEM大事件心跳监控`
+      - `run_id=11917`，`executed_at=2026-05-01T03:00:51.622954+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把 `5月5日财报`、`4月29日宣布 5月29日 Investor Day`、`4月28日入选 TIME 2026 健康与生命科学公司` 与同一轮 `+10.16%` 价格异动打包成 `【TEM 价格异动触发】` 送达；其中 Investor Day / TIME / 财报这些持续性公司事件此前已在 `run_id=11826`（`01:00:53`）送达，期间没有新的独立公告、合作落地或财务更新。
+      - `data/runtime/logs/sidecar.log` 在 `03:00:48.791-03:00:48.792` 同步记录 `parse_kind=JsonTriggered` 与成功 `deliver`，说明这不是台账重放，而是模型在新窗口再次把同一批旧事件判成当前触发。
+      - 这组最新样本说明重复提醒缺陷仍然活跃，并且已经从 `01:00` 延续到 `03:00` 窗口：同一 TEM 旧事件在无新增独立催化时仍被连续重报。它不阻断主功能链路，但持续制造提醒噪音，因此保持 `P3`。
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 2026-05-01 00:30-01:01 最新巡检样本：
+      - `job_name=TEM大事件心跳监控`
+      - `run_id=11826`，`executed_at=2026-05-01T01:00:53.541726+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把 `4月28日入选 TIME 2026 十大健康与生命科学公司`、`4月23日 USC 医学院合作`、`5月5日财报`、`5月29日 Investor Day` 与同一轮 `+9.12%` 价格异动打包成 `【TEM大事件监控触发】` 送达；其中 Investor Day 旧公告与这组持续性公司事件此前已在 `4月30日 23:31` 最近一轮提醒中出现，并没有新的独立公告、合作落地或财务更新。
+      - 同窗 `job_name=持仓重大事件心跳检测` 的 `run_id=11804` 虽然在 `00:31:08` 落成 `execution_failed + skipped_error`，但 `sidecar.log` 的 `raw_preview` 已明确写出 `最近一轮已提醒事件（4月30日23:31）包含：TEM于4月29日公告将于5月29日举办首次投资者日...这是同一个投资者日事件的后续价格走势，没有新的独立事件窗口或新的公告`。
+      - 这说明系统自己能够识别 TEM 当前窗口没有新增独立事件，但单标的 heartbeat 仍在同一小时窗口把同一批旧事件重新包装为 `triggered + sent`。它不阻断主功能链路，但持续制造提醒噪音，因此保持 `P3`。
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 2026-04-30 18:00-18:02 最新巡检样本：
+      - `job_name=RKLB异动监控`
+      - `run_id=11457`，`executed_at=2026-04-30T18:01:58.090530+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把 `Rocket Lab于4月29日宣布赢得1.9亿美元国防合同` 包装成 `【RKLB异动提醒】` 送达；同一合同此前已在 `run_id=11216`（`13:00`）与 `run_id=11386`（`16:30` 聚合 heartbeat）反复送达，本轮之间没有新的合同公告、金额更新或独立公司级新催化。
+      - 同窗 `job_name=持仓重大事件心跳检测` 的 `run_id=11455` 已落回 `noop + skipped_noop`，而 `sidecar.log` 在 `18:01:32.507-18:01:32.508` 的 `raw_preview` 还明确写出 `RKLB 4月29日公告1.9亿美元国防订单（上一轮16:30已推送）`，说明系统自己能够识别这条消息已在上一轮送达，但单标的 heartbeat 仍在 26 秒后把同一旧合同再次当作新触发送达。
+      - 这组最新样本说明重复提醒缺陷仍然活跃，并且已经从“跨 job 重复”继续扩散为“聚合 heartbeat 已承认上一轮推送过，单标的 heartbeat 仍在同一小时窗口再次重报同一旧合同”的形态。它不阻断主功能链路，但持续制造提醒噪音，因此保持 `P3`。
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 2026-04-30 16:30-17:01 最新巡检样本：
+      - `job_name=小米30港元破位预警`
+      - `run_id=11382`，`executed_at=2026-04-30T16:31:04.704739+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把同一 `小米最新价 29.02 港元，已跌破 30 港元` 条件包装成 `【小米股价破位预警 - 持续】` 送达；约 60 分钟前同一 job 的 `run_id=11335`（`2026-04-30T15:30:33+08:00`）已经把同一“持续跌破 30 港元”事实送达，而 `15:00` 与 `17:00` 两窗又只是 `noop`，中间并不存在新的独立阈值跨越。与此同时，同窗兄弟任务 `小米破位预警` 在 `16:31:04` 仍落成 `noop`，说明当前只是同一持续破位事实被再次送达，而不是新的增量事件。
+      - `job_name=持仓重大事件心跳检测`
+      - `run_id=11386`，`executed_at=2026-04-30T16:31:30.360353+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把 `RKLB 1.9 亿美元国防合同` 与 `TEM 首届投资者日` 汇总成“持仓重大事件”送达；其中 RKLB 合同此前已在 `run_id=11216`（`13:00`）和 `run_id=11287`（`14:30`）重复送达，同一 16:30 窗口并没有新的合同公告、金额更新或公司级新催化。
+      - 到 `17:01:22.507-17:01:22.508`，同一 job 在 `sidecar.log` 的 `raw_preview` 里已经显式写出 `RKLB 4月29日公告1.9亿美元国防订单（上一轮16:30已推送）`、`TEM 4月29日公告首届投资者日（5月29日）已推送`，说明模型自己也识别这些是已提醒旧事实；但系统仍在上一轮 `16:31` 把它们当作新触发送达，直到 `17:01` 才回落成 `PlainTextSuppressed -> skipped_error`。
+      - 这组最新样本说明重复提醒缺陷仍然活跃，并已扩散到“同一旧合同 / 旧公告在 13:00、14:30、16:30 连续多个窗口重复送达，随后内部摘要又承认它们已经推送过”的形态。它不阻断主功能链路，但持续制造提醒噪音，因此保持 `P3`。
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 2026-04-30 14:30-15:01 最新巡检样本：
+      - `job_name=持仓重大事件心跳检测`
+      - `run_id=11287`，`executed_at=2026-04-30T14:30:32.494623+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把 `Rocket Lab于4月29日获$1.9亿国防合同` 包装成 `【RKLB重大合同】` 送达；同一合同在 `run_id=11216`（`2026-04-30T13:00:31+08:00`）已由 `RKLB异动监控` 送达，期间没有新的合同公告、金额更新或额外公司级催化。
+      - 同一用户在更早的直聊会话里已经明确反馈 `所以这些老新闻不要重复发了 你昨天也发了好多次给我`；但仅约 90 分钟后，聚合 heartbeat 仍把同一旧合同重新包装成“重大事件”送达。
+      - `data/runtime/logs/sidecar.log` 在 `2026-04-30 14:30:28.881-14:30:28.882` 同步记录 `job_id=j_db12f27f` 的 `parse_kind=JsonTriggered` 与成功 `deliver`，说明这不是台账重放，而是模型在新窗口再次把同一旧事实判成触发提醒。
+      - 到 `15:00-15:01`，兄弟 heartbeat `RKLB异动监控` 与 `持仓重大事件心跳检测` 又分别落回 `noop + skipped_noop`，说明当前去重/增量判断仍在不同 job 与不同窗口间摇摆，而不是稳定继承“13:00 和 14:30 已提醒”的事实基线。
+      - 这组最新样本说明重复提醒缺陷仍然活跃，并且已经扩散到“用户明确投诉后，同一旧合同仍由不同 heartbeat job 在 90 分钟内再次送达”的形态。它不阻断主功能链路，但持续制造提醒噪音，因此保持 `P3`。
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 2026-04-30 10:30-13:00 最新巡检样本：
+      - `job_name=RKLB异动监控`
+      - `run_id=11094`，`executed_at=2026-04-30T10:30:52.241582+08:00`，已落成 `completed + sent + delivered=1`
+      - `response_preview` 把 `Rocket Lab 1.9 亿美元国防合同` 包装成 `重大订单利好` 送达；但这份合同不是当天新公告，而是同一用户随后在直聊里追问时间点的旧事件。
+      - 同一用户直聊会话 `Actor_feishu__direct__ou_5f64ee7ca7af22d44a83a31054e6fb92a3` 在 `12:17:02-12:29:11 CST` 连续出现两次直接反馈：先问 `这合同是什么时候的`，assistant 明确答复该合同是 `2026 年 3 月 18 日公布`；随后用户又明确要求 `所以这些老新闻不要重复发了 你昨天也发了好多次给我`，说明最近一小时真实用户已经把这条 heartbeat 识别为旧新闻重复提醒，而不是新催化。
+      - 仅约 2.5 小时后，同一 job `run_id=11216`，`executed_at=2026-04-30T13:00:31.251295+08:00`，再次落成 `completed + sent + delivered=1`
+      - `response_preview` 又把同一 `1.9 亿美元国防合同` 重新包装成 `RKLB触发重大订单提醒` 送达；两轮之间没有新的合同公告、金额变更或状态更新，只是把同一 3 月 18 日旧事实再次当作当前窗口增量事件发送。
+      - `data/runtime/logs/sidecar.log` 在 `2026-04-30 13:00:28.749-13:00:28.750` 同步记录 `job_id=j_1241aad0` 的 `parse_kind=JsonTriggered` 与成功 `deliver`；这说明已在 README 标成 `Fixed` 的“跨窗口重复提醒旧事件”链路已经真实回归，而且当前还叠加了用户直接投诉“昨天也发了好多次”。
+      - 这组最新样本说明重复提醒缺陷仍然活跃，并已扩散到“同一 RKLB 旧合同在相邻数小时窗口重复送达，且用户显式要求不要再发后仍继续触发”的形态。它不阻断主功能链路，但持续制造提醒噪音，因此状态从 `Fixed` 调回 `New`，继续按 `P3` 跟踪。
   - `data/sessions.sqlite3` -> `cron_job_runs`
     - 2026-04-29 06:30-07:02 最新巡检样本：
       - `job_name=小米30港元破位预警`
@@ -395,6 +579,7 @@
 
 ## 当前实现效果
 
+- 到 `2026-05-01 03:00` 的最新窗口，`TEM大事件心跳监控` 仍会在没有新增独立催化时，把同一组 Investor Day / TIME / 财报旧事件重新打包成 `completed + sent + delivered=1`；这说明当前去重仍无法稳定保存“该事实已提醒过”的事件级状态。
 - 到 `2026-04-23 04:31 -> 05:00` 最新窗口，`持仓重大事件心跳检测` 在连续多轮 `noop` 后又把 `01:30` 已送达的 ASTS/FCC/BlueBird 旧事件重新投递为 `completed + sent + delivered=1`；`05:00` 才再次依赖上一轮投递记忆转回 `noop`。这说明当前去重仍只围绕最近一次成功投递滚动，不能稳定保存“该事实已提醒过”的事件级状态。
 - 到 `2026-04-23 01:30` 最新窗口，新建的 `持仓重大事件心跳检测` 首轮仍把用户刚刚明确表示“太晚、已从富途知道”的 ASTS/FCC/BlueBird 旧信息投递为 `completed + sent + delivered=1`；`02:00` 才基于上一轮投递记忆转为 `noop`，说明新任务初始化时没有把当前会话里的“已知事件/不要重复普通新闻”作为去重基线。
 - 到 `2026-04-22 10:02` 最新窗口，`ASTS 重大异动心跳监控` 在 `07:01` 已送达同一 `BlueBird 7` 失败事件、随后多轮 `noop` 后，又把同一旧事件加上法律调查和盘后报价重新落成 `completed + sent + delivered=1`；这证明去重仍依赖模型临场判断，不能稳定记住“该事件已经提醒过”。
@@ -475,3 +660,10 @@
 
 - `crates/hone-scheduler/src/lib.rs` 将 heartbeat 去重基线从“同一个 job 的最近送达”扩展为“同一 actor 的最近 heartbeat 送达”，覆盖兄弟 job 在半小时轮询里重发同一催化的样本。
 - 验证：`cargo test -p hone-scheduler heartbeat_history_includes_actor_cross_job_deliveries -- --nocapture`。
+
+## 修复补充（2026-05-02）
+
+- `crates/hone-channels/src/scheduler.rs` 补强 `heartbeat_duplicate_preview_match` 的事实相似度判断：在原有 token overlap 外，新增日期、金额、英文实体与 CJK n-gram 事实 token，避免 `TEM` 的 `TIME / USC / 5月5日财报` 组合旧催化、`RKLB 4月29日 1.9 亿美元国防合同` 这类中英混写旧事件因换写法绕过去重。
+- 回归覆盖同一旧事件大幅改写后仍应 `duplicate_suppressed`，以及同 ticker 新独立事件不能被误拦。
+- 验证：`cargo test -p hone-channels heartbeat_duplicate_preview_match --lib -- --nocapture`、`cargo test -p hone-channels heartbeat_ --lib -- --nocapture`。
+- 关联 GitHub Issue：无（2026-05-02 检查 open issues 为 0）。

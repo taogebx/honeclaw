@@ -17,8 +17,9 @@ use crate::mcp_bridge::hone_mcp_servers;
 
 use super::acp_common::{
     ACP_NEEDS_SP_RESEED_KEY, ACP_PREV_PROMPT_PEAK_KEY, AcpEventLogContext, AcpPromptState,
-    AcpResponseTimeouts, AcpToolCallRecord, acp_prompt_succeeded, create_acp_session,
-    log_acp_payload, log_acp_prompt_stop_diagnostics, log_acp_raw_parse_error,
+    AcpResponseTimeouts, AcpToolCallRecord, acp_diagnostic_excerpt_for_log,
+    acp_error_detail_for_message, acp_prompt_succeeded, create_acp_session, log_acp_payload,
+    log_acp_prompt_stop_diagnostics, log_acp_raw_parse_error, message_with_bounded_stderr,
     set_acp_session_model, timeout_message_with_stderr, wait_for_response, write_jsonrpc_request,
 };
 use super::types::{
@@ -27,14 +28,15 @@ use super::types::{
 };
 
 const OPENCODE_ACP_SESSION_KEY: &str = "opencode_acp_session_id";
+const OPENCODE_LOG_DETAIL_CHARS: usize = 400;
 
-pub struct OpencodeAcpRunner {
+pub(crate) struct OpencodeAcpRunner {
     config: OpencodeAcpConfig,
     timeouts: RunnerTimeouts,
 }
 
 impl OpencodeAcpRunner {
-    pub fn new(config: OpencodeAcpConfig, timeouts: RunnerTimeouts) -> Self {
+    pub(crate) fn new(config: OpencodeAcpConfig, timeouts: RunnerTimeouts) -> Self {
         Self { config, timeouts }
     }
 }
@@ -93,7 +95,6 @@ impl AgentRunner for OpencodeAcpRunner {
 ///
 /// 用户可以按 OpenRouter 的标准写法配置模型（如 `google/gemini-3.1-pro-preview`），
 /// 本函数会自动补齐前缀。已经带 `openrouter/` 前缀的模型不会被重复添加。
-
 pub(crate) fn configured_opencode_model_id(config: &OpencodeAcpConfig) -> Option<String> {
     let model = config.model.trim();
     if model.is_empty() {
@@ -130,9 +131,9 @@ pub(crate) fn configured_opencode_model_id(config: &OpencodeAcpConfig) -> Option
 
     tracing::info!(
         "[AgentRunner/opencode] configured_model_id: input_model='{}', base_url='{}', final_model='{}'",
-        config.model,
-        config.api_base_url,
-        final_model
+        opencode_log_detail(&config.model),
+        opencode_log_detail(&config.api_base_url),
+        opencode_log_detail(&final_model)
     );
 
     Some(final_model)
@@ -182,19 +183,18 @@ fn current_exe_search_dirs() -> Vec<PathBuf> {
     };
 
     dirs.push(parent.to_path_buf());
-    if parent.file_name().and_then(|value| value.to_str()) == Some("deps") {
-        if let Some(grandparent) = parent.parent() {
-            dirs.push(grandparent.to_path_buf());
-        }
+    if parent.file_name().and_then(|value| value.to_str()) == Some("deps")
+        && let Some(grandparent) = parent.parent()
+    {
+        dirs.push(grandparent.to_path_buf());
     }
     if cfg!(target_os = "macos")
         && parent.file_name().and_then(|value| value.to_str()) == Some("MacOS")
+        && let Some(contents) = parent.parent()
     {
-        if let Some(contents) = parent.parent() {
-            let resources = contents.join("Resources");
-            dirs.push(resources.clone());
-            dirs.push(resources.join("binaries"));
-        }
+        let resources = contents.join("Resources");
+        dirs.push(resources.clone());
+        dirs.push(resources.join("binaries"));
     }
 
     dirs
@@ -407,18 +407,9 @@ async fn run_opencode_acp(
             .filter(|key| !key.trim().is_empty())
     };
 
-    // ── 日志：API key 注入状态 ──────────────────────────────────────────────────
-    let api_key_status = match injected_openrouter_api_key {
-        Some(key) => {
-            let preview = &key[..key.len().min(8)];
-            format!("injecting OPENROUTER_API_KEY={preview}…")
-        }
-        _ => {
-            "OPENROUTER_API_KEY not injected (will inherit local opencode auth/config)".to_string()
-        }
-    };
+    let api_key_status = opencode_api_key_log_status(injected_openrouter_api_key);
     let model_status = configured_opencode_model_id(config)
-        .map(|m| format!("model={m}"))
+        .map(|model| format!("model={}", opencode_log_detail(&model)))
         .unwrap_or_else(|| "model=<not set, using opencode default>".to_string());
     tracing::info!(
         "[AgentRunner/opencode] session={} {api_key_status} {model_status}",
@@ -426,7 +417,7 @@ async fn run_opencode_acp(
     );
 
     let resolved_command = resolve_opencode_command_path(config);
-    if resolved_command != PathBuf::from(&config.command) {
+    if resolved_command.as_path() != Path::new(&config.command) {
         tracing::info!(
             "[AgentRunner/opencode] session={} resolved command '{}' -> '{}'",
             request.session_id,
@@ -444,8 +435,9 @@ async fn run_opencode_acp(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    // 通过环境变量传递 OpenRouter API Key（opencode 的 provider.openrouter 配置不支持 apiKey 字段）
-    // 若 Hone 未显式注入，则继续使用用户本机 opencode 的 auth / provider 配置。
+    // opencode 的 provider.openrouter 配置不支持 apiKey 字段；Hone 只在用户把 key
+    // 写入 config.yaml 时把它桥接给子进程。若 Hone 未显式注入，则继续使用用户本机
+    // opencode 的 auth / provider 配置。
     if let Some(api_key) = injected_openrouter_api_key {
         command.env("OPENROUTER_API_KEY", api_key);
     }
@@ -465,13 +457,13 @@ async fn run_opencode_acp(
     })?;
     let stderr = child.stderr.take();
 
-    let stderr_buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let stderr_buffer = Arc::new(tokio::sync::Mutex::new(String::new()));
     let stderr_task = stderr.map(|stderr| {
-        let stderr_buf = stderr_buf.clone();
+        let stderr_buffer = stderr_buffer.clone();
         tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let mut guard = stderr_buf.lock().await;
+                let mut guard = stderr_buffer.lock().await;
                 if !guard.is_empty() {
                     guard.push('\n');
                 }
@@ -503,7 +495,7 @@ async fn run_opencode_acp(
             next_id,
             None,
             None,
-            Some(stderr_buf.clone()),
+            Some(stderr_buffer.clone()),
             Some(&acp_log),
         ),
     )
@@ -530,7 +522,7 @@ async fn run_opencode_acp(
         &request.working_directory,
         mcp_servers.clone(),
         startup_timeout,
-        stderr_buf.clone(),
+        stderr_buffer.clone(),
         Some(&acp_log),
     )
     .await?;
@@ -547,8 +539,9 @@ async fn run_opencode_acp(
 
     if let Some(model_id) = configured_opencode_model_id(config) {
         tracing::info!(
-            "[AgentRunner/opencode] session={} setting model to {model_id}",
+            "[AgentRunner/opencode] session={} setting model to {}",
             request.session_id,
+            opencode_log_detail(&model_id),
         );
         set_acp_session_model(
             "opencode",
@@ -558,7 +551,7 @@ async fn run_opencode_acp(
             &opencode_session_id,
             &model_id,
             model_timeout,
-            stderr_buf.clone(),
+            stderr_buffer.clone(),
             Some(&acp_log),
         )
         .await?;
@@ -605,7 +598,7 @@ async fn run_opencode_acp(
         next_id,
         emitter.clone(),
         &mut opencode_state,
-        stderr_buf.clone(),
+        stderr_buffer.clone(),
         AcpResponseTimeouts {
             idle: prompt_idle_timeout,
             overall: prompt_overall_timeout,
@@ -626,7 +619,7 @@ async fn run_opencode_acp(
             stop_reason,
             &prompt_result,
             &opencode_state,
-            &stderr_buf,
+            &stderr_buffer,
         )
         .await;
     }
@@ -665,20 +658,16 @@ async fn run_opencode_acp(
 
     // 若回复为空且运行"成功"，打印 stderr 帮助诊断（鉴权失败、模型未找到等）
     if reply_chars == 0 {
-        let stderr_captured = stderr_buf.lock().await.clone();
-        if stderr_captured.trim().is_empty() {
-            tracing::warn!(
-                "[AgentRunner/opencode] session={} empty reply (stop_reason={stop_reason}), no stderr captured. \
-                 Possible causes: API key not set, model not found, or ACP protocol mismatch.",
-                request.session_id,
-            );
-        } else {
-            tracing::warn!(
+        let warning = message_with_bounded_stderr(
+            &format!(
                 "[AgentRunner/opencode] session={} empty reply (stop_reason={stop_reason}). \
-                 opencode stderr:\n{stderr_captured}",
-                request.session_id,
-            );
-        }
+                 Possible causes: API key not set, model not found, or ACP protocol mismatch.",
+                request.session_id
+            ),
+            &stderr_buffer,
+        )
+        .await;
+        tracing::warn!("{warning}");
     }
 
     Ok((
@@ -847,21 +836,27 @@ fn relativize_opencode_path(path: &str) -> String {
 }
 
 fn truncate_opencode_detail(text: &str, max_chars: usize) -> String {
-    let trimmed = text.trim();
-    let total = trimmed.chars().count();
-    if total <= max_chars {
-        return trimmed.to_string();
+    acp_diagnostic_excerpt_for_log(text, max_chars)
+}
+
+pub(crate) fn opencode_api_key_log_status(
+    injected_openrouter_api_key: Option<&str>,
+) -> &'static str {
+    match injected_openrouter_api_key {
+        Some(key) if !key.trim().is_empty() => "OPENROUTER_API_KEY injected from Hone config",
+        _ => "OPENROUTER_API_KEY not injected (will inherit local opencode auth/config)",
     }
-    let keep = max_chars.saturating_sub(1);
-    let prefix = trimmed.chars().take(keep).collect::<String>();
-    format!("{prefix}…")
+}
+
+fn opencode_log_detail(text: &str) -> String {
+    acp_diagnostic_excerpt_for_log(text, OPENCODE_LOG_DETAIL_CHARS)
 }
 
 fn opencode_tool_name_for_update(state: &AcpPromptState, update: &Value) -> String {
-    if let Some(call_id) = tool_call_id(update) {
-        if let Some(existing) = state.pending_tool_calls.get(call_id) {
-            return existing.name.clone();
-        }
+    if let Some(call_id) = tool_call_id(update)
+        && let Some(existing) = state.pending_tool_calls.get(call_id)
+    {
+        return existing.name.clone();
     }
     opencode_tool_name_from_start(update)
 }
@@ -1108,7 +1103,7 @@ async fn handle_opencode_tool_call_update(
         emitter
             .emit(AgentRunnerEvent::Progress {
                 stage: "opencode.tool_failed",
-                detail: Some(format!("tool={tool_name}")),
+                detail: Some(format!("tool={}", opencode_log_detail(&tool_name))),
             })
             .await;
     }
@@ -1180,7 +1175,7 @@ async fn wait_for_opencode_response_with_timeouts(
     expected_id: u64,
     emitter: Arc<dyn AgentRunnerEmitter>,
     state: &mut AcpPromptState,
-    stderr_buf: Arc<tokio::sync::Mutex<String>>,
+    stderr_buffer: Arc<tokio::sync::Mutex<String>>,
     timeouts: AcpResponseTimeouts,
     log_ctx: &AcpEventLogContext,
 ) -> Result<Value, AgentSessionError> {
@@ -1190,10 +1185,10 @@ async fn wait_for_opencode_response_with_timeouts(
     loop {
         let now = tokio::time::Instant::now();
         if now >= overall_deadline {
-            return Err(opencode_timeout_error("overall", timeouts.overall, &stderr_buf).await);
+            return Err(opencode_timeout_error("overall", timeouts.overall, &stderr_buffer).await);
         }
         if now >= idle_deadline {
-            return Err(opencode_timeout_error("idle", timeouts.idle, &stderr_buf).await);
+            return Err(opencode_timeout_error("idle", timeouts.idle, &stderr_buffer).await);
         }
 
         let deadline = std::cmp::min(idle_deadline, overall_deadline);
@@ -1218,7 +1213,7 @@ async fn wait_for_opencode_response_with_timeouts(
                 } else {
                     ("idle", timeouts.idle)
                 };
-                return Err(opencode_timeout_error(phase, duration, &stderr_buf).await);
+                return Err(opencode_timeout_error(phase, duration, &stderr_buffer).await);
             }
         };
 
@@ -1230,7 +1225,7 @@ async fn wait_for_opencode_response_with_timeouts(
             &line,
             &emitter,
             state,
-            &stderr_buf,
+            &stderr_buffer,
             log_ctx,
         )
         .await?
@@ -1246,7 +1241,7 @@ async fn process_opencode_payload(
     line: &str,
     emitter: &Arc<dyn AgentRunnerEmitter>,
     state: &mut AcpPromptState,
-    stderr_buf: &Arc<tokio::sync::Mutex<String>>,
+    stderr_buffer: &Arc<tokio::sync::Mutex<String>>,
     log_ctx: &AcpEventLogContext,
 ) -> Result<Option<Value>, AgentSessionError> {
     let payload: Value = match serde_json::from_str(line) {
@@ -1263,41 +1258,44 @@ async fn process_opencode_payload(
     log_acp_payload(Some(log_ctx), "recv", &payload).await;
 
     if payload.get("id").and_then(|value| value.as_u64()) == Some(expected_id) {
-        if let Some(error) = payload.get("error") {
-            let message = error
-                .get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown acp error")
-                .to_string();
-            let stderr = stderr_buf.lock().await.clone();
-            let stderr = if stderr.trim().is_empty() {
-                String::new()
-            } else {
-                format!(" stderr={stderr}")
-            };
-            return Err(AgentSessionError {
-                kind: AgentSessionErrorKind::AgentFailed,
-                message: format!("opencode acp request failed: {message}{stderr}"),
-            });
-        }
-        return Ok(Some(payload.get("result").cloned().unwrap_or(Value::Null)));
+        let Some(error) = payload.get("error") else {
+            return Ok(Some(payload.get("result").cloned().unwrap_or(Value::Null)));
+        };
+        let message = error
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown acp error")
+            .to_string();
+        let message = message_with_bounded_stderr(
+            &format!(
+                "opencode acp request failed: {}",
+                acp_error_detail_for_message(&message)
+            ),
+            stderr_buffer,
+        )
+        .await;
+        return Err(AgentSessionError {
+            kind: AgentSessionErrorKind::AgentFailed,
+            message,
+        });
     }
 
-    if let Some(method) = payload.get("method").and_then(|value| value.as_str()) {
-        match method {
-            "session/update" => {
-                handle_opencode_session_update(
-                    payload.get("params").unwrap_or(&Value::Null),
-                    emitter,
-                    state,
-                )
-                .await;
-            }
-            "session/request_permission" => {
-                handle_opencode_permission_request(stdin, &payload, emitter, log_ctx).await?;
-            }
-            _ => {}
+    let Some(method) = payload.get("method").and_then(|value| value.as_str()) else {
+        return Ok(None);
+    };
+    match method {
+        "session/update" => {
+            handle_opencode_session_update(
+                payload.get("params").unwrap_or(&Value::Null),
+                emitter,
+                state,
+            )
+            .await;
         }
+        "session/request_permission" => {
+            handle_opencode_permission_request(stdin, &payload, emitter, log_ctx).await?;
+        }
+        _ => {}
     }
 
     Ok(None)
@@ -1306,13 +1304,13 @@ async fn process_opencode_payload(
 async fn opencode_timeout_error(
     phase: &'static str,
     duration: std::time::Duration,
-    stderr_buf: &Arc<tokio::sync::Mutex<String>>,
+    stderr_buffer: &Arc<tokio::sync::Mutex<String>>,
 ) -> AgentSessionError {
     let base = format!(
         "opencode acp session/prompt {phase} timeout ({}s)",
         duration.as_secs()
     );
-    let message = timeout_message_with_stderr(&base, stderr_buf).await;
+    let message = timeout_message_with_stderr(&base, stderr_buffer).await;
     let kind = if phase == "idle" {
         AgentSessionErrorKind::TimeoutPerLine
     } else {
@@ -1342,7 +1340,10 @@ async fn handle_opencode_permission_request(
     emitter
         .emit(AgentRunnerEvent::Progress {
             stage: "acp.permission",
-            detail: Some(format!("opencode:rejected:{tool_title}")),
+            detail: Some(format!(
+                "opencode:rejected:{}",
+                opencode_log_detail(&tool_title)
+            )),
         })
         .await;
 

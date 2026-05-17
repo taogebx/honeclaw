@@ -1,17 +1,17 @@
 <p align="center">
-  <img src="./resources/logo.svg" alt="Hone honepage - Your Financial Assistant" width="30%">
+  <img src="./resources/logo.svg" alt="Hone homepage - Your Financial Assistant" width="30%">
 </p>
 
 <p align="center">
   <strong> Hone 磨刀石 </strong><br>
   <strong>“并非迎合你的聊天玩具，而是你投资纪律的无情捍卫者。”</strong><br>
-  HoneClaw 致力于成为懂你的、专业的开源投研基础设施。<br><br>
+  Honeclaw 致力于成为懂你的、专业的开源投研基础设施。<br><br>
   <strong>为什么取名 Hone：</strong><br>
   Hone 的意思，是磨刀、打磨锋刃。真正严肃的投资，本质上就是这样一个过程：不是追逐每一条新闻，不是对每一次涨跌做情绪化反应，而是在研究、比较、复盘和长期纪律中，不断磨砺自己的判断力。
 </p>
 
 <p align="center">
-  <strong>简体中文</strong> | <a href="./README.md">English</a> | <strong>官网：</strong><a href="https://hone-claw.com" target="_blank">hone-claw.com</a> | <strong>💬 社群:</strong> <a href="https://discord.gg/TyDNfYXDGF" target="_blank">Discord</a>
+  <strong>简体中文</strong> | <a href="./README.md">English</a> | <strong>官网：</strong><a href="https://hone-claw.com" target="_blank">hone-claw.com</a> | <strong>💬 社群：</strong> <a href="https://discord.gg/TyDNfYXDGF" target="_blank">Discord</a>
 </p>
 
 ---
@@ -20,7 +20,7 @@
 
 Honeclaw（或称 Hone）是一个使用 **Rust** 编写的开源个人投研辅助助手。与市面上习惯于附和用户的“闲聊机器人”不同，Honeclaw 被设计为一个**具备冷静思考能力、客观且克制的投研大脑**。
 
-它通过多端渠道（Web 桌面、飞书、Discord、Telegram、iMessages）无缝接入你的日常工作流，帮助你跟踪持仓公司动态、执行严格的投资纪律、运行自动化监控任务，并在你面对波动产生情绪化交易冲动时，提供理性的数据与逻辑对抗。
+它通过多端渠道（Web 控制台、桌面端、飞书、Discord、Telegram、iMessage）无缝接入你的日常工作流，帮助你跟踪持仓公司动态、执行严格的投资纪律、运行自动化监控任务，并在你面对波动产生情绪化交易冲动时，提供理性的数据与逻辑对抗。
 
 用户端官网已上线：**[hone-claw.com](https://hone-claw.com)**。官网从普通用户视角介绍 Hone 是什么、公开聊天如何使用、持仓监控与定时任务如何嵌入日常投研，以及产品路线图、GitHub、Bilibili 和 YouTube 演示入口。
 
@@ -36,7 +36,7 @@ Honeclaw（或称 Hone）是一个使用 **Rust** 编写的开源个人投研辅
 
 - 🧠 **绝对理性的投研内核**：不附和、不盲从。在你做出投资决策时，它会基于数据和预设纪律进行交叉验证，指出你的逻辑漏洞。
 - 📱 **全平台无缝接入**：支持 Web 控制台、iMessage、飞书 (Lark)、Telegram、Discord，随时随地与你的投资大脑进行对话。
-- 🗂️ **公司画像与长期记忆**：Hone 可以把公司主画像与关键事件时间线持续沉淀为 Markdown 档案，长期保留 thesis、核心经营指标、风险台账与重大变化。
+- 🗂️ **公司画像与长期记忆**：Hone 可以把公司主画像与关键事件时间线持续沉淀为 Markdown 档案，长期保留投资主线、核心经营指标、风险台账与重大变化。
 - 📊 **持仓监控与纪律执行**：设定你的止盈止损线、加仓逻辑与核心关注指标，Hone 会像冷酷的守望者一样帮你盯盘并主动提醒。
 - ⏰ **强大的定时任务 (Cron)**：支持复杂的定时监控任务，例如盘前摘要、盘后总结、特定财报发布后的自动分析等。
 - ⚡ **Rust 驱动的极致性能**：底层完全使用 Rust 构建，确保毫秒级响应速度，同时保持极低的内存占用和极高的稳定性。
@@ -76,28 +76,31 @@ Honeclaw（或称 Hone）是一个使用 **Rust** 编写的开源个人投研辅
 
 ### 技术栈
 
-- **系统主体**：Rust (Tokio, Axum, SSE)
+- **系统主体**：Rust（Tokio, Axum, SSE）
 - **后端**：Rust
-- **客户端**（桌面端）：Rust (Tauri)
-- **前端**：TypeScript (SolidJS + Tailwind v4)
+- **客户端**（桌面端）：Rust（Tauri）
+- **前端**：TypeScript（SolidJS + Tailwind v4）
 
 ### 支持渠道
 
-- **Web Console**: 现代化的浏览器交互界面。
-- **Mac App**: 原生 macOS 桌面体验。
-- **IM 集成**: 飞书 (Feishu / Lark)、Discord、Telegram、iMessage。
+- **Web Console**：现代化的浏览器交互界面。
+- **Mac App**：原生 macOS 桌面体验。
+- **IM 集成**：飞书（Feishu / Lark）、Discord、Telegram、iMessage。
 
 ## 安装与启动
 
 完整启动矩阵、目录说明、端口、配置和排障请看 [Hone Wiki](./docs/wiki.md)。
 
-### 方案 A：通过 `curl | bash` 安装 (macOS/Linux)
+### 方案 A：通过 `curl | bash` 安装（macOS/Linux）
 
 ```shell
 curl -fsSL https://raw.githubusercontent.com/B-M-Capital-Research/honeclaw/main/scripts/install_hone_cli.sh | bash
 hone-cli doctor
 hone-cli onboard
 hone-cli start
+# 另开一个终端，打开或启动内置 Web 界面：
+hone-cli web admin-ui
+hone-cli web user-ui
 ```
 
 ### 方案 B：通过 Homebrew 安装
@@ -107,6 +110,9 @@ brew install B-M-Capital-Research/honeclaw/honeclaw
 hone-cli doctor
 hone-cli onboard
 hone-cli start
+# 另开一个终端，打开或启动内置 Web 界面：
+hone-cli web admin-ui
+hone-cli web user-ui
 ```
 
 ### 方案 C：源码开发模式
@@ -114,9 +120,13 @@ hone-cli start
 ```shell
 git clone https://github.com/B-M-Capital-Research/honeclaw.git
 cd honeclaw
-chmod +x launch.sh
-./launch.sh --desktop
+cargo run -p hone-cli -- start --build
+# 另开终端：
+cargo run -p hone-cli -- web admin-ui --dev
+cargo run -p hone-cli -- web user-ui --dev
 ```
+
+源码检出使用本地 CLI 构建启动路径；Homebrew / release 安装用户使用安装好的 `hone-cli start`。
 
 ---
 

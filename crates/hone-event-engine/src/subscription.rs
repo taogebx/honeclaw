@@ -1,6 +1,6 @@
 //! 订阅层 — 事件到 actor 的映射。
 //!
-//! MVP 提供两类订阅：
+//! 当前提供两类订阅：
 //! - `PortfolioSubscription`：一个 actor 一个实例，命中条件 =
 //!   `event.symbols` 与该 actor 的 holdings 有交集。
 //! - `GlobalSubscription`：覆盖所有传入 actor，用于宏观事件等全员播报场景。
@@ -162,7 +162,7 @@ impl SubscriptionRegistry {
             }
         }
         let mut out: Vec<ActorIdentity> = dedup.into_values().collect();
-        out.sort_by(|a, b| actor_storage_key(a).cmp(&actor_storage_key(b)));
+        out.sort_by_key(actor_storage_key);
         out
     }
 

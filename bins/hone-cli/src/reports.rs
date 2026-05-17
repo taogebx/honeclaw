@@ -17,9 +17,14 @@ use crate::common::{load_cli_config, resolve_runtime_paths};
 use crate::discord_token::discord_token_doctor_check;
 use crate::{non_empty, start};
 
+const MAX_BINARY_CHECK_DETAIL_CHARS: usize = 300;
+
 #[derive(Debug, Serialize)]
 pub(crate) struct ModelStatusReport {
     pub runner: String,
+    pub hone_cloud_base_url: String,
+    pub hone_cloud_model: String,
+    pub hone_cloud_api_key_configured: bool,
     pub codex_model: String,
     pub codex_acp_model: String,
     pub codex_acp_variant: String,
@@ -72,6 +77,7 @@ pub(crate) struct StatusReport {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ApiKeySummary {
+    pub hone_cloud: bool,
     pub openrouter: bool,
     pub primary_route: bool,
     pub auxiliary: bool,
@@ -102,13 +108,7 @@ pub(crate) fn binary_check(name: &str, help_arg: &str) -> BinaryStatus {
         Ok(result) => {
             let stdout = String::from_utf8_lossy(&result.stdout).trim().to_string();
             let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
-            let detail = if !stdout.is_empty() {
-                stdout
-            } else if !stderr.is_empty() {
-                stderr
-            } else {
-                "命令可执行".to_string()
-            };
+            let detail = command_output_detail(&stdout, &stderr);
             BinaryStatus {
                 name: name.to_string(),
                 available: true,
@@ -121,6 +121,28 @@ pub(crate) fn binary_check(name: &str, help_arg: &str) -> BinaryStatus {
             detail: error.to_string(),
         },
     }
+}
+
+fn command_output_detail(stdout: &str, stderr: &str) -> String {
+    let detail = if !stdout.is_empty() {
+        stdout
+    } else if !stderr.is_empty() {
+        stderr
+    } else {
+        return "命令可执行".to_string();
+    };
+    truncate_binary_check_detail(detail)
+}
+
+fn truncate_binary_check_detail(detail: &str) -> String {
+    if detail.chars().count() <= MAX_BINARY_CHECK_DETAIL_CHARS {
+        return detail.to_string();
+    }
+    detail
+        .chars()
+        .take(MAX_BINARY_CHECK_DETAIL_CHARS)
+        .collect::<String>()
+        + "..."
 }
 
 /// 查 hone 自己发布的 sidecar 二进制(hone-console-page / hone-mcp / 各 channel bin)
@@ -156,6 +178,9 @@ pub(crate) fn build_model_status(config: &hone_core::HoneConfig) -> ModelStatusR
         && !non_empty(&config.agent.opencode.api_key);
     ModelStatusReport {
         runner: config.agent.runner.clone(),
+        hone_cloud_base_url: config.agent.hone_cloud.base_url.clone(),
+        hone_cloud_model: config.agent.hone_cloud.model.clone(),
+        hone_cloud_api_key_configured: non_empty(&config.agent.hone_cloud.api_key),
         codex_model: config.agent.codex_model.clone(),
         codex_acp_model: config.agent.codex_acp.model.clone(),
         codex_acp_variant: config.agent.codex_acp.variant.clone(),
@@ -166,7 +191,7 @@ pub(crate) fn build_model_status(config: &hone_core::HoneConfig) -> ModelStatusR
         opencode_inherits_local_config,
         auxiliary_base_url: config.llm.auxiliary.base_url.clone(),
         auxiliary_model: config.llm.auxiliary.model.clone(),
-        auxiliary_api_key_configured: !config.llm.auxiliary.resolved_api_key().is_empty(),
+        auxiliary_api_key_configured: non_empty(&config.llm.auxiliary.api_key),
         search_base_url: config.agent.multi_agent.search.base_url.clone(),
         search_model: config.agent.multi_agent.search.model.clone(),
         search_api_key_configured: non_empty(&config.agent.multi_agent.search.api_key),
@@ -197,51 +222,63 @@ pub(crate) fn build_channel_reports(config: &hone_core::HoneConfig) -> Vec<Chann
             auth_configured: non_empty(&config.feishu.app_id)
                 && non_empty(&config.feishu.app_secret),
             chat_scope: Some(chat_scope_label(config.feishu.chat_scope)),
-            details: vec![format!(
-                "app_id={}",
-                if non_empty(&config.feishu.app_id) {
-                    "<set>"
-                } else {
-                    "<empty>"
-                }
-            )],
+            details: vec![
+                format!(
+                    "app_id={}",
+                    if non_empty(&config.feishu.app_id) {
+                        "<set>"
+                    } else {
+                        "<empty>"
+                    }
+                ),
+                format!("allow_emails={}", config.feishu.allow_emails.len()),
+                format!("allow_mobiles={}", config.feishu.allow_mobiles.len()),
+                format!("allow_open_ids={}", config.feishu.allow_open_ids.len()),
+            ],
         },
         ChannelStatusReport {
             channel: "telegram".to_string(),
             enabled: config.telegram.enabled,
             auth_configured: non_empty(&config.telegram.bot_token),
             chat_scope: Some(chat_scope_label(config.telegram.chat_scope)),
-            details: vec![format!(
-                "bot_token={}",
-                if non_empty(&config.telegram.bot_token) {
-                    "<set>"
-                } else {
-                    "<empty>"
-                }
-            )],
+            details: vec![
+                format!(
+                    "bot_token={}",
+                    if non_empty(&config.telegram.bot_token) {
+                        "<set>"
+                    } else {
+                        "<empty>"
+                    }
+                ),
+                format!("allow_from={}", config.telegram.allow_from.len()),
+            ],
         },
         ChannelStatusReport {
             channel: "discord".to_string(),
             enabled: config.discord.enabled,
             auth_configured: non_empty(&config.discord.bot_token),
             chat_scope: Some(chat_scope_label(config.discord.chat_scope)),
-            details: vec![format!(
-                "bot_token={}",
-                if non_empty(&config.discord.bot_token) {
-                    "<set>"
-                } else {
-                    "<empty>"
-                }
-            )],
+            details: vec![
+                format!(
+                    "bot_token={}",
+                    if non_empty(&config.discord.bot_token) {
+                        "<set>"
+                    } else {
+                        "<empty>"
+                    }
+                ),
+                format!("allow_from={}", config.discord.allow_from.len()),
+            ],
         },
     ]
 }
 
 pub(crate) fn build_api_key_summary(config: &hone_core::HoneConfig) -> ApiKeySummary {
     ApiKeySummary {
-        openrouter: !config.llm.openrouter.effective_key_pool().is_empty(),
+        hone_cloud: non_empty(&config.agent.hone_cloud.api_key),
+        openrouter: !config.llm.openrouter_key_pool().is_empty(),
         primary_route: non_empty(&config.agent.opencode.api_key),
-        auxiliary: !config.llm.auxiliary.resolved_api_key().is_empty(),
+        auxiliary: non_empty(&config.llm.auxiliary.api_key),
         multi_agent_search: non_empty(&config.agent.multi_agent.search.api_key),
         multi_agent_answer: non_empty(&config.agent.multi_agent.answer.api_key),
         fmp: !config.fmp.effective_key_pool().is_empty(),
@@ -253,8 +290,45 @@ pub(crate) fn build_api_key_summary(config: &hone_core::HoneConfig) -> ApiKeySum
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_summary_reports_hone_cloud_key() {
+        let mut config = hone_core::HoneConfig::default();
+        assert!(!build_api_key_summary(&config).hone_cloud);
+
+        config.agent.hone_cloud.api_key = "hc-test".to_string();
+        assert!(build_api_key_summary(&config).hone_cloud);
+    }
+
+    #[test]
+    fn model_status_reports_hone_cloud_route() {
+        let mut config = hone_core::HoneConfig::default();
+        config.agent.runner = "hone_cloud".to_string();
+        config.agent.hone_cloud.api_key = "hc-test".to_string();
+
+        let report = build_model_status(&config);
+        assert_eq!(report.runner, "hone_cloud");
+        assert_eq!(report.hone_cloud_base_url, "https://hone-claw.com");
+        assert_eq!(report.hone_cloud_model, "hone-cloud");
+        assert!(report.hone_cloud_api_key_configured);
+    }
+
+    #[test]
+    fn command_output_detail_is_bounded() {
+        let detail = command_output_detail(&"x".repeat(MAX_BINARY_CHECK_DETAIL_CHARS + 10), "");
+        assert_eq!(
+            detail,
+            format!("{}...", "x".repeat(MAX_BINARY_CHECK_DETAIL_CHARS))
+        );
+    }
+}
+
 /// 根据 `agent.runner` 的配置值,查对应 CLI 二进制的 probe 指令。
-/// 本地 runner(function_calling / multi_agent) 不挂外部 CLI,返回 `None`。
+/// `function_calling` 与 `hone_cloud` 不挂本机 CLI,返回 `None`;
+/// `multi-agent` 的 answer 阶段复用 opencode ACP,因此返回 opencode 探针。
 pub(crate) fn runner_binary_name(runner: &str) -> Option<(&'static str, &'static str)> {
     hone_core::config::AgentRunnerKind::from_config_value(runner)
         .cli_probe()
@@ -317,7 +391,10 @@ pub(crate) async fn build_doctor_report(config_path: Option<&Path>) -> DoctorRep
                         detail: "配置解析成功".to_string(),
                     });
                     if non_empty(&config.discord.bot_token) {
-                        checks.push(discord_token_doctor_check(&config.discord.bot_token));
+                        checks.push(discord_token_doctor_check(
+                            crate::i18n::Lang::from_locale(config.language),
+                            &config.discord.bot_token,
+                        ));
                     }
                     if let Some(parent) = loaded_paths.canonical_config_path.parent() {
                         let readonly = std::fs::metadata(parent)

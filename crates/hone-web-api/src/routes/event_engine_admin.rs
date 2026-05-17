@@ -71,14 +71,6 @@ fn validate_global_digest(cfg: &GlobalDigestConfig) -> Result<(), Response> {
             ),
         ));
     }
-    for s in &cfg.schedules {
-        if chrono::NaiveTime::parse_from_str(s, "%H:%M").is_err() {
-            return Err(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("global_digest.schedules 含非法时刻 {s:?},必须是 HH:MM (24h)"),
-            ));
-        }
-    }
     if cfg.final_pick_n == 0 {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
@@ -100,16 +92,25 @@ fn validate_global_digest(cfg: &GlobalDigestConfig) -> Result<(), Response> {
             "global_digest.lookback_hours 必须 > 0",
         ));
     }
-    if cfg.pass1_model.trim().is_empty() || cfg.pass2_model.trim().is_empty() {
+    if cfg.pass1_model.trim().is_empty() && cfg.pass1_llm.trim().is_empty() {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
-            "global_digest.pass1_model / pass2_model 不能为空",
+            "global_digest.pass1_model 或 pass1_llm 不能为空",
         ));
     }
-    if cfg.event_dedupe_enabled && cfg.event_dedupe_model.trim().is_empty() {
+    if cfg.pass2_model.trim().is_empty() && cfg.pass2_llm.trim().is_empty() {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
-            "global_digest.event_dedupe_enabled=true 时 event_dedupe_model 不能为空",
+            "global_digest.pass2_model 或 pass2_llm 不能为空",
+        ));
+    }
+    if cfg.event_dedupe_enabled
+        && cfg.event_dedupe_model.trim().is_empty()
+        && cfg.event_dedupe_llm.trim().is_empty()
+    {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "global_digest.event_dedupe_enabled=true 时 event_dedupe_model 或 event_dedupe_llm 不能为空",
         ));
     }
     Ok(())
@@ -337,13 +338,13 @@ pub(crate) async fn handle_update_rss_feed(
     }
 }
 
-// ─────────────────────────── thesis context (admin view) ──────────
+// ─────────────────────────── 投资主线 context (admin view) ──────────
 
-/// GET /api/event-engine/thesis-context?channel=&user_id=&channel_scope=
+/// GET /api/event-engine/mainline-context?channel=&user_id=&channel_scope=
 ///
-/// 管理端查看任意 actor 的蒸馏 thesis 与画像 inventory。和 public 端
+/// 管理端查看任意 actor 的蒸馏投资主线与画像 inventory。和 public 端
 /// `/api/public/digest-context` 内容一致,但 actor 由 query 指定而非 session。
-pub(crate) async fn handle_get_thesis_context(
+pub(crate) async fn handle_get_mainline_context(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<UserIdQuery>,
 ) -> Response {
@@ -383,12 +384,10 @@ pub(crate) async fn handle_get_thesis_context(
             "user_id": actor.user_id,
             "channel_scope": actor.channel_scope,
         },
-        "investment_global_style": prefs.investment_global_style,
-        "investment_theses": prefs.investment_theses.clone().unwrap_or_default(),
-        "global_digest_enabled": prefs.global_digest_enabled,
-        "global_digest_floor_macro_picks": prefs.global_digest_floor_macro_picks,
-        "last_thesis_distilled_at": prefs.last_thesis_distilled_at,
-        "thesis_distill_skipped": prefs.thesis_distill_skipped,
+        "mainline_style": prefs.mainline_style,
+        "mainline_by_ticker": prefs.mainline_by_ticker.clone().unwrap_or_default(),
+        "last_mainline_distilled_at": prefs.last_mainline_distilled_at,
+        "mainline_distill_skipped": prefs.mainline_distill_skipped,
         "holdings": holdings,
         "profile_list": profile_summaries,
     }))
@@ -399,7 +398,7 @@ pub(crate) async fn handle_get_thesis_context(
 ///
 /// 管理端查看任意 actor 任意 ticker 的完整画像 markdown。read-only。
 pub(crate) async fn handle_get_actor_company_profile(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<AdminProfileQuery>,
 ) -> Response {
     let actor = match require_actor(
@@ -414,7 +413,6 @@ pub(crate) async fn handle_get_actor_company_profile(
     if target.is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "ticker 不能为空");
     }
-    let _ = &state; // silence unused
     let sandbox_base = hone_channels::sandbox_base_dir();
     let sandbox_root = hone_event_engine::global_digest::actor_sandbox_dir(&sandbox_base, &actor);
     let profiles = hone_event_engine::global_digest::scan_profiles(&sandbox_root, None);
@@ -491,13 +489,13 @@ fn list_profile_summaries_admin(sandbox_root: &PathBuf) -> Vec<serde_json::Value
     out
 }
 
-// ─────────────────────────── thesis distill manual ─────────────────
+// ─────────────────────────── 投资主线手动蒸馏 ─────────────────────
 
-/// POST /api/event-engine/thesis-distill?channel=&user_id=&channel_scope=
+/// POST /api/event-engine/mainline-distill?channel=&user_id=&channel_scope=
 ///
-/// 立即对指定 actor 跑一次 thesis 蒸馏 —— admin 调试 / 用户主动刷新用。
+/// 立即对指定 actor 跑一次投资主线蒸馏 —— admin 调试 / 用户主动刷新用。
 /// 平时由 web-api 启动的 cron 每 7 天自动跑,不需要走这条。
-pub(crate) async fn handle_distill_thesis_now(
+pub(crate) async fn handle_distill_mainline_now(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<UserIdQuery>,
 ) -> Response {
@@ -514,7 +512,7 @@ pub(crate) async fn handle_distill_thesis_now(
         Ok(None) => {
             return json_error(
                 StatusCode::NOT_FOUND,
-                "actor 没有 portfolio,无法蒸馏 thesis(请先建仓)",
+                "actor 没有 portfolio,无法蒸馏投资主线(请先建仓)",
             );
         }
         Err(e) => {
@@ -532,29 +530,36 @@ pub(crate) async fn handle_distill_thesis_now(
     if holdings.is_empty() {
         return json_error(
             StatusCode::BAD_REQUEST,
-            "portfolio 持仓为空,无法蒸馏 thesis",
+            "portfolio 持仓为空,无法蒸馏投资主线",
         );
     }
 
     // LLM provider
-    let provider: Arc<dyn hone_llm::LlmProvider> =
-        match hone_llm::OpenRouterProvider::from_config(&state.core.config) {
-            Ok(p) => Arc::new(p),
-            Err(e) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("OpenRouter provider 不可用: {e}"),
-                );
-            }
-        };
-    let model = state
-        .core
-        .config
-        .event_engine
-        .global_digest
-        .event_dedupe_model
-        .clone();
-    let distiller = hone_event_engine::global_digest::LlmThesisDistiller::new(provider, model);
+    let gd = &state.core.config.event_engine.global_digest;
+    let profile_ref = if gd.mainline_distill_llm.trim().is_empty() {
+        &gd.event_dedupe_llm
+    } else {
+        &gd.mainline_distill_llm
+    };
+    let created = match hone_llm::LlmResolver::new(&state.core.config)
+        .provider_for_profile_or_openrouter_model(
+            Some(profile_ref),
+            &gd.event_dedupe_model,
+            &gd.event_dedupe_model,
+            Some(1200),
+        ) {
+        Ok(created) => created,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("LLM provider 不可用: {e}"),
+            );
+        }
+    };
+    let distiller = hone_event_engine::global_digest::LlmMainlineDistiller::new(
+        created.provider,
+        created.model,
+    );
 
     let prefs_storage = match hone_event_engine::prefs::FilePrefsStorage::new(
         &state.core.config.storage.notif_prefs_dir,
@@ -586,10 +591,10 @@ pub(crate) async fn handle_distill_thesis_now(
 
     Json(json!({
         "ok": true,
-        "theses_count": updated.investment_theses.as_ref().map(|m| m.len()).unwrap_or(0),
-        "global_style_set": updated.investment_global_style.is_some(),
-        "skipped_tickers": updated.thesis_distill_skipped,
-        "last_distilled_at": updated.last_thesis_distilled_at,
+        "mainline_count": updated.mainline_by_ticker.as_ref().map(|m| m.len()).unwrap_or(0),
+        "mainline_style_set": updated.mainline_style.is_some(),
+        "skipped_tickers": updated.mainline_distill_skipped,
+        "last_distilled_at": updated.last_mainline_distilled_at,
     }))
     .into_response()
 }
@@ -624,30 +629,34 @@ pub(crate) async fn handle_delete_rss_feed(
 mod tests {
     use super::*;
 
-    fn cfg(schedules: Vec<&str>, top_n: u32, pick_n: u32) -> GlobalDigestConfig {
+    fn cfg(top_n: u32, pick_n: u32) -> GlobalDigestConfig {
         GlobalDigestConfig {
             enabled: true,
             timezone: "Asia/Shanghai".into(),
-            schedules: schedules.into_iter().map(String::from).collect(),
             lookback_hours: 24,
-            pass1_model: "amazon/nova-lite-v1".into(),
+            pass1_llm: String::new(),
+            pass1_model: "x-ai/grok-4.1-fast".into(),
+            pass2_llm: String::new(),
             pass2_model: "x-ai/grok-4.1-fast".into(),
             pass2_top_n: top_n,
             final_pick_n: pick_n,
             fetch_full_text: true,
             event_dedupe_enabled: true,
+            event_dedupe_llm: String::new(),
             event_dedupe_model: "x-ai/grok-4.1-fast".into(),
+            mainline_distill_llm: String::new(),
+            jina_api_key: None,
         }
     }
 
     #[test]
     fn validate_global_digest_passes_on_canonical_config() {
-        assert!(validate_global_digest(&cfg(vec!["09:00", "21:00"], 15, 8)).is_ok());
+        assert!(validate_global_digest(&cfg(15, 8)).is_ok());
     }
 
     #[test]
     fn validate_global_digest_rejects_unknown_timezone() {
-        let mut c = cfg(vec!["09:00"], 15, 8);
+        let mut c = cfg(15, 8);
         c.timezone = "Mars/Olympus".into();
         let err = validate_global_digest(&c).unwrap_err();
         let body = format!("{:?}", err);
@@ -655,20 +664,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_global_digest_rejects_bad_schedule_format() {
-        let c = cfg(vec!["25:99"], 15, 8);
-        assert!(validate_global_digest(&c).is_err());
-    }
-
-    #[test]
     fn validate_global_digest_rejects_zero_final_pick_n() {
-        let c = cfg(vec!["09:00"], 5, 0);
+        let c = cfg(5, 0);
         assert!(validate_global_digest(&c).is_err());
     }
 
     #[test]
     fn validate_global_digest_rejects_top_n_below_pick_n() {
-        let c = cfg(vec!["09:00"], 3, 8);
+        let c = cfg(3, 8);
         assert!(validate_global_digest(&c).is_err());
     }
 

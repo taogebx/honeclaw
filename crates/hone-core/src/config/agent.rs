@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,6 +12,18 @@ pub struct LlmConfig {
     pub auxiliary: AuxiliaryLlmConfig,
     #[serde(default)]
     pub kimi: KimiConfig,
+    /// Provider registry for transport, base URL, credentials, and provider kind.
+    #[serde(default)]
+    pub providers: BTreeMap<String, LlmProviderEntryConfig>,
+    /// Profile registry for model selection and per-use generation parameters.
+    /// Runtime consumers prefer profiles when configured; legacy OpenRouter/Auxiliary
+    /// fields remain fallback-compatible.
+    #[serde(default)]
+    pub profiles: BTreeMap<String, LlmProfileEntryConfig>,
+    #[serde(default)]
+    pub default_profile: String,
+    #[serde(default)]
+    pub auxiliary_profile: String,
 }
 
 impl Default for LlmConfig {
@@ -20,7 +33,26 @@ impl Default for LlmConfig {
             openrouter: OpenRouterConfig::default(),
             auxiliary: AuxiliaryLlmConfig::default(),
             kimi: KimiConfig::default(),
+            providers: BTreeMap::new(),
+            profiles: BTreeMap::new(),
+            default_profile: String::new(),
+            auxiliary_profile: String::new(),
         }
+    }
+}
+
+impl LlmConfig {
+    /// Config-only OpenRouter key pool. New configs should write
+    /// `llm.providers.openrouter.api_key/api_keys`; legacy
+    /// `llm.openrouter.api_key/api_keys` remains readable as a config-only
+    /// fallback during migration.
+    pub fn openrouter_key_pool(&self) -> crate::api_key_pool::ApiKeyPool {
+        let mut keys = Vec::new();
+        if let Some(provider) = self.providers.get("openrouter") {
+            keys.extend(provider.effective_key_pool().keys().iter().cloned());
+        }
+        keys.extend(self.openrouter.effective_key_pool().keys().iter().cloned());
+        crate::api_key_pool::ApiKeyPool::new(keys)
     }
 }
 
@@ -30,14 +62,12 @@ fn default_provider() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenRouterConfig {
-    /// 单 Key 向后兼容字段（优先于 api_keys[0]）
+    /// 单 Key 向后兼容字段（优先于 `api_keys[0]`）
     #[serde(default)]
     pub api_key: String,
     /// 多 Key 列表，支持多账号 fallback（与 api_key 合并后去重使用）
     #[serde(default)]
     pub api_keys: Vec<String>,
-    #[serde(default = "default_api_key_env")]
-    pub api_key_env: String,
     #[serde(default = "default_model")]
     pub model: String,
     #[serde(default = "default_sub_model")]
@@ -55,7 +85,6 @@ impl Default for OpenRouterConfig {
         Self {
             api_key: String::new(),
             api_keys: Vec::new(),
-            api_key_env: default_api_key_env(),
             model: default_model(),
             sub_model: default_sub_model(),
             timeout: default_timeout(),
@@ -87,8 +116,6 @@ pub struct AuxiliaryLlmConfig {
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
-    #[serde(default = "default_auxiliary_api_key_env")]
-    pub api_key_env: String,
     #[serde(default)]
     pub model: String,
     #[serde(default = "default_timeout")]
@@ -104,7 +131,6 @@ impl Default for AuxiliaryLlmConfig {
         Self {
             base_url: default_auxiliary_base_url(),
             api_key: String::new(),
-            api_key_env: default_auxiliary_api_key_env(),
             model: String::new(),
             timeout: default_timeout(),
             max_retries: default_max_retries(),
@@ -117,35 +143,12 @@ impl AuxiliaryLlmConfig {
     pub fn is_configured(&self) -> bool {
         !self.base_url.trim().is_empty()
             && !self.model.trim().is_empty()
-            && (!self.api_key.trim().is_empty() || !self.api_key_env.trim().is_empty())
-    }
-
-    pub fn resolved_api_key(&self) -> String {
-        let direct = self.api_key.trim();
-        if !direct.is_empty() {
-            return direct.to_string();
-        }
-
-        let env_name = self.api_key_env.trim();
-        if env_name.is_empty() {
-            return String::new();
-        }
-
-        std::env::var(env_name)
-            .unwrap_or_default()
-            .trim()
-            .to_string()
+            && !self.api_key.trim().is_empty()
     }
 }
 
-fn default_api_key_env() -> String {
-    "OPENROUTER_API_KEY".to_string()
-}
 fn default_auxiliary_base_url() -> String {
     String::new()
-}
-fn default_auxiliary_api_key_env() -> String {
-    "MINIMAX_API_KEY".to_string()
 }
 fn default_model() -> String {
     "moonshotai/kimi-k2.5".to_string()
@@ -163,12 +166,108 @@ fn default_max_tokens() -> u32 {
     32768
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmProviderEntryConfig {
+    #[serde(default = "default_llm_provider_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for LlmProviderEntryConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_llm_provider_kind(),
+            base_url: String::new(),
+            api_key: String::new(),
+            api_keys: Vec::new(),
+            timeout: None,
+            max_retries: None,
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
+impl LlmProviderEntryConfig {
+    pub fn effective_key_pool(&self) -> crate::api_key_pool::ApiKeyPool {
+        crate::api_key_pool::ApiKeyPool::merged(&self.api_key, &self.api_keys)
+    }
+}
+
+fn default_llm_provider_kind() -> String {
+    "openai_compatible".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LlmProfileEntryConfig {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub params: LlmProfileParamsConfig,
+    #[serde(default)]
+    pub provider_options: BTreeMap<String, LlmProviderOptionsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LlmProfileParamsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<LlmReasoningConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_body: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LlmReasoningConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<bool>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LlmProviderOptionsConfig {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_body: BTreeMap<String, serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct KimiConfig {
     #[serde(default)]
     pub api_key: String,
-    #[serde(default)]
-    pub api_key_env: String,
     #[serde(default)]
     pub model: String,
     #[serde(default = "default_timeout")]
@@ -204,6 +303,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub opencode: OpencodeAcpConfig,
     #[serde(default)]
+    pub hone_cloud: HoneCloudConfig,
+    #[serde(default)]
     pub multi_agent: MultiAgentConfig,
 }
 
@@ -232,13 +333,16 @@ pub enum AgentRunnerKind {
     CodexCli,
     CodexAcp,
     OpencodeAcp,
+    HoneCloud,
     MultiAgent,
     Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentRunnerProbe {
+    /// 本机 CLI runner 启动前可快速探测的二进制。
     pub binary: &'static str,
+    /// 用于轻量确认二进制存在且能运行的参数。
     pub arg: &'static str,
 }
 
@@ -251,6 +355,7 @@ impl AgentRunnerKind {
             "codex_cli" => Self::CodexCli,
             "codex_acp" => Self::CodexAcp,
             "opencode_acp" => Self::OpencodeAcp,
+            "hone_cloud" => Self::HoneCloud,
             "multi-agent" => Self::MultiAgent,
             _ => Self::Unknown,
         }
@@ -264,6 +369,7 @@ impl AgentRunnerKind {
             Self::CodexCli => "codex_cli",
             Self::CodexAcp => "codex_acp",
             Self::OpencodeAcp => "opencode_acp",
+            Self::HoneCloud => "hone_cloud",
             Self::MultiAgent => "multi-agent",
             Self::Unknown => "unknown",
         }
@@ -273,6 +379,11 @@ impl AgentRunnerKind {
         matches!(self, Self::CodexAcp | Self::OpencodeAcp)
     }
 
+    /// 返回 runner 需要的本机 CLI 快速探针。
+    ///
+    /// `multi-agent` 的 answer 阶段由 opencode ACP 驱动，因此复用 opencode
+    /// 探针；`hone_cloud` 与 `function_calling` 不依赖本机 CLI，返回 `None`。
+    /// `gemini_acp` 运行时已禁用，但旧配置检查仍复用 gemini 探针。
     pub fn cli_probe(self) -> Option<AgentRunnerProbe> {
         match self {
             Self::GeminiCli | Self::GeminiAcp => Some(AgentRunnerProbe {
@@ -291,6 +402,7 @@ impl AgentRunnerKind {
                 binary: "opencode",
                 arg: "--version",
             }),
+            Self::HoneCloud => None,
             Self::FunctionCalling | Self::Unknown => None,
         }
     }
@@ -329,26 +441,38 @@ impl Default for AgentConfig {
             gemini_acp: GeminiAcpConfig::default(),
             codex_acp: CodexAcpConfig::default(),
             opencode: OpencodeAcpConfig::default(),
+            hone_cloud: HoneCloudConfig::default(),
             multi_agent: MultiAgentConfig::default(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HoneCloudConfig {
+    #[serde(default = "default_hone_cloud_base_url")]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_hone_cloud_model")]
+    pub model: String,
+}
+
+impl Default for HoneCloudConfig {
+    fn default() -> Self {
+        Self {
+            base_url: default_hone_cloud_base_url(),
+            api_key: String::new(),
+            model: default_hone_cloud_model(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MultiAgentConfig {
     #[serde(default)]
     pub search: MultiAgentSearchConfig,
     #[serde(default)]
     pub answer: MultiAgentAnswerConfig,
-}
-
-impl Default for MultiAgentConfig {
-    fn default() -> Self {
-        Self {
-            search: MultiAgentSearchConfig::default(),
-            answer: MultiAgentAnswerConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,8 +532,8 @@ pub struct GeminiAcpConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub model: String,
-    #[serde(default = "default_gemini_api_key_env")]
-    pub api_key_env: String,
+    #[serde(default)]
+    pub api_key: String,
 }
 
 impl Default for GeminiAcpConfig {
@@ -418,7 +542,7 @@ impl Default for GeminiAcpConfig {
             command: default_gemini_acp_command(),
             args: default_gemini_acp_args(),
             model: String::new(),
-            api_key_env: default_gemini_api_key_env(),
+            api_key: String::new(),
         }
     }
 }
@@ -480,7 +604,7 @@ pub struct OpencodeAcpConfig {
     /// 可选的 Hone 侧 API key 覆盖；留空则继承用户本机 opencode 登录态 / provider 配置
     #[serde(default)]
     pub api_key: String,
-    /// OpenRouter API Key（运行时注入，来自 llm.openrouter.api_key 配置，不写入 YAML）
+    /// OpenRouter API Key（运行时注入，来自 config.yaml 的 OpenRouter key pool，不写入 YAML）
     #[serde(skip)]
     pub openrouter_api_key: Option<String>,
 }
@@ -571,6 +695,14 @@ fn default_agent_runner() -> String {
     "function_calling".to_string()
 }
 
+fn default_hone_cloud_base_url() -> String {
+    "https://hone-claw.com".to_string()
+}
+
+fn default_hone_cloud_model() -> String {
+    "hone-cloud".to_string()
+}
+
 fn default_multi_agent_search_base_url() -> String {
     "https://api.minimaxi.com/v1".to_string()
 }
@@ -589,37 +721,6 @@ fn default_multi_agent_search_max_iterations() -> u32 {
 
 fn default_multi_agent_answer_max_tool_calls() -> u32 {
     3
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{AgentRunnerKind, MultiAgentAnswerConfig};
-
-    #[test]
-    fn multi_agent_answer_default_tool_limit_is_three() {
-        assert_eq!(MultiAgentAnswerConfig::default().max_tool_calls, 3);
-    }
-
-    #[test]
-    fn agent_default_daily_conversation_limit_is_twelve() {
-        assert_eq!(super::AgentConfig::default().daily_conversation_limit, 12);
-    }
-
-    #[test]
-    fn agent_runner_kind_keeps_wire_values_and_probe_mapping() {
-        let kind = AgentRunnerKind::from_config_value("codex_acp");
-        assert_eq!(kind.as_str(), "codex_acp");
-        assert!(kind.manages_own_context());
-        let probe = kind.cli_probe().expect("codex acp probe");
-        assert_eq!(probe.binary, "codex-acp");
-        assert_eq!(probe.arg, "--help");
-        assert_eq!(
-            serde_yaml::to_string(&AgentRunnerKind::MultiAgent)
-                .expect("serialize")
-                .trim(),
-            "multi-agent"
-        );
-    }
 }
 
 fn default_multi_agent_answer_api_base_url() -> String {
@@ -646,10 +747,6 @@ fn default_gemini_acp_args() -> Vec<String> {
     ]
 }
 
-fn default_gemini_api_key_env() -> String {
-    "GEMINI_API_KEY".to_string()
-}
-
 fn default_codex_acp_command() -> String {
     "codex-acp".to_string()
 }
@@ -660,4 +757,38 @@ fn default_codex_command() -> String {
 
 fn default_opencode_args() -> Vec<String> {
     vec!["acp".to_string()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentRunnerKind, MultiAgentAnswerConfig};
+
+    #[test]
+    fn multi_agent_answer_default_tool_limit_is_three() {
+        assert_eq!(MultiAgentAnswerConfig::default().max_tool_calls, 3);
+    }
+
+    #[test]
+    fn agent_default_daily_conversation_limit_is_twelve() {
+        assert_eq!(super::AgentConfig::default().daily_conversation_limit, 12);
+    }
+
+    #[test]
+    fn agent_runner_kind_keeps_wire_values_and_probe_mapping() {
+        let kind = AgentRunnerKind::from_config_value("codex_acp");
+        assert_eq!(kind.as_str(), "codex_acp");
+        assert!(kind.manages_own_context());
+        let probe = kind.cli_probe().expect("codex acp probe");
+        assert_eq!(probe.binary, "codex-acp");
+        assert_eq!(probe.arg, "--help");
+        let cloud = AgentRunnerKind::from_config_value("hone_cloud");
+        assert_eq!(cloud.as_str(), "hone_cloud");
+        assert!(cloud.cli_probe().is_none());
+        assert_eq!(
+            serde_yaml::to_string(&AgentRunnerKind::MultiAgent)
+                .expect("serialize")
+                .trim(),
+            "multi-agent"
+        );
+    }
 }

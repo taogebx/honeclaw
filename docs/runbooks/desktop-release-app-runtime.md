@@ -139,9 +139,8 @@ The expected bundle path on macOS is:
 /Users/ecohnoch/Library/Caches/honeclaw/target/release/bundle/macos/Hone Financial.app
 ```
 
-Current repo helpers now align with this cache target:
+Current repo helpers align with this cache target:
 
-- `launch.sh --release` builds and launches the packaged `.app` executable on macOS
 - `scripts/build_desktop.sh` also defaults to `/Users/<user>/Library/Caches/honeclaw/target`
 - do not mix these helpers with the legacy `hone-financial/target` cache path
 
@@ -163,6 +162,33 @@ env \
 ```
 
 This is the recommended long-running command.
+
+## Start A Headless Smoke Server
+
+Daily build verification can run the packaged desktop executable in a Web/API-only mode when the goal is to prove `/api/meta`, the public user page, and disabled channel status without depending on macOS window lifecycle.
+
+Use the same `.app/Contents/MacOS/hone-desktop` binary with `HONE_DESKTOP_SMOKE_SERVER=1`:
+
+```bash
+env \
+  HONE_DESKTOP_SMOKE_SERVER=1 \
+  HONE_WEB_PORT=18077 \
+  HONE_PUBLIC_WEB_PORT=18088 \
+  HONE_USER_CONFIG_PATH=/Users/ecohnoch/Desktop/honeclaw/data/runtime/daily-build-check/config.yaml \
+  HONE_DESKTOP_DATA_DIR=/Users/ecohnoch/Desktop/honeclaw/data/runtime/daily-build-check/data \
+  HONE_SKILLS_DIR=/Users/ecohnoch/Desktop/honeclaw/skills \
+  /Users/ecohnoch/Library/Caches/honeclaw/target/release/bundle/macos/Hone\ Financial.app/Contents/MacOS/hone-desktop
+```
+
+Expected smoke checks:
+
+```bash
+curl http://127.0.0.1:18077/api/meta
+curl http://127.0.0.1:18088/
+curl http://127.0.0.1:18077/api/channels
+```
+
+The process stays alive until Ctrl-C. This mode is for release build smoke verification; normal desktop use should still launch the release app without `HONE_DESKTOP_SMOKE_SERVER`.
 
 ## Start The Backend Lane
 
@@ -418,12 +444,12 @@ curl http://127.0.0.1:8077/api/channels
 - if logs still show `config.path=.../data/runtime/config_runtime.yaml`, the process was started by an old env/runbook path and may ignore the latest runner change
 - verify both the effective config file path and the actual binary path of the running process before changing more config
 
-### `launch.sh --release` vs direct `.app` launch
+### Build Helper vs Direct `.app` Launch
 
-- `./launch.sh --release` is useful as a build-and-run helper
-- it now launches the same packaged `.app/Contents/MacOS/hone-desktop` path documented above
-- `launch.sh` also records its own supervisor pid in `data/runtime/current.pid`, which is the contract used by `restart_hone` to stop the previous supervisor cleanly before relaunch
-- if there is ever a discrepancy, prefer the `.app` bundle path documented above and verify `current.pid` still points to the active `launch.sh` supervisor
+- `bun run build:desktop` is the build helper for the packaged desktop app
+- direct launch should use the packaged `.app/Contents/MacOS/hone-desktop` path documented above
+- source runtime supervision is handled by `hone-cli start`, which records `data/runtime/current.pid`
+- if there is ever a discrepancy, prefer the `.app` bundle path documented above and verify the active process command line before changing more config
 
 ## Recommended Team Habit
 

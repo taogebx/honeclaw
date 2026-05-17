@@ -3,6 +3,8 @@
 //! 将原 `hone-console-page` 二进制的服务逻辑提取为库，
 //! 供 `hone-desktop` 在 Tauri 主进程内直接嵌入启动，无需子进程 sidecar。
 
+mod aliyun_captcha;
+mod aliyun_sms;
 pub mod logging;
 mod public_auth;
 pub mod routes;
@@ -14,7 +16,7 @@ pub use logging::{LogBuffer, LogCaptureLayer, LogEntry};
 pub use routes::{build_admin_app, build_public_app};
 pub use state::{AppState, AuthState, PushEvent};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -25,7 +27,8 @@ use hone_event_engine::{
     BodyPolisher, DiscordSink, FeishuSink, IMessageSink, LlmPolisher, LogSink, MultiChannelSink,
     OutboundSink, TelegramSink, parse_polish_levels,
 };
-use hone_llm::{LlmProvider, OpenRouterProvider};
+use hone_llm::{CreatedLlmProvider, LlmResolver};
+use hone_memory::{ChannelTargetRecord, CronJobStorage};
 use tokio::sync::broadcast;
 use tracing::info;
 use tracing_subscriber::prelude::*;
@@ -46,12 +49,19 @@ fn build_event_engine_polisher(
     if levels.is_empty() {
         return None;
     }
-    match OpenRouterProvider::from_config(core_cfg) {
-        Ok(provider) => {
-            let provider: Arc<dyn LlmProvider> = Arc::new(provider);
-            let polisher = LlmPolisher::new(provider, levels)
-                .with_model(core_cfg.llm.openrouter.auxiliary_model());
-            info!("event engine: LlmPolisher 已装配");
+    match LlmResolver::new(core_cfg).provider_for_profile_or_openrouter_model(
+        Some(&engine_cfg.renderer.polish_llm),
+        core_cfg.llm.openrouter.auxiliary_model(),
+        core_cfg.llm.openrouter.auxiliary_model(),
+        None,
+    ) {
+        Ok(created) => {
+            let polisher = LlmPolisher::new(created.provider, levels).with_model(&created.model);
+            info!(
+                model = %created.model,
+                profile = ?created.profile_name,
+                "event engine: LlmPolisher 已装配"
+            );
             Some(Arc::new(polisher) as Arc<dyn BodyPolisher>)
         }
         Err(e) => {
@@ -61,25 +71,29 @@ fn build_event_engine_polisher(
     }
 }
 
-const DEFAULT_EVENT_ENGINE_NEWS_CLASSIFIER_MODEL: &str = "amazon/nova-lite-v1";
+const DEFAULT_EVENT_ENGINE_NEWS_CLASSIFIER_MODEL: &str = "x-ai/grok-4.1-fast";
+const DEFAULT_MAINLINE_DISTILL_MAX_TOKENS: u16 = 1200;
 
 /// 装配"不确定来源 NewsCritical → LLM 仲裁"分类器。
-/// 走 OpenRouter,key 复用 llm.openrouter.api_key。
+/// 走 LLM profile resolver；OpenRouter key 来自 config.yaml 的 provider key pool。
 /// 失败一律退化为 `None`(router 跳过 LLM 路径,uncertain 源新闻保持 Low)。
 fn build_event_engine_news_classifier(
     core_cfg: &HoneConfig,
 ) -> Option<Arc<dyn hone_event_engine::NewsClassifier>> {
-    match OpenRouterProvider::from_config(core_cfg) {
-        Ok(provider) => {
-            let provider: Arc<dyn LlmProvider> = Arc::new(provider);
-            let model = core_cfg.event_engine.news_classifier_model.trim();
-            let model = if model.is_empty() {
-                DEFAULT_EVENT_ENGINE_NEWS_CLASSIFIER_MODEL
-            } else {
-                model
-            };
-            let classifier = hone_event_engine::LlmNewsClassifier::new(provider, model);
-            info!("event engine: news LLM classifier 装配 (model={model})");
+    match LlmResolver::new(core_cfg).provider_for_profile_or_openrouter_model(
+        Some(&core_cfg.event_engine.news_classifier_llm),
+        &core_cfg.event_engine.news_classifier_model,
+        DEFAULT_EVENT_ENGINE_NEWS_CLASSIFIER_MODEL,
+        None,
+    ) {
+        Ok(created) => {
+            let classifier =
+                hone_event_engine::LlmNewsClassifier::new(created.provider, &created.model);
+            info!(
+                model = %created.model,
+                profile = ?created.profile_name,
+                "event engine: news LLM classifier 装配"
+            );
             Some(Arc::new(classifier) as Arc<dyn hone_event_engine::NewsClassifier>)
         }
         Err(e) => {
@@ -89,6 +103,188 @@ fn build_event_engine_news_classifier(
             None
         }
     }
+}
+
+fn sec_filings_enrichment_max_tokens(core_cfg: &HoneConfig) -> u16 {
+    let requested = core_cfg
+        .event_engine
+        .sec_filings
+        .enrichment
+        .max_summary_tokens;
+    requested.clamp(1, u16::MAX as u32) as u16
+}
+
+fn earnings_quality_review_max_tokens(core_cfg: &HoneConfig) -> u16 {
+    let requested = core_cfg
+        .event_engine
+        .earnings
+        .quality_review
+        .max_review_tokens;
+    requested.clamp(1, u16::MAX as u32) as u16
+}
+
+fn mainline_distill_max_tokens(_core_cfg: &HoneConfig) -> u16 {
+    DEFAULT_MAINLINE_DISTILL_MAX_TOKENS
+}
+
+/// SEC filing enrichment 只生成短摘要,必须使用独立 completion budget。
+///
+/// 不能复用 `llm.openrouter.max_tokens`:SEC filing 的 input 可以很长,但 output
+/// 目标只有约 200 字。复用全局 30k 预算会触发 OpenRouter 对单次请求做过高
+/// 预授权,在 key 周限额仍有余额时也可能返回 402。
+fn build_sec_filings_enrichment_llm(core_cfg: &HoneConfig) -> Option<CreatedLlmProvider> {
+    let enrichment = &core_cfg.event_engine.sec_filings.enrichment;
+    if !core_cfg.event_engine.sources.sec_filings || !enrichment.enabled {
+        return None;
+    }
+    let max_tokens = sec_filings_enrichment_max_tokens(core_cfg);
+    match LlmResolver::new(core_cfg).provider_for_profile_or_openrouter_model(
+        Some(&enrichment.llm),
+        &enrichment.model,
+        &enrichment.model,
+        Some(max_tokens),
+    ) {
+        Ok(created) => {
+            info!(
+                max_tokens,
+                model = %created.model,
+                profile = ?created.profile_name,
+                "event engine: sec_filings enrichment LLM provider 装配"
+            );
+            Some(created)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "event engine: sec_filings enrichment LLM provider 不可用,filing 摘要将降级: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// EarningsReleased 综合质量 review 输出结构化 JSON judgement,同样使用独立
+/// completion budget。provider 不可用时 review 关闭,engine 不启动 EPS-only poller。
+fn build_earnings_quality_review_llm(core_cfg: &HoneConfig) -> Option<CreatedLlmProvider> {
+    let review = &core_cfg.event_engine.earnings.quality_review;
+    if !core_cfg.event_engine.sources.earnings_surprise || !review.enabled {
+        return None;
+    }
+    let max_tokens = earnings_quality_review_max_tokens(core_cfg);
+    match LlmResolver::new(core_cfg).provider_for_profile_or_openrouter_model(
+        Some(&review.llm),
+        &review.model,
+        &review.model,
+        Some(max_tokens),
+    ) {
+        Ok(created) => {
+            info!(
+                max_tokens,
+                model = %created.model,
+                profile = ?created.profile_name,
+                "event engine: earnings quality review LLM provider 装配"
+            );
+            Some(created)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "event engine: earnings quality review LLM provider 不可用,earnings_surprise 将跳过 EPS-only candidates: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// Mainline distill 只输出 1-2 句投资主线,不能复用全局长输出 budget。
+///
+/// 复用 `llm.openrouter.max_tokens` 会让 OpenRouter 在低余额时按 30k completion
+/// tokens 预授权,导致短摘要任务也触发 HTTP 402。
+fn build_mainline_distill_llm(core_cfg: &HoneConfig) -> Option<CreatedLlmProvider> {
+    if !core_cfg.event_engine.global_digest.enabled {
+        return None;
+    }
+    let max_tokens = mainline_distill_max_tokens(core_cfg);
+    let gd = &core_cfg.event_engine.global_digest;
+    let profile_ref = if gd.mainline_distill_llm.trim().is_empty() {
+        &gd.event_dedupe_llm
+    } else {
+        &gd.mainline_distill_llm
+    };
+    match LlmResolver::new(core_cfg).provider_for_profile_or_openrouter_model(
+        Some(profile_ref),
+        &gd.event_dedupe_model,
+        &gd.event_dedupe_model,
+        Some(max_tokens),
+    ) {
+        Ok(created) => {
+            info!(
+                max_tokens,
+                model = %created.model,
+                profile = ?created.profile_name,
+                "event engine: mainline distill LLM provider 装配"
+            );
+            Some(created)
+        }
+        Err(e) => {
+            tracing::warn!("mainline distill LLM provider 不可用: {e}");
+            None
+        }
+    }
+}
+
+fn build_global_digest_llms(
+    core_cfg: &HoneConfig,
+) -> Option<(CreatedLlmProvider, CreatedLlmProvider, CreatedLlmProvider)> {
+    let gd = &core_cfg.event_engine.global_digest;
+    if !gd.enabled {
+        return None;
+    }
+    let resolver = LlmResolver::new(core_cfg);
+    let pass1 = match resolver.provider_for_profile_or_openrouter_model(
+        Some(&gd.pass1_llm),
+        &gd.pass1_model,
+        &gd.pass1_model,
+        None,
+    ) {
+        Ok(created) => created,
+        Err(e) => {
+            tracing::warn!("global_digest pass1 LLM provider 不可用: {e}");
+            return None;
+        }
+    };
+    let pass2 = match resolver.provider_for_profile_or_openrouter_model(
+        Some(&gd.pass2_llm),
+        &gd.pass2_model,
+        &gd.pass2_model,
+        None,
+    ) {
+        Ok(created) => created,
+        Err(e) => {
+            tracing::warn!("global_digest pass2 LLM provider 不可用: {e}");
+            return None;
+        }
+    };
+    let event_dedupe = match resolver.provider_for_profile_or_openrouter_model(
+        Some(&gd.event_dedupe_llm),
+        &gd.event_dedupe_model,
+        &gd.event_dedupe_model,
+        None,
+    ) {
+        Ok(created) => created,
+        Err(e) => {
+            tracing::warn!("global_digest event-dedupe LLM provider 不可用: {e}");
+            return None;
+        }
+    };
+    info!(
+        pass1_model = %pass1.model,
+        pass1_profile = ?pass1.profile_name,
+        pass2_model = %pass2.model,
+        pass2_profile = ?pass2.profile_name,
+        event_dedupe_model = %event_dedupe.model,
+        event_dedupe_profile = ?event_dedupe.profile_name,
+        "global_digest LLM providers 装配"
+    );
+    Some((pass1, pass2, event_dedupe))
 }
 
 /// 按 config 组装真实 OutboundSink(事件引擎的渠道出口)。
@@ -114,6 +310,7 @@ fn build_event_engine_sink(core_cfg: &HoneConfig) -> Arc<dyn OutboundSink> {
         && !core_cfg.feishu.app_id.trim().is_empty()
         && !core_cfg.feishu.app_secret.trim().is_empty()
     {
+        let direct_actor_targets = feishu_direct_actor_contact_targets(core_cfg);
         multi = multi.with_channel(
             "feishu",
             Arc::new(
@@ -124,7 +321,8 @@ fn build_event_engine_sink(core_cfg: &HoneConfig) -> Arc<dyn OutboundSink> {
                 .with_single_direct_contact_fallback(
                     &core_cfg.feishu.allow_emails,
                     &core_cfg.feishu.allow_mobiles,
-                ),
+                )
+                .with_direct_actor_contact_targets(direct_actor_targets),
             ),
         );
     }
@@ -141,6 +339,77 @@ fn build_event_engine_sink(core_cfg: &HoneConfig) -> Arc<dyn OutboundSink> {
         "event engine sink: MultiChannelSink 已装配"
     );
     Arc::new(multi)
+}
+
+fn feishu_direct_actor_contact_targets(core_cfg: &HoneConfig) -> Vec<(String, String)> {
+    let storage = CronJobStorage::with_sqlite(
+        &core_cfg.storage.cron_jobs_dir,
+        &core_cfg.storage.session_sqlite_db_path,
+    );
+    feishu_direct_actor_contact_targets_from_records(storage.list_channel_targets())
+}
+
+fn feishu_direct_actor_contact_targets_from_records(
+    records: Vec<ChannelTargetRecord>,
+) -> Vec<(String, String)> {
+    let mut targets_by_actor: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for record in records {
+        if record.channel.trim() != "feishu" {
+            continue;
+        }
+        if matches!(record.channel_scope.as_deref(), Some(scope) if scope != "direct") {
+            continue;
+        }
+        let target = record.target.trim();
+        if !looks_like_contact_target(target) {
+            continue;
+        }
+        for actor_user_id in record.actor_user_ids {
+            let actor_user_id = actor_user_id.trim();
+            if actor_user_id.is_empty() {
+                continue;
+            }
+            targets_by_actor
+                .entry(actor_user_id.to_string())
+                .or_default()
+                .insert(target.to_string());
+        }
+    }
+    targets_by_actor
+        .into_iter()
+        .filter_map(|(actor_user_id, targets)| {
+            if targets.len() == 1 {
+                targets
+                    .into_iter()
+                    .next()
+                    .map(|target| (actor_user_id, target))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn looks_like_contact_target(target: &str) -> bool {
+    let target = target.trim();
+    if target.is_empty() || target == "*" {
+        return false;
+    }
+    target.contains('@') || looks_like_mobile_target(target)
+}
+
+fn looks_like_mobile_target(target: &str) -> bool {
+    let target = target.trim();
+    if target.is_empty() {
+        return false;
+    }
+    if !target
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || matches!(ch, '+' | ' ' | '-' | '(' | ')'))
+    {
+        return false;
+    }
+    target.chars().filter(|ch| ch.is_ascii_digit()).count() >= 7
 }
 
 pub struct StartedServer {
@@ -380,7 +649,7 @@ pub async fn start_server(
 
     // ── 事件引擎（主动消息 feed，默认 enabled=false；config 开启后启动）──
     {
-        let engine_cfg = state.core.config.event_engine.clone();
+        let mut engine_cfg = state.core.config.event_engine.clone();
         let fmp_cfg = state.core.config.fmp.clone();
         let portfolio_dir = state.core.config.storage.portfolio_dir.clone();
         let notif_prefs_dir = state.core.config.storage.notif_prefs_dir.clone();
@@ -410,35 +679,40 @@ pub async fn start_server(
         let polisher = build_event_engine_polisher(&state.core.config, &engine_cfg);
         let sink = build_event_engine_sink(&state.core.config);
         let news_classifier = build_event_engine_news_classifier(&state.core.config);
-        // global_digest 也走 OpenRouter,与 news_classifier 用同一 provider
-        let global_digest_provider: Option<Arc<dyn LlmProvider>> =
-            match OpenRouterProvider::from_config(&state.core.config) {
-                Ok(p) => Some(Arc::new(p)),
-                Err(e) => {
-                    tracing::warn!("global_digest LLM provider 不可用: {e}");
-                    None
-                }
-            };
+        let sec_filings_enrichment = build_sec_filings_enrichment_llm(&state.core.config);
+        if let Some(created) = &sec_filings_enrichment {
+            engine_cfg.sec_filings.enrichment.model = created.model.clone();
+        }
+        let sec_filings_enrichment_provider =
+            sec_filings_enrichment.map(|created| created.provider);
+        let earnings_quality_review = build_earnings_quality_review_llm(&state.core.config);
+        if let Some(created) = &earnings_quality_review {
+            engine_cfg.earnings.quality_review.model = created.model.clone();
+        }
+        let earnings_quality_review_provider =
+            earnings_quality_review.map(|created| created.provider);
+        let mainline_distill = build_mainline_distill_llm(&state.core.config);
+        let global_digest_llms = build_global_digest_llms(&state.core.config);
+        if let Some((pass1, pass2, event_dedupe)) = &global_digest_llms {
+            engine_cfg.global_digest.pass1_model = pass1.model.clone();
+            engine_cfg.global_digest.pass2_model = pass2.model.clone();
+            engine_cfg.global_digest.event_dedupe_model = event_dedupe.model.clone();
+        }
 
-        // ── Thesis 蒸馏 cron(每 7 天扫一次,独立 task,挂掉不影响 digest)──
-        if let Some(p) = global_digest_provider.clone() {
-            let distill_model = state
-                .core
-                .config
-                .event_engine
-                .global_digest
-                .event_dedupe_model
-                .clone();
+        // ── 投资主线蒸馏 cron(每 7 天扫一次,独立 task,挂掉不影响 digest)──
+        if let Some(created) = mainline_distill {
+            let p = created.provider;
+            let distill_model = created.model;
             let prefs_dir_clone = notif_prefs_dir.clone();
             let portfolio_dir_clone = portfolio_dir.clone();
-            let thesis_task_runs_dir = task_runs_dir_arc.clone();
+            let mainline_task_runs_dir = task_runs_dir_arc.clone();
             task_handles.push(tokio::spawn(async move {
                 let prefs_storage =
                     match hone_event_engine::prefs::FilePrefsStorage::new(&prefs_dir_clone) {
                         Ok(s) => Arc::new(s) as Arc<dyn hone_event_engine::prefs::PrefsProvider>,
                         Err(e) => {
                             tracing::warn!(
-                                "thesis distill cron: prefs storage 打开失败: {e},cron 不启动"
+                                "mainline distill cron: prefs storage 打开失败: {e},cron 不启动"
                             );
                             return;
                         }
@@ -447,7 +721,7 @@ pub async fn start_server(
                     Arc::new(hone_memory::PortfolioStorage::new(&portfolio_dir_clone));
                 let sandbox_base = hone_channels::sandbox_base_dir();
                 let distiller =
-                    Arc::new(hone_event_engine::global_digest::LlmThesisDistiller::new(
+                    Arc::new(hone_event_engine::global_digest::LlmMainlineDistiller::new(
                         p,
                         distill_model.clone(),
                     ));
@@ -455,7 +729,7 @@ pub async fn start_server(
                     model = %distill_model,
                     sandbox_base = %sandbox_base.display(),
                     interval_hours = hone_event_engine::global_digest::DEFAULT_DISTILL_INTERVAL_HOURS,
-                    "thesis distill cron starting"
+                    "mainline distill cron starting"
                 );
                 hone_event_engine::global_digest::distill_cron_loop(
                     distiller,
@@ -463,7 +737,7 @@ pub async fn start_server(
                     portfolio_storage,
                     sandbox_base,
                     hone_event_engine::global_digest::DEFAULT_DISTILL_INTERVAL_HOURS,
-                    Some(thesis_task_runs_dir),
+                    Some(mainline_task_runs_dir),
                 )
                 .await;
             }));
@@ -485,8 +759,18 @@ pub async fn start_server(
             if let Some(c) = news_classifier {
                 engine = engine.with_news_classifier(c);
             }
-            if let Some(p) = global_digest_provider {
-                engine = engine.with_global_digest_provider(p);
+            if let Some((pass1, pass2, event_dedupe)) = global_digest_llms {
+                engine = engine.with_global_digest_providers(
+                    pass1.provider,
+                    pass2.provider,
+                    event_dedupe.provider,
+                );
+            }
+            if let Some(p) = sec_filings_enrichment_provider {
+                engine = engine.with_sec_filings_enrichment_provider(p);
+            }
+            if let Some(p) = earnings_quality_review_provider {
+                engine = engine.with_earnings_quality_review_provider(p);
             }
             if let Err(e) = engine.start().await {
                 tracing::warn!("event engine start failed: {e}");
@@ -568,4 +852,88 @@ pub async fn start_server(
         public_port,
         task_handles,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sec_filings_enrichment_max_tokens_uses_configured_cap() {
+        let mut cfg = HoneConfig::default();
+        cfg.event_engine.sec_filings.enrichment.max_summary_tokens = 800;
+
+        assert_eq!(sec_filings_enrichment_max_tokens(&cfg), 800);
+    }
+
+    #[test]
+    fn sec_filings_enrichment_max_tokens_clamps_to_valid_u16_range() {
+        let mut cfg = HoneConfig::default();
+
+        cfg.event_engine.sec_filings.enrichment.max_summary_tokens = 0;
+        assert_eq!(sec_filings_enrichment_max_tokens(&cfg), 1);
+
+        cfg.event_engine.sec_filings.enrichment.max_summary_tokens = 70_000;
+        assert_eq!(sec_filings_enrichment_max_tokens(&cfg), u16::MAX);
+    }
+
+    #[test]
+    fn mainline_distill_uses_short_completion_budget() {
+        let mut cfg = HoneConfig::default();
+        cfg.llm.openrouter.max_tokens = 30_000;
+
+        assert_eq!(mainline_distill_max_tokens(&cfg), 1200);
+    }
+
+    #[test]
+    fn feishu_direct_actor_targets_use_unambiguous_contact_targets() {
+        let targets = feishu_direct_actor_contact_targets_from_records(vec![
+            channel_target_record("feishu", None, "+8613800138000", vec!["ou_old"]),
+            channel_target_record("telegram", None, "+8613800138000", vec!["tg_user"]),
+            channel_target_record(
+                "feishu",
+                Some("chat_oc_1"),
+                "+8613800138001",
+                vec!["ou_group"],
+            ),
+            channel_target_record("feishu", None, "ou_stale", vec!["ou_open"]),
+            channel_target_record("feishu", None, "alice@example.com", vec!["ou_email"]),
+        ]);
+
+        assert_eq!(
+            targets,
+            vec![
+                ("ou_email".to_string(), "alice@example.com".to_string()),
+                ("ou_old".to_string(), "+8613800138000".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn feishu_direct_actor_targets_skip_ambiguous_actor_targets() {
+        let targets = feishu_direct_actor_contact_targets_from_records(vec![
+            channel_target_record("feishu", None, "+8613800138000", vec!["ou_old"]),
+            channel_target_record("feishu", None, "+8613800138001", vec!["ou_old"]),
+        ]);
+
+        assert!(targets.is_empty());
+    }
+
+    fn channel_target_record(
+        channel: &str,
+        channel_scope: Option<&str>,
+        target: &str,
+        actor_user_ids: Vec<&str>,
+    ) -> ChannelTargetRecord {
+        ChannelTargetRecord {
+            channel: channel.to_string(),
+            channel_scope: channel_scope.map(str::to_string),
+            target: target.to_string(),
+            actor_user_ids: actor_user_ids.into_iter().map(str::to_string).collect(),
+            sources: vec!["test".to_string()],
+            scheduled_jobs: 1,
+            enabled_jobs: 1,
+            last_seen_at: None,
+        }
+    }
 }

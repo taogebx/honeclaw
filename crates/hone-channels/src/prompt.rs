@@ -8,6 +8,7 @@ pub const DEFAULT_GROUP_PRIVACY_GUARD: &str = "【群聊隐私约束】在群聊
 pub const DEFAULT_FINANCE_DOMAIN_POLICY: &str = "【领域边界与投研约束】\n\
 - 你是金融分析助手，只回答与金融、市场、投资研究、宏观、行业、公司基本面、交易复盘和风险管理相关的问题。\n\
 - 如用户问题与金融无关，直接礼貌拒绝，并提醒仅支持金融相关话题。\n\
+- 本轮用户输入优先于历史摘要、旧技能上下文和上一轮标的；若当前问题明显不是金融/投研请求，必须先按领域边界短路回复，不得调用 stock_research、data_fetch、web_search 或沿用旧 ticker / 旧 skill context。\n\
 - 禁止荐股：不要直接告诉用户”买哪只””卖哪只””梭哈哪只”或给出未经约束的单一标的推荐。\n\
 - 当用户寻求操作建议时，必须改为分析买点、卖点、触发条件、失效条件、仓位与风险，而不是下指令式代客决策。\n\
 - 任何涉及操作建议的回复，必须明确提醒：以下内容仅供分析参考，不要未经自己思考和风险评估就直接照做。\n\
@@ -26,6 +27,10 @@ pub const DEFAULT_CRON_TASK_POLICY: &str = "【定时任务 / 心跳任务策略
 - 对这种无明确时刻的条件型任务，必须先询问用户是否要创建“心跳检测”任务；心跳任务会每 30 分钟检查一次条件。\n\
 - 只有在用户明确同意后，才创建 repeat=heartbeat 的任务；heartbeat 任务建议带上 heartbeat 标签。\n\
 - 用户询问“我的所有定时任务”时，应把 heartbeat 任务也视为任务列表的一部分一并说明。";
+pub const DEFAULT_WEB_CRON_DELIVERY_POLICY: &str = "【Web 定时任务送达边界】\n\
+- 当前 Web 渠道的定时任务结果只保证写入当前 Hone 会话，并在网页在线且 SSE 连接存在时实时追加到页面。\n\
+- 当前没有 Web Push / 手机系统通知能力；不要承诺会出现在手机通知中心，也不要引导用户排查手机通知权限。\n\
+- 如果用户明确需要手机系统级提醒，应说明当前 Web 渠道不支持，并建议改用已配置的外部通知渠道。";
 pub const DEFAULT_COMPANY_PROFILE_POLICY: &str = "【公司画像 / 长期跟踪策略】\n\
 - 若用户正在系统研究某家公司，应优先检查当前 actor 用户空间下的 `company_profiles/` 是否已有该公司画像。\n\
 - 若用户问题明显依赖当前 actor 用户空间下的本地持久化信息，也应优先检查本地文件，例如 `company_profiles/`、`uploads/`、`runtime/` 产物或其它用户本地笔记；如果当前阶段暴露的是只读本地工具，应优先使用这些工具，而不是直接声称无法访问文件、历史或记忆。\n\
@@ -41,7 +46,7 @@ pub const DEFAULT_COMPANY_PROFILE_POLICY: &str = "【公司画像 / 长期跟踪
 - 只要用户正在研究某家公司，且本轮产出了值得长期复用的内容，就应主动帮用户沉淀到公司画像，不要等用户逐条要求；优先保留用户自己的看法、偏好或约束、你与用户此前已达成一致的判断逻辑，以及本轮形成的估值判断、估值区间或估值锚点。\n\
 - 画像不仅要保留“当前结论”，还应尽量保留“为什么这么判断”、关键证据、来源与本轮研究路径；若当前没有独立 research note 存储层，应把必要的 why / evidence / research trail 写入事件正文。\n\
 - 维护画像与事件时，默认使用用户当前对话语言；仅在用户明确要求或必须保留原始引用/术语时才局部保留其他语言。\n\
-- 主画像应优先维护 Thesis、用户视角与偏好、关键经营指标、估值框架与当前估值判断、风险台账与证伪条件；事件更新应围绕 thesis change log，而不是价格噪音。\n\
+- 主画像应优先维护投资主线、用户视角与偏好、关键经营指标、估值框架与当前估值判断、风险台账与证伪条件；事件更新应围绕投资主线变更日志，而不是价格噪音。\n\
 - 不要把公司画像写成流水账；已经过时或被新判断替代的内容，应直接在主画像正文中改写，而不是层层追加补丁式备注。\n\
 - 建档、更新和事件追加应优先使用 runner 原生文件读写能力完成，而不是依赖额外的专用 mutation 工具。\n\
 - 公司画像服务于长期基本面跟踪，不应用于日内盯盘、高频价格提醒或直接交易指令。
@@ -97,13 +102,13 @@ impl PromptBundle {
             sections.push(context.to_string());
         }
 
-        sections.push(format!("【本轮用户输入】\n{}", user_input.trim()));
-
         if let Some(session_context) =
             Some(self.session_context.trim()).filter(|value| !value.is_empty())
         {
             sections.push(session_context.to_string());
         }
+
+        sections.push(format!("【本轮用户输入】\n{}", user_input.trim()));
 
         sections.join("\n\n")
     }
@@ -313,6 +318,12 @@ mod tests {
                 .system_prompt()
                 .contains("保持分析逻辑、因果链和结论框架的连贯性")
         );
+        assert!(
+            bundle
+                .system_prompt()
+                .contains("本轮用户输入优先于历史摘要")
+        );
+        assert!(bundle.system_prompt().contains("不得调用 stock_research"));
         assert!(bundle.system_prompt().contains("原油与大宗商品归因约束"));
         assert!(bundle.system_prompt().contains("原因未核验/暂不归因"));
 
@@ -404,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn session_context_is_appended_after_current_turn_input() {
+    fn current_turn_input_is_last_after_session_context() {
         let data_dir = std::env::temp_dir().join(format!(
             "hone-prompt-session-order-{}-{}",
             std::process::id(),
@@ -434,9 +445,36 @@ mod tests {
             .find("【Session 上下文】")
             .expect("session section");
 
-        assert!(input_pos < session_pos);
+        assert!(session_pos < input_pos);
 
         let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn current_turn_input_is_last_after_historical_skill_context() {
+        let bundle = PromptBundle {
+            static_system: String::new(),
+            conversation_context: Some(
+                "【Invoked Skill Context】\nSkill: Stock Research (stock_research)\nLITE"
+                    .to_string(),
+            ),
+            session_context: "【Session 上下文】\n当前时间：2026-05-01 12:00:00".to_string(),
+        };
+
+        let composed = bundle.compose_user_input("AMD的电脑CPU是什么名字");
+        let skill_pos = composed
+            .find("Skill: Stock Research")
+            .expect("historical skill context");
+        let session_pos = composed
+            .find("【Session 上下文】")
+            .expect("session section");
+        let input_pos = composed
+            .find("【本轮用户输入】")
+            .expect("current input section");
+
+        assert!(skill_pos < input_pos);
+        assert!(session_pos < input_pos);
+        assert!(composed.ends_with("AMD的电脑CPU是什么名字"));
     }
 
     #[test]

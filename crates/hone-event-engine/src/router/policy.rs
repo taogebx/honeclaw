@@ -75,39 +75,30 @@ impl NotificationRouter {
         if matches!(sev, Severity::High) {
             return sev;
         }
-        if let Some(threshold_pct) = price_override_threshold(event, prefs) {
-            if matches!(event.kind, EventKind::PriceAlert { .. }) {
-                let pct = event
-                    .payload
-                    .get("changesPercentage")
-                    .and_then(|v| v.as_f64());
-                if let Some(p) = pct {
-                    let min_direct = self.price_min_direct_pct.max(0.0);
-                    let large_weight_threshold = prefs
-                        .large_position_weight_pct
-                        .unwrap_or(self.large_position_weight_pct);
-                    let is_large_position = event_position_weight_pct(event)
-                        .map(|w| w >= large_weight_threshold)
-                        .unwrap_or(false);
-                    let required = if is_large_position {
-                        threshold_pct
-                    } else {
-                        threshold_pct.max(min_direct)
-                    };
-                    if p.abs() >= required {
-                        return Severity::High;
-                    }
-                }
+        if let Some(threshold_pct) = price_override_threshold(event, prefs)
+            && matches!(event.kind, EventKind::PriceAlert { .. })
+            && let Some(change_pct) = price_alert_change_pct(event)
+        {
+            let min_direct = self.price_min_direct_pct.max(0.0);
+            let large_weight_threshold = prefs
+                .large_position_weight_pct
+                .unwrap_or(self.large_position_weight_pct);
+            let is_large_position = event_position_weight_pct(event)
+                .map(|weight| weight >= large_weight_threshold)
+                .unwrap_or(false);
+            let required = if is_large_position {
+                threshold_pct
+            } else {
+                threshold_pct.max(min_direct)
+            };
+            if change_pct.abs() >= required {
+                return Severity::High;
             }
         }
         if let Some(kinds) = prefs.immediate_kinds.as_deref() {
             let tag = kind_tag(&event.kind);
             if kinds.iter().any(|k| k == tag) {
-                if matches!(
-                    event.kind,
-                    EventKind::NewsCritical | EventKind::PressRelease
-                ) && matches!(sev, Severity::Low)
-                {
+                if matches!(event.kind, EventKind::NewsCritical) && matches!(sev, Severity::Low) {
                     tracing::info!(
                         event_id = %event.id,
                         kind = %tag,
@@ -167,6 +158,13 @@ fn price_override_threshold(event: &MarketEvent, prefs: &NotificationPrefs) -> O
             .or(prefs.price_high_pct_override),
         None => prefs.price_high_pct_override,
     }
+}
+
+fn price_alert_change_pct(event: &MarketEvent) -> Option<f64> {
+    event
+        .payload
+        .get("changesPercentage")
+        .and_then(|value| value.as_f64())
 }
 
 fn event_position_weight_pct(event: &MarketEvent) -> Option<f64> {
@@ -239,19 +237,15 @@ fn is_legal_ad_event(event: &MarketEvent) -> bool {
 
 pub(super) fn event_category(event: &MarketEvent) -> &'static str {
     match event.kind {
-        EventKind::PriceAlert { .. }
-        | EventKind::Weekly52High
-        | EventKind::Weekly52Low
-        | EventKind::VolumeSpike => "price",
-        EventKind::NewsCritical | EventKind::PressRelease | EventKind::SocialPost => "news",
+        EventKind::PriceAlert { .. } | EventKind::Weekly52High | EventKind::Weekly52Low => "price",
+        EventKind::NewsCritical | EventKind::SocialPost => "news",
         EventKind::SecFiling { .. } => "filing",
         EventKind::EarningsUpcoming
         | EventKind::EarningsReleased
         | EventKind::EarningsCallTranscript => "earnings",
         EventKind::MacroEvent => "macro",
-        EventKind::Dividend | EventKind::Split | EventKind::Buyback => "corp_action",
+        EventKind::Dividend | EventKind::Split => "corp_action",
         EventKind::AnalystGrade => "analyst",
-        EventKind::PortfolioPreMarket | EventKind::PortfolioPostMarket => "portfolio",
     }
 }
 

@@ -16,6 +16,7 @@ use hone_event_engine::prefs::{
     ALL_KIND_TAGS, FilePrefsStorage, NotificationPrefs, PrefsProvider, QuietHours,
     first_invalid_kind_tag,
 };
+use hone_event_engine::unified_digest::DigestSlot;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -25,10 +26,9 @@ pub struct NotificationPrefsTool {
     prefs_dir: PathBuf,
     actor: Option<ActorIdentity>,
     /// `get_overview` 聚合视图所需的上下文。HoneBotCore 构造时必传,
-    /// 保证用户问「我的推送怎么配的」时拿到的是含 cron + 全局 digest 的完整表格。
+    /// 保证用户问「我的推送怎么配的」时拿到的是含 cron + unified digest 的完整表格。
     cron_jobs_dir: PathBuf,
-    global_digest: crate::schedule_view::GlobalDigestSlice,
-    portfolio_defaults: crate::schedule_view::PortfolioDigestDefaults,
+    digest_defaults: crate::schedule_view::DigestDefaults,
 }
 
 impl NotificationPrefsTool {
@@ -36,15 +36,13 @@ impl NotificationPrefsTool {
         prefs_dir: impl Into<PathBuf>,
         actor: Option<ActorIdentity>,
         cron_jobs_dir: impl Into<PathBuf>,
-        global_digest: crate::schedule_view::GlobalDigestSlice,
-        portfolio_defaults: crate::schedule_view::PortfolioDigestDefaults,
+        digest_defaults: crate::schedule_view::DigestDefaults,
     ) -> Self {
         Self {
             prefs_dir: prefs_dir.into(),
             actor,
             cron_jobs_dir: cron_jobs_dir.into(),
-            global_digest,
-            portfolio_defaults,
+            digest_defaults,
         }
     }
 
@@ -72,21 +70,21 @@ fn parse_severity(raw: &str) -> HoneResult<Severity> {
 }
 
 fn extract_string_array(value: &Value) -> HoneResult<Vec<String>> {
-    let arr = value.as_array().ok_or_else(|| {
-        HoneError::Tool("value 必须是字符串数组,例如 [\"news_critical\",\"press_release\"]".into())
+    let string_values = value.as_array().ok_or_else(|| {
+        HoneError::Tool("value 必须是字符串数组,例如 [\"news_critical\",\"sec_filing\"]".into())
     })?;
-    let mut out = Vec::with_capacity(arr.len());
-    for item in arr {
-        let s = item
+    let mut strings = Vec::with_capacity(string_values.len());
+    for string_value in string_values {
+        let tag = string_value
             .as_str()
             .ok_or_else(|| HoneError::Tool("kind tag 列表里出现非字符串元素".into()))?
             .trim()
             .to_string();
-        if !s.is_empty() {
-            out.push(s);
+        if !tag.is_empty() {
+            strings.push(tag);
         }
     }
-    Ok(out)
+    Ok(strings)
 }
 
 fn validate_tags(tags: &[String]) -> HoneResult<()> {
@@ -117,30 +115,17 @@ fn prefs_to_json(prefs: &NotificationPrefs) -> Value {
         "allow_kinds": prefs.allow_kinds,
         "blocked_kinds": prefs.blocked_kinds,
         "timezone": prefs.timezone,
-        "digest_windows": prefs.digest_windows,
+        "digest_slots": prefs.digest_slots,
         "price_high_pct_override": prefs.price_high_pct_override,
         "immediate_kinds": prefs.immediate_kinds,
-        "global_digest_enabled": prefs.global_digest_enabled,
-        "investment_global_style": prefs.investment_global_style,
-        "investment_theses": prefs.investment_theses,
-        "global_digest_floor_macro_picks": prefs.global_digest_floor_macro_picks,
+        "mainline_style": prefs.mainline_style,
+        "mainline_by_ticker": prefs.mainline_by_ticker,
         "quiet_hours": prefs.quiet_hours.as_ref().map(|qh| json!({
             "from": qh.from,
             "to": qh.to,
             "exempt_kinds": qh.exempt_kinds,
         })),
     })
-}
-
-fn parse_bool_flag(value: &Value, action: &str) -> HoneResult<bool> {
-    match value {
-        Value::Bool(b) => Ok(*b),
-        Value::String(s) => Ok(matches!(
-            s.trim().to_ascii_lowercase().as_str(),
-            "true" | "1" | "yes" | "on"
-        )),
-        _ => Err(HoneError::Tool(format!("{action} 需要 true/false"))),
-    }
 }
 
 #[async_trait]
@@ -155,11 +140,9 @@ impl Tool for NotificationPrefsTool {
          set_portfolio_only 只推持仓相关、allow_kinds 设置白名单、block_kinds 设置黑名单、\
          clear_allow/clear_block 清空对应列表、reset 恢复默认。\
          per-actor 推送节奏:set_timezone 设本人 IANA 时区(如 Asia/Shanghai、America/New_York)、\
-         set_digest_windows 设本地 HH:MM 摘要时刻列表(传 [] 则关 digest)、\
+         set_digest_slots 设 digest 触发槽位(传 HH:MM 数组,每个时刻自动建一个 default slot;传 [] 关 digest)、\
          set_price_high_pct 调价格异动即时推阈值 (0<x≤50,如 3.5)、\
          set_immediate_kinds 指定哪些 kind 强制升 High 即时推。\
-         全局要闻 digest:set_global_digest_enabled 开关、\
-         set_macro_floor_picks 设置宏观料底线条数(0-5)。\
          **概览类问题**(用户问\"我的推送怎么配的\"/\"推送日程\"/\"都什么时候推什么\"/\"quiet 设了没\"等):\
          调 get_overview 拿到拍平后的全部推送时刻 + 即时推配置 + quiet_hours,返回里有 display_text \
          字段已经按调用方所在渠道(Discord 用代码块表 / Telegram 用 <pre> / Feishu+iMessage 用列表)\
@@ -167,17 +150,16 @@ impl Tool for NotificationPrefsTool {
          勿扰时段(quiet_hours):set_quiet_hours 传 {from:\"23:00\", to:\"07:00\", exempt_kinds?:[...]} \
          在区间内 hold 一切 immediate 推送 + 跳过 digest 触发,到 to 时刻把 hold 住的事件 + \
          buffer 累积的 Medium/Low 合并成一条早间合集发出;过保鲜期事件直接 drop \
-         (PriceAlert/VolumeSpike 2h, Weekly52 8h, Social 12h, 其它事实性事件不过期)。\
+         (PriceAlert 2h, Weekly52 8h, Social 12h, 其它事实性事件不过期)。\
          exempt_kinds 命中的 kind 即使在 quiet 内仍立即推(例如想财报夜里也响:[\"earnings_released\"])。\
          clear_quiet_hours 关掉勿扰。\
          **注意**:每只持仓的 thesis 与整体 investment_style 现在由系统每周自动从用户\
          自己写的公司画像(走 company_portrait skill)蒸馏,**不再支持手动通过本工具编辑**。\
          若用户问\"为什么我的 thesis 是 X / 想改 Y\",指引他更新对应公司画像即可,\
          系统会在下次蒸馏(默认 7 天周期)自动反映。\
-         kind tag 必须选自:earnings_upcoming / earnings_released / news_critical / \
-         press_release / price_alert / weekly52_high / weekly52_low / volume_spike / \
-         dividend / split / buyback / sec_filing / analyst_grade / macro_event / \
-         portfolio_pre_market / portfolio_post_market。"
+         kind tag 必须选自:earnings_upcoming / earnings_released / earnings_call_transcript / \
+         news_critical / price_alert / weekly52_high / weekly52_low / dividend / split / \
+         sec_filing / analyst_grade / macro_event / social_post。"
     }
 
     fn parameters(&self) -> Vec<ToolParameter> {
@@ -198,11 +180,9 @@ impl Tool for NotificationPrefsTool {
                     "clear_allow".into(),
                     "clear_block".into(),
                     "set_timezone".into(),
-                    "set_digest_windows".into(),
+                    "set_digest_slots".into(),
                     "set_price_high_pct".into(),
                     "set_immediate_kinds".into(),
-                    "set_global_digest_enabled".into(),
-                    "set_macro_floor_picks".into(),
                     "set_quiet_hours".into(),
                     "clear_quiet_hours".into(),
                     "get_overview".into(),
@@ -218,10 +198,8 @@ impl Tool for NotificationPrefsTool {
                     set_portfolio_only 传 true/false;\
                     allow_kinds/block_kinds/set_immediate_kinds 传 JSON 数组 (例 [\"news_critical\"]);\
                     set_timezone 传 IANA 名 (例 \"Asia/Shanghai\");\
-                    set_digest_windows 传 HH:MM 数组 (例 [\"19:00\",\"02:30\",\"09:00\"],空数组关 digest);\
+                    set_digest_slots 传 HH:MM 数组 (例 [\"19:00\",\"02:30\",\"09:00\"],空数组关 digest);\
                     set_price_high_pct 传数字 (0<x≤50,例 3.5);\
-                    set_global_digest_enabled 传 true/false;\
-                    set_macro_floor_picks 传整数 0-5 (默认 1);\
                     set_quiet_hours 传 JSON 对象 {\"from\":\"HH:MM\", \"to\":\"HH:MM\", \"exempt_kinds\":[\"earnings_released\", ...]} (exempt_kinds 可省);\
                     clear_quiet_hours 不需要 value。\
                     get/clear_allow/clear_block/enable/disable/reset 不需要 value。"
@@ -249,16 +227,15 @@ impl Tool for NotificationPrefsTool {
                 return Ok(json!({ "status": "ok", "prefs": prefs_to_json(&prefs) }));
             }
             "get_overview" => {
-                // 拿全部推送时刻拍平视图:持仓 digest / 全局 digest / cron / 即时推 / quiet_hours。
-                // 构造时已强制注入 cron_jobs_dir + global_digest + portfolio_defaults,这里直接组装。
+                // 拿全部推送时刻拍平视图:unified digest slots / cron / 即时推 / quiet_hours。
+                // 构造时已强制注入 cron_jobs_dir + digest_defaults,这里直接组装。
                 // 渲染按 actor.channel 选格式:Discord/Telegram 用 monospace 代码块表,
                 // Feishu/iMessage 用项目符号列表(后两者不支持 markdown/HTML)。
                 let overview = crate::schedule_view::build_overview(
                     &self.prefs_dir,
                     &self.cron_jobs_dir,
                     &actor,
-                    &self.global_digest,
-                    &self.portfolio_defaults,
+                    &self.digest_defaults,
                     chrono::Utc::now(),
                 )
                 .map_err(|e| HoneError::Tool(format!("聚合推送日程失败: {e}")))?;
@@ -331,26 +308,52 @@ impl Tool for NotificationPrefsTool {
                     prefs.timezone = Some(trimmed.to_string());
                 }
             }
-            "set_digest_windows" => {
-                let arr = value.as_array().ok_or_else(|| {
+            "set_digest_slots" => {
+                let slot_values = value.as_array().ok_or_else(|| {
                     HoneError::Tool(
-                        "set_digest_windows 需要 HH:MM 字符串数组,例 [\"19:00\",\"09:00\"];传 [] 关 digest".into(),
+                        "set_digest_slots 需要 HH:MM 字符串数组,例 [\"19:00\",\"09:00\"];传 [] 关 digest".into(),
                     )
                 })?;
-                let mut wins: Vec<String> = Vec::with_capacity(arr.len());
-                for item in arr {
-                    let s = item
+                let mut slots: Vec<DigestSlot> = Vec::with_capacity(slot_values.len());
+                for (idx, slot_value) in slot_values.iter().enumerate() {
+                    let slot_time = slot_value
                         .as_str()
-                        .ok_or_else(|| HoneError::Tool("digest_windows 元素必须是字符串".into()))?
+                        .ok_or_else(|| {
+                            HoneError::Tool("digest_slots 元素必须是 HH:MM 字符串".into())
+                        })?
                         .trim()
                         .to_string();
-                    if s.is_empty() {
+                    if slot_time.is_empty() {
                         continue;
                     }
-                    validate_hhmm(&s)?;
-                    wins.push(s);
+                    validate_hhmm(&slot_time)?;
+                    slots.push(DigestSlot {
+                        id: format!("slot_{idx}"),
+                        time: slot_time,
+                        label: None,
+                        floor_macro: None,
+                    });
                 }
-                prefs.digest_windows = Some(wins);
+                // 任何 slot 落在现有 quiet_hours 内都会被 scheduler 让位给
+                // quiet_flush,等于 digest slot 配置静默失效。这里 hard error,
+                // 逼 LLM 自动改时间或先 clear_quiet_hours。
+                if let Some(qh) = prefs.quiet_hours.as_ref() {
+                    let blocked_slots: Vec<String> = slots
+                        .iter()
+                        .filter(|slot| crate::schedule_view::time_in_quiet(&slot.time, Some(qh)))
+                        .map(|slot| slot.time.clone())
+                        .collect();
+                    if !blocked_slots.is_empty() {
+                        return Err(HoneError::Tool(format!(
+                            "digest slot 时间 [{}] 落在 quiet_hours {}–{} 内,scheduler 不会触发;\
+                             改 slot 时间或先 clear_quiet_hours / 缩短 quiet 区间。",
+                            blocked_slots.join(", "),
+                            qh.from,
+                            qh.to,
+                        )));
+                    }
+                }
+                prefs.digest_slots = Some(slots);
             }
             "set_price_high_pct" => {
                 let pct = match &value {
@@ -377,37 +380,20 @@ impl Tool for NotificationPrefsTool {
                 validate_tags(&tags)?;
                 prefs.immediate_kinds = if tags.is_empty() { None } else { Some(tags) };
             }
-            "set_global_digest_enabled" => {
-                prefs.global_digest_enabled = parse_bool_flag(&value, "set_global_digest_enabled")?;
-            }
-            "set_macro_floor_picks" => {
-                let n = match &value {
-                    Value::Number(n) => n.as_u64(),
-                    Value::String(s) => s.trim().parse::<u64>().ok(),
-                    _ => None,
-                }
-                .ok_or_else(|| HoneError::Tool("set_macro_floor_picks 需要整数 (0-5)".into()))?;
-                if n > 5 {
-                    return Err(HoneError::Tool(format!(
-                        "macro_floor_picks 必须在 [0, 5] 范围,收到 {n}"
-                    )));
-                }
-                prefs.global_digest_floor_macro_picks = n as u32;
-            }
             "set_quiet_hours" => {
-                let obj = value.as_object().ok_or_else(|| {
+                let quiet_hours_object = value.as_object().ok_or_else(|| {
                     HoneError::Tool(
                         "set_quiet_hours 需要对象 {from, to, exempt_kinds?},例 {\"from\":\"23:00\",\"to\":\"07:00\"}"
                             .into(),
                     )
                 })?;
-                let from = obj
+                let from = quiet_hours_object
                     .get("from")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| HoneError::Tool("set_quiet_hours 缺少 from (HH:MM)".into()))?
                     .trim()
                     .to_string();
-                let to = obj
+                let to = quiet_hours_object
                     .get("to")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| HoneError::Tool("set_quiet_hours 缺少 to (HH:MM)".into()))?
@@ -421,16 +407,35 @@ impl Tool for NotificationPrefsTool {
                             .into(),
                     ));
                 }
-                let exempt_kinds: Vec<String> = match obj.get("exempt_kinds") {
+                let exempt_kinds: Vec<String> = match quiet_hours_object.get("exempt_kinds") {
                     Some(v) if !v.is_null() => extract_string_array(v)?,
                     _ => Vec::new(),
                 };
                 validate_tags(&exempt_kinds)?;
-                prefs.quiet_hours = Some(QuietHours {
-                    from,
-                    to,
-                    exempt_kinds,
-                });
+                // 反向校验:新 quiet 区间会吞掉现有 digest_slots(同样会被 scheduler 跳过),
+                // 报错让用户先调 slot。
+                let candidate = QuietHours {
+                    from: from.clone(),
+                    to: to.clone(),
+                    exempt_kinds: exempt_kinds.clone(),
+                };
+                if let Some(slots) = prefs.digest_slots.as_ref() {
+                    let bad: Vec<String> = slots
+                        .iter()
+                        .filter(|s| crate::schedule_view::time_in_quiet(&s.time, Some(&candidate)))
+                        .map(|s| s.time.clone())
+                        .collect();
+                    if !bad.is_empty() {
+                        return Err(HoneError::Tool(format!(
+                            "新 quiet_hours {}–{} 会吞掉现有 digest slot [{}],它们将不再触发;\
+                             请先 set_digest_slots 调整时间,或缩短 quiet 区间。",
+                            from,
+                            to,
+                            bad.join(", "),
+                        )));
+                    }
+                }
+                prefs.quiet_hours = Some(candidate);
             }
             "clear_quiet_hours" => {
                 prefs.quiet_hours = None;
@@ -463,14 +468,17 @@ mod tests {
             dir.to_path_buf(),
             Some(actor),
             cron_dir,
-            crate::schedule_view::GlobalDigestSlice {
-                enabled: true,
-                timezone: "Asia/Shanghai".into(),
-                schedules: vec!["07:30".into(), "21:00".into()],
-            },
-            crate::schedule_view::PortfolioDigestDefaults {
-                pre_market: "08:30".into(),
-                post_market: "09:00".into(),
+            crate::schedule_view::DigestDefaults {
+                slots: vec![
+                    crate::schedule_view::DigestDefaultSlot {
+                        time: "08:30".into(),
+                        label: Some("盘前摘要".into()),
+                    },
+                    crate::schedule_view::DigestDefaultSlot {
+                        time: "09:00".into(),
+                        label: Some("晨间摘要".into()),
+                    },
+                ],
             },
         )
     }
@@ -530,7 +538,7 @@ mod tests {
         .unwrap();
         tool.execute(json!({
             "action": "block_kinds",
-            "value": ["press_release"]
+            "value": ["social_post"]
         }))
         .await
         .unwrap();
@@ -539,7 +547,7 @@ mod tests {
             out["prefs"]["allow_kinds"],
             json!(["earnings_released", "sec_filing"])
         );
-        assert_eq!(out["prefs"]["blocked_kinds"], json!(["press_release"]));
+        assert_eq!(out["prefs"]["blocked_kinds"], json!(["social_post"]));
     }
 
     #[tokio::test]
@@ -599,24 +607,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_digest_windows_round_trips_and_validates_format() {
+    async fn set_digest_slots_round_trips_and_validates_format() {
         let dir = tempdir().unwrap();
         let tool = mk(dir.path());
         tool.execute(json!({
-            "action": "set_digest_windows",
+            "action": "set_digest_slots",
             "value": ["19:00", "02:30", "09:00"]
         }))
         .await
         .unwrap();
         let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(
-            out["prefs"]["digest_windows"],
-            json!(["19:00", "02:30", "09:00"])
-        );
+        let times: Vec<String> = out["prefs"]["digest_slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["time"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(times, vec!["19:00", "02:30", "09:00"]);
 
         // 非法格式被拒
         let err = tool
-            .execute(json!({"action":"set_digest_windows","value":["25:99"]}))
+            .execute(json!({"action":"set_digest_slots","value":["25:99"]}))
             .await
             .unwrap_err();
         match err {
@@ -625,11 +636,11 @@ mod tests {
         }
 
         // 空数组允许 = 关 digest
-        tool.execute(json!({"action":"set_digest_windows","value":[]}))
+        tool.execute(json!({"action":"set_digest_slots","value":[]}))
             .await
             .unwrap();
         let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["digest_windows"], json!([]));
+        assert_eq!(out["prefs"]["digest_slots"], json!([]));
     }
 
     #[tokio::test]
@@ -699,63 +710,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_global_digest_enabled_round_trips() {
-        let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
-        // 默认为 true
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["global_digest_enabled"], json!(true));
-
-        tool.execute(json!({"action":"set_global_digest_enabled","value":false}))
-            .await
-            .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["global_digest_enabled"], json!(false));
-
-        // 字符串形式也接受
-        tool.execute(json!({"action":"set_global_digest_enabled","value":"true"}))
-            .await
-            .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["global_digest_enabled"], json!(true));
-    }
-
-    #[tokio::test]
-    async fn set_macro_floor_picks_validates_range() {
-        let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
-        tool.execute(json!({"action":"set_macro_floor_picks","value":3}))
-            .await
-            .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["global_digest_floor_macro_picks"], json!(3));
-
-        // 0 合法(关闭 floor)
-        tool.execute(json!({"action":"set_macro_floor_picks","value":0}))
-            .await
-            .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["global_digest_floor_macro_picks"], json!(0));
-
-        // 超过 5 拒绝
-        let err = tool
-            .execute(json!({"action":"set_macro_floor_picks","value":99}))
-            .await
-            .unwrap_err();
-        match err {
-            HoneError::Tool(msg) => assert!(msg.contains("[0, 5]"), "msg={msg}"),
-            other => panic!("unexpected err {other:?}"),
-        }
-
-        // 字符串数字也接受
-        tool.execute(json!({"action":"set_macro_floor_picks","value":"2"}))
-            .await
-            .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["global_digest_floor_macro_picks"], json!(2));
-    }
-
-    #[tokio::test]
     async fn missing_actor_is_rejected() {
         let dir = tempdir().unwrap();
         let cron_dir = dir.path().join("__test_cron__");
@@ -764,14 +718,17 @@ mod tests {
             dir.path().to_path_buf(),
             None,
             cron_dir,
-            crate::schedule_view::GlobalDigestSlice {
-                enabled: false,
-                timezone: "Asia/Shanghai".into(),
-                schedules: vec![],
-            },
-            crate::schedule_view::PortfolioDigestDefaults {
-                pre_market: "08:30".into(),
-                post_market: "09:00".into(),
+            crate::schedule_view::DigestDefaults {
+                slots: vec![
+                    crate::schedule_view::DigestDefaultSlot {
+                        time: "08:30".into(),
+                        label: Some("盘前摘要".into()),
+                    },
+                    crate::schedule_view::DigestDefaultSlot {
+                        time: "09:00".into(),
+                        label: Some("晨间摘要".into()),
+                    },
+                ],
             },
         );
         let err = tool.execute(json!({"action":"get"})).await.unwrap_err();
@@ -870,7 +827,10 @@ mod tests {
         let dir = tempdir().unwrap();
         // mk() 用的是 telegram actor → display_text 应是 <pre> 包的等宽块
         let tool = mk(dir.path());
-        let out = tool.execute(json!({"action":"get_overview"})).await.unwrap();
+        let out = tool
+            .execute(json!({"action":"get_overview"}))
+            .await
+            .unwrap();
         assert_eq!(out["status"], json!("ok"));
         let txt = out["display_text"].as_str().expect("display_text");
         assert!(txt.contains("你的推送日程"));
@@ -881,7 +841,7 @@ mod tests {
         assert!(!txt.contains("| --- |"));
         assert_eq!(out["render_format"], json!("TelegramHtml"));
         let entries = out["overview"]["schedule"].as_array().unwrap();
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 2);
     }
 
     #[tokio::test]
@@ -894,17 +854,23 @@ mod tests {
             dir.path().to_path_buf(),
             Some(actor),
             cron_dir,
-            crate::schedule_view::GlobalDigestSlice {
-                enabled: true,
-                timezone: "Asia/Shanghai".into(),
-                schedules: vec!["07:30".into(), "21:00".into()],
-            },
-            crate::schedule_view::PortfolioDigestDefaults {
-                pre_market: "08:30".into(),
-                post_market: "09:00".into(),
+            crate::schedule_view::DigestDefaults {
+                slots: vec![
+                    crate::schedule_view::DigestDefaultSlot {
+                        time: "08:30".into(),
+                        label: Some("盘前摘要".into()),
+                    },
+                    crate::schedule_view::DigestDefaultSlot {
+                        time: "09:00".into(),
+                        label: Some("晨间摘要".into()),
+                    },
+                ],
             },
         );
-        let out = tool.execute(json!({"action":"get_overview"})).await.unwrap();
+        let out = tool
+            .execute(json!({"action":"get_overview"}))
+            .await
+            .unwrap();
         let txt = out["display_text"].as_str().unwrap();
         assert!(txt.contains("```"), "discord 应用代码块: {txt}");
         assert!(!txt.contains("<pre>"));
@@ -921,17 +887,23 @@ mod tests {
             dir.path().to_path_buf(),
             Some(actor),
             cron_dir,
-            crate::schedule_view::GlobalDigestSlice {
-                enabled: true,
-                timezone: "Asia/Shanghai".into(),
-                schedules: vec!["07:30".into(), "21:00".into()],
-            },
-            crate::schedule_view::PortfolioDigestDefaults {
-                pre_market: "08:30".into(),
-                post_market: "09:00".into(),
+            crate::schedule_view::DigestDefaults {
+                slots: vec![
+                    crate::schedule_view::DigestDefaultSlot {
+                        time: "08:30".into(),
+                        label: Some("盘前摘要".into()),
+                    },
+                    crate::schedule_view::DigestDefaultSlot {
+                        time: "09:00".into(),
+                        label: Some("晨间摘要".into()),
+                    },
+                ],
             },
         );
-        let out = tool.execute(json!({"action":"get_overview"})).await.unwrap();
+        let out = tool
+            .execute(json!({"action":"get_overview"}))
+            .await
+            .unwrap();
         let txt = out["display_text"].as_str().unwrap();
         assert!(!txt.contains("```"));
         assert!(!txt.contains("<pre>"));
@@ -954,5 +926,109 @@ mod tests {
             .unwrap();
         let out = tool.execute(json!({"action":"get"})).await.unwrap();
         assert_eq!(out["prefs"]["quiet_hours"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn set_digest_slots_rejects_slot_inside_existing_quiet() {
+        let dir = tempdir().unwrap();
+        let tool = mk(dir.path());
+        tool.execute(json!({
+            "action": "set_quiet_hours",
+            "value": { "from": "00:00", "to": "08:00" },
+        }))
+        .await
+        .unwrap();
+        let err = tool
+            .execute(json!({
+                "action": "set_digest_slots",
+                "value": ["02:30", "09:00"]
+            }))
+            .await
+            .unwrap_err();
+        match err {
+            HoneError::Tool(msg) => {
+                assert!(msg.contains("02:30"), "msg={msg}");
+                assert!(msg.contains("quiet_hours"), "msg={msg}");
+            }
+            other => panic!("unexpected err {other:?}"),
+        }
+        // 落盘的 slots 应保持未变(default 即 None)
+        let out = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(out["prefs"]["digest_slots"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn set_digest_slots_outside_quiet_succeeds() {
+        let dir = tempdir().unwrap();
+        let tool = mk(dir.path());
+        tool.execute(json!({
+            "action": "set_quiet_hours",
+            "value": { "from": "00:00", "to": "08:00" },
+        }))
+        .await
+        .unwrap();
+        tool.execute(json!({
+            "action": "set_digest_slots",
+            "value": ["09:00", "19:00"]
+        }))
+        .await
+        .unwrap();
+        let out = tool.execute(json!({"action":"get"})).await.unwrap();
+        let times: Vec<String> = out["prefs"]["digest_slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["time"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(times, vec!["09:00", "19:00"]);
+    }
+
+    #[tokio::test]
+    async fn set_quiet_hours_rejects_when_existing_slot_falls_in() {
+        let dir = tempdir().unwrap();
+        let tool = mk(dir.path());
+        tool.execute(json!({
+            "action": "set_digest_slots",
+            "value": ["02:30", "09:00"]
+        }))
+        .await
+        .unwrap();
+        let err = tool
+            .execute(json!({
+                "action": "set_quiet_hours",
+                "value": { "from": "00:00", "to": "08:00" },
+            }))
+            .await
+            .unwrap_err();
+        match err {
+            HoneError::Tool(msg) => {
+                assert!(msg.contains("吞掉"), "msg={msg}");
+                assert!(msg.contains("02:30"), "msg={msg}");
+            }
+            other => panic!("unexpected err {other:?}"),
+        }
+        // quiet 没落盘
+        let out = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(out["prefs"]["quiet_hours"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn set_quiet_hours_safe_when_no_slot_overlap() {
+        let dir = tempdir().unwrap();
+        let tool = mk(dir.path());
+        tool.execute(json!({
+            "action": "set_digest_slots",
+            "value": ["09:00", "19:00"]
+        }))
+        .await
+        .unwrap();
+        tool.execute(json!({
+            "action": "set_quiet_hours",
+            "value": { "from": "23:00", "to": "07:00" },
+        }))
+        .await
+        .unwrap();
+        let out = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(out["prefs"]["quiet_hours"]["from"], json!("23:00"));
     }
 }

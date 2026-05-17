@@ -19,9 +19,9 @@ pub mod types;
 
 pub use history::ExecutionFilter;
 pub use types::{
-    CronJob, CronJobData, CronJobExecutionInput, CronJobExecutionRecord, CronJobUpdate,
-    CronSchedule, MAX_ENABLED_JOBS_PER_ACTOR, PendingUpdate, cron_enabled_limit_error,
-    is_cron_enabled_limit_error,
+    ChannelTargetRecord, CronJob, CronJobData, CronJobExecutionInput, CronJobExecutionRecord,
+    CronJobUpdate, CronSchedule, MAX_ENABLED_JOBS_PER_ACTOR, PendingUpdate,
+    cron_enabled_limit_error, is_cron_enabled_limit_error,
 };
 
 /// 定时任务存储管理器
@@ -134,6 +134,101 @@ mod tests {
             false,
         );
         assert_eq!(bad_weekly["success"], false);
+    }
+
+    #[test]
+    fn add_job_rejects_empty_channel_target() {
+        let dir = make_temp_dir("hone_cron_storage_empty_target");
+        let storage = CronJobStorage::new(&dir);
+        let actor = actor("telegram", "user_1", None);
+
+        let result = storage.add_job(
+            &actor,
+            "missing target",
+            Some(9),
+            Some(0),
+            "daily",
+            "task",
+            "   ",
+            None,
+            None,
+            None,
+            true,
+            None,
+            false,
+        );
+
+        assert_eq!(result["success"], false);
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("channel_target 不能为空")
+        );
+        assert!(storage.list_jobs(&actor).is_empty());
+    }
+
+    #[test]
+    fn channel_target_directory_aggregates_jobs_and_execution_history() {
+        let dir = make_temp_dir("hone_cron_storage_target_directory");
+        let sqlite_path = dir.join("sessions.sqlite3");
+        let storage = CronJobStorage::with_sqlite(&dir, &sqlite_path);
+        let actor = actor("telegram", "user_1", Some("g:1:c:2"));
+
+        let add = storage.add_job(
+            &actor,
+            "group heartbeat",
+            Some(9),
+            Some(0),
+            "heartbeat",
+            "task",
+            "-100123",
+            None,
+            None,
+            None,
+            true,
+            None,
+            false,
+        );
+        assert_eq!(add["success"], true);
+        let job_id = add["job"]["id"].as_str().unwrap_or_default();
+
+        storage
+            .record_execution_event(
+                &actor,
+                job_id,
+                "group heartbeat",
+                "-100123",
+                true,
+                CronJobExecutionInput {
+                    execution_status: "completed".to_string(),
+                    message_send_status: "sent".to_string(),
+                    should_deliver: true,
+                    delivered: true,
+                    response_preview: Some("ok".to_string()),
+                    error_message: None,
+                    detail: serde_json::json!({"delivery_key": "target-directory-test"}),
+                },
+            )
+            .expect("record execution");
+
+        let targets = storage.list_channel_targets();
+        let target = targets
+            .iter()
+            .find(|target| target.target == "-100123")
+            .expect("target should be discoverable");
+        assert_eq!(target.channel, "telegram");
+        assert_eq!(target.channel_scope.as_deref(), Some("g:1:c:2"));
+        assert_eq!(target.scheduled_jobs, 1);
+        assert_eq!(target.enabled_jobs, 1);
+        assert!(target.sources.iter().any(|source| source == "cron_job"));
+        assert!(
+            target
+                .sources
+                .iter()
+                .any(|source| source == "cron_execution")
+        );
+        assert!(target.actor_user_ids.iter().any(|user| user == "user_1"));
     }
 
     #[test]
@@ -608,13 +703,14 @@ mod tests {
     }
 
     #[test]
-    fn due_jobs_skip_existing_prompt_schedule_time_mismatch() {
+    fn due_jobs_repair_existing_prompt_schedule_time_mismatch() {
         let dir = make_temp_dir("hone_cron_storage_prompt_mismatch_due");
         let storage = CronJobStorage::new(&dir);
         let actor = actor("feishu", "ou_real", None);
         let now_bj = chrono::Utc::now().with_timezone(&beijing_offset());
         let hour = now_bj.hour() as u32;
         let minute = now_bj.minute() as u32;
+        let stale_hour = (hour + 1) % 24;
 
         let data = CronJobData {
             actor: Some(actor.clone()),
@@ -623,13 +719,13 @@ mod tests {
                 id: "j_mismatch".to_string(),
                 name: "错配任务".to_string(),
                 schedule: CronSchedule {
-                    hour,
+                    hour: stale_hour,
                     minute,
                     repeat: "daily".to_string(),
                     weekday: None,
                     date: None,
                 },
-                task_prompt: "【触发时间】每天 20:45\n执行任务".to_string(),
+                task_prompt: format!("【触发时间】每天 {hour:02}:{minute:02}\n执行任务"),
                 push: serde_json::json!({"type": "analysis"}),
                 enabled: true,
                 channel: "feishu".to_string(),
@@ -650,7 +746,23 @@ mod tests {
             now_bj.weekday().num_days_from_monday(),
             &["feishu"],
         );
-        assert!(due.is_empty());
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1.id, "j_mismatch");
+        assert_eq!(
+            (due[0].1.schedule.hour, due[0].1.schedule.minute),
+            (hour, minute)
+        );
+
+        let saved = storage.load_jobs(&actor);
+        let repaired = saved
+            .jobs
+            .into_iter()
+            .find(|job| job.id == "j_mismatch")
+            .expect("repaired job");
+        assert_eq!(
+            (repaired.schedule.hour, repaired.schedule.minute),
+            (hour, minute)
+        );
     }
 
     #[test]
@@ -810,5 +922,499 @@ mod tests {
         assert!(records[0].delivered);
         assert_eq!(records[0].response_preview.as_deref(), Some("final report"));
         assert_eq!(records[0].detail["phase"], "terminal");
+    }
+
+    #[test]
+    fn stale_started_rows_can_be_recovered_as_failed() {
+        let dir = make_temp_dir("hone_cron_storage_interrupted_pending");
+        let sqlite_path = dir.join("sessions.sqlite3");
+        let storage = CronJobStorage::with_sqlite(&dir, &sqlite_path);
+        let feishu_actor = actor("feishu", "ou_interrupted", None);
+        let discord_actor = actor("discord", "du_interrupted", None);
+
+        for (actor, job_id, channel_target, phase) in [
+            (
+                &feishu_actor,
+                "j_feishu_started",
+                "ou_interrupted",
+                "started",
+            ),
+            (
+                &feishu_actor,
+                "j_feishu_other",
+                "ou_interrupted",
+                "progress",
+            ),
+            (
+                &discord_actor,
+                "j_discord_started",
+                "du_interrupted",
+                "started",
+            ),
+        ] {
+            storage
+                .record_execution_event(
+                    actor,
+                    job_id,
+                    "pending job",
+                    channel_target,
+                    false,
+                    CronJobExecutionInput {
+                        execution_status: "running".to_string(),
+                        message_send_status: "pending".to_string(),
+                        should_deliver: true,
+                        delivered: false,
+                        response_preview: None,
+                        error_message: None,
+                        detail: serde_json::json!({
+                            "phase": phase,
+                            "delivery_key": format!("{job_id}:2026-05-08:08:00"),
+                        }),
+                    },
+                )
+                .expect("record pending");
+        }
+
+        let conn = rusqlite::Connection::open(&sqlite_path).expect("open conn");
+        conn.execute(
+            "UPDATE cron_job_runs SET executed_at = ?1 WHERE job_id = ?2",
+            rusqlite::params!["2026-05-07T20:30:00+08:00", "j_feishu_started"],
+        )
+        .expect("make started row stale");
+
+        let updated = storage
+            .recover_stale_started_executions(
+                "feishu",
+                "2026-05-07T20:45:00+08:00",
+                "feishu_scheduler_startup",
+                "Feishu scheduler runtime restarted before this run reached a terminal status",
+            )
+            .expect("finalize pending");
+        assert_eq!(updated, 1);
+
+        let finalized = storage
+            .list_execution_records("j_feishu_started", 10)
+            .expect("list finalized");
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].execution_status, "execution_failed");
+        assert_eq!(finalized[0].message_send_status, "send_failed");
+        assert!(!finalized[0].should_deliver);
+        assert!(!finalized[0].delivered);
+        assert_eq!(finalized[0].detail["phase"], "recovered_stale_pending");
+        assert_eq!(
+            finalized[0].detail["delivery_key"],
+            "j_feishu_started:2026-05-08:08:00"
+        );
+        assert_eq!(
+            finalized[0].detail["recovered_by"],
+            "feishu_scheduler_startup"
+        );
+        assert!(
+            finalized[0]
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("runtime restarted")
+        );
+
+        let feishu_other = storage
+            .list_execution_records("j_feishu_other", 10)
+            .expect("list feishu other");
+        assert_eq!(feishu_other[0].execution_status, "running");
+        assert_eq!(feishu_other[0].message_send_status, "pending");
+
+        let discord = storage
+            .list_execution_records("j_discord_started", 10)
+            .expect("list discord");
+        assert_eq!(discord[0].execution_status, "running");
+        assert_eq!(discord[0].message_send_status, "pending");
+    }
+
+    /// Reproduce production sequence: 12 heartbeat jobs, two consecutive 30-min
+    /// windows each. Every (job, window) pair writes a started row then a noop
+    /// terminal — production observes started rows persisting as
+    /// `running + pending` across windows, so verify no orphan started rows
+    /// remain after both windows finish.
+    #[test]
+    fn heartbeat_started_rows_finalize_across_two_windows() {
+        let dir = make_temp_dir("hone_cron_storage_heartbeat_two_windows");
+        let sqlite_path = dir.join("sessions.sqlite3");
+        let storage = CronJobStorage::with_sqlite(&dir, &sqlite_path);
+        let actor = actor("feishu", "ou_heartbeat", None);
+
+        let job_names = [
+            "持仓重大事件心跳检测",
+            "TEM破位预警",
+            "CAI破位预警",
+            "ORCL 大事件监控",
+            "ASTS 重大异动心跳监控",
+            "Monitor_Watchlist_11",
+            "RKLB异动监控",
+            "全天原油价格3小时播报",
+            "小米30港元破位预警",
+            "Cerebras IPO与业务进展心跳监控",
+            "TEM大事件心跳监控",
+            "小米破位预警",
+        ];
+        let windows = ["2026-04-28:15:30:heartbeat", "2026-04-28:16:00:heartbeat"];
+
+        for window in &windows {
+            for (idx, job_name) in job_names.iter().enumerate() {
+                let job_id = format!("j_{idx:08x}");
+                let delivery_key = format!("{job_id}:{window}");
+                storage
+                    .record_execution_event(
+                        &actor,
+                        &job_id,
+                        job_name,
+                        &actor.user_id,
+                        true,
+                        CronJobExecutionInput {
+                            execution_status: "running".to_string(),
+                            message_send_status: "pending".to_string(),
+                            should_deliver: true,
+                            delivered: false,
+                            response_preview: None,
+                            error_message: None,
+                            detail: serde_json::json!({
+                                "delivery_key": delivery_key,
+                                "phase": "started",
+                            }),
+                        },
+                    )
+                    .expect("record started");
+
+                storage
+                    .record_execution_event(
+                        &actor,
+                        &job_id,
+                        job_name,
+                        &actor.user_id,
+                        true,
+                        CronJobExecutionInput {
+                            execution_status: "noop".to_string(),
+                            message_send_status: "skipped_noop".to_string(),
+                            should_deliver: false,
+                            delivered: false,
+                            response_preview: None,
+                            error_message: None,
+                            detail: serde_json::json!({
+                                "delivery_key": delivery_key,
+                                "heartbeat_model": "model-x",
+                                "parse_kind": "Empty",
+                            }),
+                        },
+                    )
+                    .expect("record terminal");
+            }
+        }
+
+        let conn = rusqlite::Connection::open(&sqlite_path).expect("open conn");
+        let stuck: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM cron_job_runs WHERE execution_status='running' AND message_send_status='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count stuck");
+        assert_eq!(
+            stuck, 0,
+            "no started row should remain running+pending after terminal noop"
+        );
+
+        let total: i64 = conn
+            .query_row("SELECT count(*) FROM cron_job_runs", [], |row| row.get(0))
+            .expect("count total");
+        let expected = (job_names.len() * windows.len()) as i64;
+        assert_eq!(
+            total, expected,
+            "exactly one row per (job, window) should remain"
+        );
+    }
+
+    /// Reproduce a Feishu-style terminal where `result.metadata` is wrapped via
+    /// `execution_detail_with_delivery_key`, producing a detail object with
+    /// `delivery_key` at top level, plus a `scheduler` sub-object — matches the
+    /// real production payload exactly.
+    #[test]
+    fn heartbeat_started_rows_finalize_with_scheduler_metadata_wrapper() {
+        let dir = make_temp_dir("hone_cron_storage_heartbeat_scheduler_wrap");
+        let sqlite_path = dir.join("sessions.sqlite3");
+        let storage = CronJobStorage::with_sqlite(&dir, &sqlite_path);
+        let actor = actor("feishu", "ou_heartbeat_wrap", None);
+
+        let job_id = "j_db12f27f";
+        let delivery_key = "j_db12f27f:2026-04-30:13:00:heartbeat";
+
+        storage
+            .record_execution_event(
+                &actor,
+                job_id,
+                "RKLB异动监控",
+                &actor.user_id,
+                true,
+                CronJobExecutionInput {
+                    execution_status: "running".to_string(),
+                    message_send_status: "pending".to_string(),
+                    should_deliver: true,
+                    delivered: false,
+                    response_preview: None,
+                    error_message: None,
+                    detail: serde_json::json!({
+                        "delivery_key": delivery_key,
+                        "phase": "started",
+                    }),
+                },
+            )
+            .expect("record started");
+
+        let terminal_detail = serde_json::json!({
+            "delivery_key": delivery_key,
+            "receive_id": "ou_heartbeat_wrap",
+            "scheduler": {
+                "heartbeat_model": "model-x",
+                "parse_kind": "JsonTriggered",
+                "raw_chars": 312,
+                "starts_with_json": true,
+                "raw_preview": "{\"status\":\"triggered\"}",
+                "deliver_preview": "RKLB 触发提醒",
+            },
+        });
+        storage
+            .record_execution_event(
+                &actor,
+                job_id,
+                "RKLB异动监控",
+                &actor.user_id,
+                true,
+                CronJobExecutionInput {
+                    execution_status: "completed".to_string(),
+                    message_send_status: "sent".to_string(),
+                    should_deliver: true,
+                    delivered: true,
+                    response_preview: Some("RKLB 触发提醒".to_string()),
+                    error_message: None,
+                    detail: terminal_detail,
+                },
+            )
+            .expect("record terminal");
+
+        let records = storage.list_execution_records(job_id, 10).expect("list");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].execution_status, "completed");
+        assert_eq!(records[0].message_send_status, "sent");
+        assert!(records[0].delivered);
+    }
+
+    #[test]
+    fn execution_terminal_event_falls_back_to_recent_started_row() {
+        let dir = make_temp_dir("hone_cron_storage_exec_update_recent_started");
+        let sqlite_path = dir.join("sessions.sqlite3");
+        let storage = CronJobStorage::with_sqlite(&dir, &sqlite_path);
+        let actor = actor("feishu", "ou_exec_update_fallback", None);
+
+        let add = storage.add_job(
+            &actor,
+            "heartbeat",
+            Some(9),
+            Some(0),
+            "heartbeat",
+            "task",
+            "ou_exec_update_fallback",
+            None,
+            None,
+            None,
+            true,
+            None,
+            true,
+        );
+        let job_id = add["job"]["id"].as_str().unwrap_or_default().to_string();
+
+        storage
+            .record_execution_event(
+                &actor,
+                &job_id,
+                "heartbeat",
+                "ou_exec_update_fallback",
+                true,
+                CronJobExecutionInput {
+                    execution_status: "running".to_string(),
+                    message_send_status: "pending".to_string(),
+                    should_deliver: true,
+                    delivered: false,
+                    response_preview: None,
+                    error_message: None,
+                    detail: serde_json::json!({"phase": "started", "delivery_key": "k-recent"}),
+                },
+            )
+            .expect("record started");
+
+        storage
+            .record_execution_event(
+                &actor,
+                &job_id,
+                "heartbeat",
+                "ou_exec_update_fallback",
+                true,
+                CronJobExecutionInput {
+                    execution_status: "noop".to_string(),
+                    message_send_status: "skipped_noop".to_string(),
+                    should_deliver: false,
+                    delivered: false,
+                    response_preview: None,
+                    error_message: None,
+                    detail: serde_json::json!({"phase": "terminal", "delivery_key": null}),
+                },
+            )
+            .expect("record terminal");
+
+        let records = storage
+            .list_execution_records(&job_id, 10)
+            .expect("list execution records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].execution_status, "noop");
+        assert_eq!(records[0].message_send_status, "skipped_noop");
+        assert_eq!(records[0].detail["phase"], "terminal");
+    }
+
+    /// Reproduce the v0.5.0 terminal write that handed raw heartbeat
+    /// diagnostics to storage without wrapping a top-level delivery_key.
+    #[test]
+    fn pre_fix_v0_5_0_terminal_without_delivery_key_finalizes_recent_started_row() {
+        let dir = make_temp_dir("hone_cron_storage_pre_fix_terminal");
+        let sqlite_path = dir.join("sessions.sqlite3");
+        let storage = CronJobStorage::with_sqlite(&dir, &sqlite_path);
+        let actor = actor("feishu", "ou_pre_fix", None);
+
+        let job_id = "j_654aef9b";
+        let delivery_key = "j_654aef9b:2026-04-28:15:30:heartbeat";
+
+        storage
+            .record_execution_event(
+                &actor,
+                job_id,
+                "小米30港元破位预警",
+                &actor.user_id,
+                true,
+                CronJobExecutionInput {
+                    execution_status: "running".to_string(),
+                    message_send_status: "pending".to_string(),
+                    should_deliver: true,
+                    delivered: false,
+                    response_preview: None,
+                    error_message: None,
+                    detail: serde_json::json!({
+                        "delivery_key": delivery_key,
+                        "phase": "started",
+                    }),
+                },
+            )
+            .expect("record started");
+
+        storage
+            .record_execution_event(
+                &actor,
+                job_id,
+                "小米30港元破位预警",
+                &actor.user_id,
+                true,
+                CronJobExecutionInput {
+                    execution_status: "noop".to_string(),
+                    message_send_status: "skipped_noop".to_string(),
+                    should_deliver: false,
+                    delivered: false,
+                    response_preview: None,
+                    error_message: None,
+                    detail: serde_json::json!({
+                        "heartbeat_model": "model-x",
+                        "parse_kind": "JsonNoop",
+                        "raw_chars": 18,
+                        "starts_with_json": true,
+                        "raw_preview": "{\"status\":\"noop\"}",
+                    }),
+                },
+            )
+            .expect("record terminal");
+
+        let conn = rusqlite::Connection::open(&sqlite_path).expect("open conn");
+        let stuck: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM cron_job_runs WHERE execution_status='running' AND message_send_status='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count stuck");
+        let total: i64 = conn
+            .query_row("SELECT count(*) FROM cron_job_runs", [], |row| row.get(0))
+            .expect("count total");
+
+        assert_eq!(stuck, 0);
+        assert_eq!(total, 1);
+    }
+
+    /// Reproduce a legacy started row written without delivery_key in detail.
+    #[test]
+    fn heartbeat_started_row_without_delivery_key_is_finalized_by_recent_started_fallback() {
+        let dir = make_temp_dir("hone_cron_storage_legacy_started");
+        let sqlite_path = dir.join("sessions.sqlite3");
+        let storage = CronJobStorage::with_sqlite(&dir, &sqlite_path);
+        let actor = actor("feishu", "ou_legacy", None);
+
+        let job_id = "j_legacy";
+        storage
+            .record_execution_event(
+                &actor,
+                job_id,
+                "legacy heartbeat",
+                &actor.user_id,
+                true,
+                CronJobExecutionInput {
+                    execution_status: "running".to_string(),
+                    message_send_status: "pending".to_string(),
+                    should_deliver: true,
+                    delivered: false,
+                    response_preview: None,
+                    error_message: None,
+                    detail: serde_json::json!({"phase": "started"}),
+                },
+            )
+            .expect("record legacy started");
+
+        storage
+            .record_execution_event(
+                &actor,
+                job_id,
+                "legacy heartbeat",
+                &actor.user_id,
+                true,
+                CronJobExecutionInput {
+                    execution_status: "noop".to_string(),
+                    message_send_status: "skipped_noop".to_string(),
+                    should_deliver: false,
+                    delivered: false,
+                    response_preview: None,
+                    error_message: None,
+                    detail: serde_json::json!({
+                        "delivery_key": "j_legacy:2026-04-30:13:00:heartbeat",
+                        "heartbeat_model": "model-x",
+                    }),
+                },
+            )
+            .expect("record terminal");
+
+        let conn = rusqlite::Connection::open(&sqlite_path).expect("open conn");
+        let stuck: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM cron_job_runs WHERE execution_status='running' AND message_send_status='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count stuck");
+        let total: i64 = conn
+            .query_row("SELECT count(*) FROM cron_job_runs", [], |row| row.get(0))
+            .expect("count total");
+
+        assert_eq!(stuck, 0);
+        assert_eq!(total, 1);
     }
 }

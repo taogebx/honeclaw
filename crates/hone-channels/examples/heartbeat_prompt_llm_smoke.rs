@@ -3,14 +3,13 @@
 //! 跑法:
 //!   cargo run --example heartbeat_prompt_llm_smoke -p hone-channels
 //!
-//! 目的：直接喂 `build_scheduled_prompt` 构造出来的 heartbeat prompt 给生产
-//! 真实走的辅助 LLM (`llm.auxiliary`，OpenAI-compatible，当前为 MiniMax)，
+//! 目的：直接喂 `build_scheduled_prompt` 构造出来的 heartbeat prompt 给 legacy
+//! `llm.auxiliary` 辅助 LLM(OpenAI-compatible)，
 //! 再用生产路径上的 `inspect_heartbeat_result` 去判定 `parse_kind`。
 //!
-//! 为什么不是 OpenRouter：`scheduler.rs` 里 heartbeat 的 `model_override` 走的是
-//! `core.auxiliary_model_name()`，也就是 `llm.auxiliary.model`。config.yaml 注释
-//! 明写：「When configured, it overrides the legacy openrouter.sub_model route」。
-//! 所以这里必须用 `OpenAiCompatibleProvider` 指向 `llm.auxiliary` 才算覆盖生产。
+//! 注意：当前生产默认优先 `llm.auxiliary_profile`；只有该 profile 留空时才回落到
+//! `llm.auxiliary`，再回落到 legacy `openrouter.sub_model`。本 smoke 只覆盖这条
+//! direct auxiliary 兼容路径，不覆盖 profile resolver。
 //!
 //! 覆盖的回归：
 //!   - `scheduler_heartbeat_unknown_status_silent_skip.md`：模型把推理塞进
@@ -94,6 +93,7 @@ async fn run_case(
     let messages = vec![Message {
         role: "user".into(),
         content: Some(prompt),
+        reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
         name: None,
@@ -127,16 +127,13 @@ async fn main() -> Result<()> {
             "llm.auxiliary 未配置（base_url/model/api_key 至少缺一项），heartbeat 生产路径不可用"
         );
     }
-    let api_key = aux.resolved_api_key();
+    let api_key = aux.api_key.trim();
     if api_key.is_empty() {
-        bail!(
-            "llm.auxiliary.api_key 解析为空（含 env {}）",
-            aux.api_key_env
-        );
+        bail!("llm.auxiliary.api_key 为空；请写入 config.yaml，运行时不再读取 MINIMAX_API_KEY");
     }
     let max_tokens: u16 = aux.max_tokens.min(u16::MAX as u32) as u16;
     let provider =
-        OpenAiCompatibleProvider::new(&api_key, &aux.base_url, &aux.model, aux.timeout, max_tokens)
+        OpenAiCompatibleProvider::new(api_key, &aux.base_url, &aux.model, aux.timeout, max_tokens)
             .with_context(
                 || "构造 OpenAiCompatibleProvider (heartbeat smoke, MiniMax auxiliary)",
             )?;

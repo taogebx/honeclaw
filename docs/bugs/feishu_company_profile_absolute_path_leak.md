@@ -14,6 +14,33 @@
   - `sessions.last_message_preview` 同样保留 `/Users/ecohnoch/Desktop/honeclaw/data/agent-sandboxes/...` 绝对路径，说明这不是单次渲染误差，而是最终出站文本本身带了本机路径。
   - `data/runtime/logs/acp-events.log` 同时显示该轮正常 `stopReason=end_turn` 收口，没有证据表明系统把这类路径识别为内部实现细节并在出站前剥离。
 
+## 2026-05-13 复发证据
+
+- 本轮巡检确认该缺陷在最近四小时真实 Feishu direct 会话中复发，状态从 `Fixed` 调回 `New`。
+- `data/sessions/Actor_feishu__direct__ou_5f44eaaa05cec98860b5336c3bddcc22d1.json`
+  - `2026-05-12T23:48:33.273558+08:00` 用户要求：`帮我建PDD的公司画像`。
+  - `2026-05-12T23:53:47.706234+08:00` assistant final 返回“PDD 公司画像已建好”，但同时把 `[profile.md](/Users/fengming2/Desktop/honeclaw/data/agent-sandboxes/feishu/direct__.../company_profiles/pdd/profile.md)` 这类本机 Markdown 文件链接直接放进用户可见文本。
+  - 路径中包含本机仓库根目录、`data/agent-sandboxes/feishu` 存储布局、direct actor sandbox 标识与公司画像内部目录结构。
+- 结论：
+  - 这是同一根因 / 同一影响范围的复发，不新建重复文档。
+  - 主功能“画像已创建”看起来完成，但回复继续暴露本机路径和内部文件落点；因此仍按质量与信息边界缺陷定级为 `P3`。
+  - 为何不定为 `P1/P2`：本轮证据没有显示画像创建失败、跨用户错投、消息投递失败或数据损坏；受损的是外部渠道输出边界和可读性，因此不影响主功能链路完成度。
+
+## 2026-05-14 修复
+
+- 本轮确认 Feishu final 出站实际依赖共享 `sanitize_user_visible_output(...)`，而该层此前只清理内部协议 / reasoning，不会直接脱敏本地 Markdown 文件链接或裸绝对路径；因此 2026-04-26 的修复意图没有覆盖复发样本。
+- 已在 `crates/hone-channels/src/runtime.rs` 将本地路径脱敏并入共享可见文本净化：
+  - `[profile.md](/Users/.../company_profiles/pdd/profile.md)` 与 `file:///Users/...` 形式的本地 Markdown 链接会保留无路径标签，如 `profile.md`；
+  - 裸 `/Users/...` 与 `C:\Users\...` 绝对路径会统一改写为 `<absolute-path>/<basename>`；
+  - `data/agent-sandboxes/...`、direct actor sandbox 标识、本机仓库根目录不再进入 Feishu / Telegram / scheduler 等共享出站文本。
+- 状态从 `New` 更新为 `Fixed`。本轮未依赖当前机器 live 运行态复核；后续若部署后仍看到本地路径或 sandbox 标识进入外部渠道回复，应在本单追加复发证据。
+
+## 2026-05-14 验证
+
+- `cargo test -p hone-channels sanitize_user_visible_output_redacts --lib -- --nocapture`
+- `cargo test -p hone-channels sanitize_user_visible_output_ --lib -- --nocapture`
+- `rustfmt --edition 2024 --config skip_children=true --check crates/hone-channels/src/runtime.rs`
+
 ## 端到端链路
 
 1. Feishu 直聊用户要求“帮我建 ccld 公司画像”。
@@ -41,9 +68,9 @@
 
 ## 当前实现效果
 
-- 画像建档主功能已成功完成，但最终回复把内部文件落点当成用户可见结果的一部分发送。
-- Feishu 用户无法使用这些 `/Users/...` 路径，且路径内容会暴露本地工程目录与运行时存储布局。
-- 该问题属于输出质量与信息边界问题，不是“任务没做完”；因此当前按独立质量缺陷跟踪。
+- 2026-05-14 修复后，共享出站净化层会剥离本地 Markdown 文件链接中的绝对路径，并掩码裸本机绝对路径。
+- 画像建档主功能仍按原流程完成；对外回复只保留用户可理解的文件标签或 `<absolute-path>/<basename>` 占位，不再暴露本地工程目录、运行时存储布局或 direct actor sandbox 标识。
+- 该问题属于输出质量与信息边界问题，不是“任务没做完”；因此按独立质量缺陷跟踪，当前状态为 `Fixed`。
 
 ## 用户影响
 
@@ -54,7 +81,7 @@
 ## 根因判断
 
 - 公司画像建档链路很可能直接复用了桌面/app 场景下的 Markdown 文件链接输出模板，没有区分“本机可点击路径”与“渠道用户可见文本”。
-- 出站净化当前主要关注 `<think>`、原始报错、工具协议等污染文本，但没有把本地绝对路径和 markdown file-link 视为需要剥离的内部实现细节。
+- 修复前，出站净化主要关注 `<think>`、原始报错、工具协议等污染文本，但没有把本地绝对路径和 markdown file-link 视为需要剥离的内部实现细节。
 - 这与已有“空回复 fallback”或“过早收口”不是同一根因；本轮是建档成功后的结果组织与出站边界问题。
 
 ## 下一步建议

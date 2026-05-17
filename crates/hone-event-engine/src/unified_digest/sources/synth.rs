@@ -1,0 +1,159 @@
+//! `SynthSource` —— 把 `EventStore` 里未来 4 天的 `EarningsUpcoming` teaser 合成
+//! 为 T-3 / T-2 / T-1 倒计时 `MarketEvent`,按 `SubscriptionRegistry::resolve`
+//! 匹配到 actor。
+//!
+//! 复用 `pollers::earnings::synthesize_countdowns` 的纯计算函数,逻辑与旧
+//! `DigestScheduler::tick_once` 一致,只是把"per-tick 全 actor 一次算 + per-actor
+//! 分发"改成"per-actor 单独取自家命中"。
+
+use chrono::{DateTime, FixedOffset, TimeZone, Utc};
+use hone_core::ActorIdentity;
+
+use crate::pollers::earnings::synthesize_countdowns;
+use crate::store::EventStore;
+use crate::subscription::SharedRegistry;
+use crate::unified_digest::sources::UnifiedCandidate;
+
+pub struct SynthSource<'a> {
+    store: &'a EventStore,
+    registry: &'a SharedRegistry,
+    /// 当 prefs.timezone 缺失时用的全局回退时区(小时整数偏移)。`SynthSource`
+    /// 内部不知道 prefs,所以只在 actor 没有独立时区时用它计算本地日期。
+    tz_offset_hours: i32,
+}
+
+impl<'a> SynthSource<'a> {
+    pub fn new(store: &'a EventStore, registry: &'a SharedRegistry, tz_offset_hours: i32) -> Self {
+        Self {
+            store,
+            registry,
+            tz_offset_hours,
+        }
+    }
+
+    /// 取 `actor` 命中的 T-3/T-2/T-1 倒计时事件;按 `tz_offset_hours` 解释 `now` 的"今天"。
+    pub fn synthesize_for_actor(
+        &self,
+        actor: &ActorIdentity,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<UnifiedCandidate>> {
+        let teasers = self.store.list_upcoming_earnings(now, 4)?;
+        let offset = FixedOffset::east_opt(self.tz_offset_hours * 3600)
+            .unwrap_or(FixedOffset::east_opt(0).unwrap());
+        let local_today = offset.from_utc_datetime(&now.naive_utc()).date_naive();
+        let synth_pool = synthesize_countdowns(&teasers, local_today);
+        let registry = self.registry.load();
+        let mut out = Vec::new();
+        for ev in synth_pool {
+            if registry
+                .resolve(&ev)
+                .into_iter()
+                .any(|(a, _sev)| &a == actor && a.is_direct())
+            {
+                out.push(UnifiedCandidate::from_synth(ev, now));
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::{EventKind, MarketEvent, Severity};
+    use crate::subscription::{PortfolioSubscription, SharedRegistry, SubscriptionRegistry};
+    use crate::unified_digest::ItemOrigin;
+    use tempfile::tempdir;
+
+    fn actor() -> ActorIdentity {
+        ActorIdentity::new("telegram", "u1", None::<&str>).unwrap()
+    }
+
+    fn earnings_teaser(symbol: &str, occurred: DateTime<Utc>) -> MarketEvent {
+        MarketEvent {
+            id: format!("teaser:{symbol}:{}", occurred.timestamp()),
+            kind: EventKind::EarningsUpcoming,
+            severity: Severity::Medium,
+            symbols: vec![symbol.into()],
+            occurred_at: occurred,
+            title: format!("{symbol} earnings"),
+            summary: "scheduled".into(),
+            url: None,
+            source: "fmp.earnings_calendar".into(),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    fn open_store() -> EventStore {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("test.sqlite3");
+        let store = EventStore::open(&path).unwrap();
+        std::mem::forget(temp_dir);
+        store
+    }
+
+    fn registry_with_holding(symbol: &str, actor: &ActorIdentity) -> SharedRegistry {
+        let mut registry = SubscriptionRegistry::new();
+        registry.register(Box::new(PortfolioSubscription::new(
+            actor.clone(),
+            [symbol.to_string()],
+        )));
+        SharedRegistry::from_registry(registry)
+    }
+
+    #[test]
+    fn synthesizes_t_minus_n_for_holdings_only() {
+        let store = open_store();
+        let now = Utc.with_ymd_and_hms(2026, 4, 27, 13, 0, 0).unwrap();
+        // GOOGL 财报在 4-29(T-2),AAPL 财报在 5-04(超出 T-3 窗口)
+        store
+            .insert_event(&earnings_teaser(
+                "GOOGL",
+                Utc.with_ymd_and_hms(2026, 4, 29, 20, 0, 0).unwrap(),
+            ))
+            .unwrap();
+        store
+            .insert_event(&earnings_teaser(
+                "AAPL",
+                Utc.with_ymd_and_hms(2026, 5, 4, 20, 0, 0).unwrap(),
+            ))
+            .unwrap();
+        let test_actor = actor();
+        let registry = registry_with_holding("GOOGL", &test_actor);
+        let synth_source = SynthSource::new(&store, &registry, 0); // UTC
+
+        let candidates = synth_source.synthesize_for_actor(&test_actor, now).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].event.id.starts_with("synth:earnings:GOOGL:"));
+        assert_eq!(candidates[0].origin, ItemOrigin::Synth);
+    }
+
+    #[test]
+    fn skips_when_actor_has_no_matching_holding() {
+        let store = open_store();
+        let now = Utc.with_ymd_and_hms(2026, 4, 27, 13, 0, 0).unwrap();
+        store
+            .insert_event(&earnings_teaser(
+                "GOOGL",
+                Utc.with_ymd_and_hms(2026, 4, 29, 20, 0, 0).unwrap(),
+            ))
+            .unwrap();
+        let test_actor = actor();
+        // 只持有 NVDA;GOOGL 倒计时不应推 test_actor
+        let registry = registry_with_holding("NVDA", &test_actor);
+        let synth_source = SynthSource::new(&store, &registry, 0);
+        let candidates = synth_source.synthesize_for_actor(&test_actor, now).unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn empty_store_returns_empty() {
+        let store = open_store();
+        let now = Utc.with_ymd_and_hms(2026, 4, 27, 13, 0, 0).unwrap();
+        let test_actor = actor();
+        let registry = registry_with_holding("GOOGL", &test_actor);
+        let synth_source = SynthSource::new(&store, &registry, 0);
+        let candidates = synth_source.synthesize_for_actor(&test_actor, now).unwrap();
+        assert!(candidates.is_empty());
+    }
+}

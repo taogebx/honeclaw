@@ -4,7 +4,7 @@
 //! severity，则调用 `polish()`，用返回文本替代默认模板。Polisher 返回 `None`
 //! 表示"保持原文"（例如 LLM 调用失败），路由器照常发送默认模板。
 //!
-//! MVP 提供两种实现：
+//! 当前提供两种实现：
 //! - `NoopPolisher`：什么都不做，始终返回 `None`
 //! - `LlmPolisher`：调用 hone-llm 的 `LlmProvider` 做短提示润色
 
@@ -66,6 +66,7 @@ impl LlmPolisher {
                  4) 不做任何投资建议；5) 直接输出润色后的正文，不要添加前缀/后缀。"
                     .into(),
             ),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -82,6 +83,7 @@ impl LlmPolisher {
         let user = Message {
             role: "user".into(),
             content: Some(user_payload.to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -114,7 +116,7 @@ impl BodyPolisher for LlmPolisher {
     }
 }
 
-/// 把 config 里的字符串 severity 列表转换为 HashSet<Severity>。
+/// 把 config 里的字符串 severity 列表转换为 `HashSet<Severity>`。
 /// 不识别的字符串被忽略（记一条 warn）。
 pub fn parse_polish_levels(names: &[String]) -> HashSet<Severity> {
     let mut out = HashSet::new();
@@ -144,7 +146,7 @@ mod tests {
     use crate::event::{EventKind, MarketEvent, Severity};
     use chrono::Utc;
     use hone_llm::provider::ChatResult;
-    use hone_llm::{ChatResponse, Message, ToolCall};
+    use hone_llm::{ChatResponse, Message};
     use std::sync::Mutex;
 
     fn ev(sev: Severity) -> MarketEvent {
@@ -202,10 +204,6 @@ mod tests {
         ) -> futures::stream::BoxStream<'a, hone_core::HoneResult<String>> {
             unimplemented!("not used")
         }
-    }
-
-    fn _unused_tool_call() -> ToolCall {
-        unimplemented!("present to keep ToolCall imported when test only compiles")
     }
 
     #[tokio::test]

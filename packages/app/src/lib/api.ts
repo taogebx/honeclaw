@@ -19,11 +19,18 @@ import type {
   PortfolioSummary,
   HoldingUpsertInput,
   LogEntry,
+  DesktopChannelSettings,
+  DesktopChannelSettingsInput,
+  DesktopChannelSettingsUpdateResult,
   WebInviteActionResult,
   WebInviteInfo,
 } from "./types";
 import type { ActorRef } from "./actors";
-import { apiFetch, createEventSource } from "./backend";
+import {
+  apiFetch,
+  createEventSource,
+  friendlyBackendErrorMessage,
+} from "./backend";
 
 export class ApiError extends Error {
   status: number;
@@ -38,11 +45,18 @@ export class ApiError extends Error {
 }
 
 export function isUnauthorizedApiError(error: unknown) {
-  return error instanceof ApiError && (error.status === 401 || error.status === 403);
+  return (
+    error instanceof ApiError && (error.status === 401 || error.status === 403)
+  );
 }
 
 async function parseJson<T>(response: Response): Promise<T> {
+  const contentType = response.headers.get("content-type") ?? "";
   if (!response.ok) {
+    const friendlyMessage = friendlyBackendErrorMessage(response.status);
+    if (friendlyMessage) {
+      throw new ApiError(friendlyMessage, response);
+    }
     const text = await response.text();
     let message = "";
     try {
@@ -53,7 +67,26 @@ async function parseJson<T>(response: Response): Promise<T> {
     }
     throw new ApiError(message || text || response.statusText, response);
   }
+  if (!contentType.toLowerCase().includes("application/json")) {
+    const text = await response.text();
+    const snippet = text.trim().slice(0, 80);
+    throw new ApiError(
+      `Expected JSON response but received ${contentType || "unknown content type"}${
+        snippet ? `: ${snippet}` : ""
+      }`,
+      response,
+    );
+  }
   return response.json() as Promise<T>;
+}
+
+async function apiErrorFromResponse(response: Response): Promise<ApiError> {
+  const friendlyMessage = friendlyBackendErrorMessage(response.status);
+  if (friendlyMessage) {
+    return new ApiError(friendlyMessage, response);
+  }
+  const text = await response.text();
+  return new ApiError(text || response.statusText, response);
 }
 
 export async function getMeta() {
@@ -64,6 +97,24 @@ export async function getMeta() {
 export async function getChannels() {
   const response = await apiFetch("/api/channels");
   return parseJson<ChannelStatusInfo[]>(response);
+}
+
+export async function getChannelSettings() {
+  const response = await apiFetch("/api/channel-settings");
+  return parseJson<DesktopChannelSettings>(response);
+}
+
+export async function putChannelSettings(
+  settings: DesktopChannelSettingsInput,
+) {
+  const response = await apiFetch("/api/channel-settings", {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(settings),
+  });
+  return parseJson<DesktopChannelSettingsUpdateResult>(response);
 }
 
 export async function getUsers() {
@@ -91,7 +142,7 @@ export async function createWebInvite(phoneNumber: string) {
 
 async function mutateWebInvite(
   userId: string,
-  action: "disable" | "enable" | "reset",
+  action: "disable" | "enable" | "reset" | "api-key" | "api-key/reset",
 ) {
   const response = await apiFetch(
     `/api/web-users/invites/${encodeURIComponent(userId)}/${action}`,
@@ -112,6 +163,14 @@ export async function enableWebInvite(userId: string) {
 
 export async function resetWebInvite(userId: string) {
   return mutateWebInvite(userId, "reset");
+}
+
+export async function getWebInviteApiKey(userId: string) {
+  return mutateWebInvite(userId, "api-key");
+}
+
+export async function resetWebInviteApiKey(userId: string) {
+  return mutateWebInvite(userId, "api-key/reset");
 }
 
 function actorQuery(actor: ActorRef) {
@@ -182,8 +241,7 @@ export async function sendChat(
   });
 
   if (!response.ok) {
-    const text = await response.text();
-    throw new ApiError(text || response.statusText, response);
+    throw await apiErrorFromResponse(response);
   }
 
   if (!response.body) {
@@ -197,56 +255,39 @@ export async function connectEvents(actor: ActorRef) {
   return createEventSource(`/api/events?${actorQuery(actor)}`);
 }
 
-export async function publicInviteLogin(
-  inviteCode: string,
+export async function getPublicCaptchaConfig() {
+  const response = await apiFetch("/api/public/auth/captcha/config");
+  return parseJson<{
+    enabled: boolean;
+    region: string;
+    prefix: string;
+    scene_id: string;
+    script_url: string;
+  }>(response);
+}
+
+export async function publicSendSmsCode(
   phoneNumber: string,
+  captchaVerifyParam?: string,
 ) {
-  const response = await apiFetch("/api/public/auth/invite-login", {
+  const response = await apiFetch("/api/public/auth/sms/send", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      invite_code: inviteCode,
       phone_number: phoneNumber,
+      captcha_verify_param: captchaVerifyParam,
     }),
   });
-  const payload = await parseJson<{ user: PublicAuthUserInfo }>(response);
-  return payload.user;
+  await parseJson<{ ok: boolean }>(response);
 }
 
-export async function publicPasswordLogin(input: {
+export async function publicSmsLogin(input: {
   phone_number: string;
-  password: string;
+  verify_code: string;
   remember: boolean;
-}) {
-  const response = await apiFetch("/api/public/auth/password-login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(input),
-  });
-  const payload = await parseJson<{ user: PublicAuthUserInfo }>(response);
-  return payload.user;
-}
-
-export async function setPublicPassword(input: {
-  new_password: string;
   tos_version: string;
 }) {
-  const response = await apiFetch("/api/public/auth/set-password", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(input),
-  });
-  const payload = await parseJson<{ user: PublicAuthUserInfo }>(response);
-  return payload.user;
-}
-
-export async function changePublicPassword(input: {
-  current_password: string;
-  new_password: string;
-}) {
-  const response = await apiFetch("/api/public/auth/change-password", {
+  const response = await apiFetch("/api/public/auth/sms/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
@@ -262,19 +303,19 @@ export async function publicLogout() {
   await parseJson<{ ok: boolean }>(response);
 }
 
-export async function getPublicAuthMe() {
-  const response = await apiFetch("/api/public/auth/me");
+export async function getPublicAuthMe(signal?: AbortSignal) {
+  const response = await apiFetch("/api/public/auth/me", { signal });
   const payload = await parseJson<{ user: PublicAuthUserInfo }>(response);
   return payload.user;
 }
 
-export async function getPublicHistory() {
-  const response = await apiFetch("/api/public/history");
+export async function getPublicHistory(signal?: AbortSignal) {
+  const response = await apiFetch("/api/public/history", { signal });
   const payload = await parseJson<{ messages?: HistoryMsg[] }>(response);
   return payload.messages ?? [];
 }
 
-// ── Public digest context (read-only thesis + profiles surface) ─────────
+// ── Public digest context (read-only mainline + profiles surface) ─────────
 
 export type ProfileSummary = {
   dir: string;
@@ -286,12 +327,12 @@ export type ProfileSummary = {
 
 export type DigestContext = {
   actor: { channel: string; user_id: string };
-  investment_global_style: string | null;
-  investment_theses: Record<string, string>;
+  mainline_style: string | null;
+  mainline_by_ticker: Record<string, string>;
   global_digest_enabled: boolean;
   global_digest_floor_macro_picks: number;
-  last_thesis_distilled_at: string | null;
-  thesis_distill_skipped: string[];
+  last_mainline_distilled_at: string | null;
+  mainline_distill_skipped: string[];
   holdings: string[];
   profile_list: ProfileSummary[];
 };
@@ -301,18 +342,18 @@ export async function getDigestContext(): Promise<DigestContext> {
   return parseJson<DigestContext>(response);
 }
 
-// ── Admin: thesis context for any actor ─────────────────────────────────
+// ── Admin: mainline context for any actor ─────────────────────────────────
 
-export type AdminThesisContext = DigestContext & {
+export type AdminMainlineContext = DigestContext & {
   actor: { channel: string; user_id: string; channel_scope?: string | null };
 };
 
-export async function getAdminThesisContext(
+export async function getAdminMainlineContext(
   actor: ActorRef,
-): Promise<AdminThesisContext> {
+): Promise<AdminMainlineContext> {
   const q = actorQuery(actor);
-  const response = await apiFetch(`/api/event-engine/thesis-context?${q}`);
-  return parseJson<AdminThesisContext>(response);
+  const response = await apiFetch(`/api/event-engine/mainline-context?${q}`);
+  return parseJson<AdminMainlineContext>(response);
 }
 
 export async function getAdminCompanyProfile(
@@ -331,15 +372,15 @@ export async function getAdminCompanyProfile(
   return parseJson(response);
 }
 
-export async function adminTriggerThesisDistill(actor: ActorRef): Promise<{
+export async function adminTriggerMainlineDistill(actor: ActorRef): Promise<{
   ok: boolean;
-  theses_count: number;
-  global_style_set: boolean;
+  mainline_count: number;
+  mainline_style_set: boolean;
   skipped_tickers: string[];
   last_distilled_at: string | null;
 }> {
   const q = actorQuery(actor);
-  const response = await apiFetch(`/api/event-engine/thesis-distill?${q}`, {
+  const response = await apiFetch(`/api/event-engine/mainline-distill?${q}`, {
     method: "POST",
   });
   return parseJson(response);
@@ -347,8 +388,8 @@ export async function adminTriggerThesisDistill(actor: ActorRef): Promise<{
 
 export async function refreshDigestContext(): Promise<{
   ok: boolean;
-  theses_count: number;
-  global_style_set: boolean;
+  mainline_count: number;
+  mainline_style_set: boolean;
   skipped_tickers: string[];
   last_distilled_at: string | null;
 }> {
@@ -396,8 +437,7 @@ export async function sendPublicChat(
   });
 
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(text || response.statusText);
+    throw await apiErrorFromResponse(response);
   }
 
   if (!response.body) {
@@ -621,6 +661,9 @@ export interface TaskSummary {
   failed_24h: number;
   last_error: string | null;
   last_failure_at: string | null;
+  /// 最近一次失败之后又跑了多少次(ok/skipped 都算)。
+  /// null = 24h 内没失败过;0 = 最新这次就是失败;>0 = 已恢复 N 次。
+  runs_since_last_failure: number | null;
 }
 
 export interface TaskRunsResponse {
@@ -653,8 +696,10 @@ export async function connectLogStream() {
 
 export interface NotificationRecord {
   run_id: number;
+  record_source: "cron_job" | "event_engine" | string;
   job_id: string;
   job_name: string;
+  event_kind?: string | null;
   channel: string;
   user_id: string;
   channel_scope?: string | null;
@@ -698,6 +743,7 @@ export interface NotificationsQuery {
   until?: string;
   channel?: string;
   user_id?: string;
+  channel_scope?: string;
   job_id?: string;
   execution_status?: string;
   message_send_status?: string;
@@ -723,7 +769,7 @@ export async function getNotifications(
 
 // ── 推送日程 API (per-actor 拍平视图) ────────────────────────────────────────
 
-export type ScheduleSource = "portfolio_digest" | "global_digest" | "cron_job";
+export type ScheduleSource = "digest" | "cron_job";
 
 export interface ScheduleEntry {
   time_local: string;
@@ -892,6 +938,26 @@ export async function applyImportCompanyProfiles(
 
 // ── 通知偏好 API ──────────────────────────────────────────────────────────
 
+/** 单个 digest 槽位 —— 后端 v0.4.x 起的新 schema(替代旧 digest_windows: string[])。
+ *  时刻按 prefs.timezone 解释为本地 HH:MM;label 用于渲染 header,floor_macro 控制
+ *  Pass 2 personalize 至少保留几条 macro_floor。前端编辑面板只渲染/写 id+time,
+ *  label/floor_macro 透传不破坏。 */
+export type DigestSlot = {
+  id: string;
+  time: string;
+  label?: string | null;
+  floor_macro?: number | null;
+};
+
+/** 勿扰时段:from/to 都是 prefs.timezone 解释的本地 HH:MM。在区间内 hold immediate
+ *  推送 + 跳过 digest 触发,到 to 时刻一次性 quiet_flush;exempt_kinds 命中的 kind
+ *  即使在 quiet 内也立即推。 */
+export type QuietHoursPrefs = {
+  from: string;
+  to: string;
+  exempt_kinds: string[];
+};
+
 export type NotificationPrefs = {
   enabled: boolean;
   portfolio_only: boolean;
@@ -900,12 +966,14 @@ export type NotificationPrefs = {
   blocked_kinds: string[];
   /** IANA 时区名;null = 沿用全局 digest.timezone */
   timezone: string | null;
-  /** 本地 HH:MM 列表;null = 沿用全局 [pre_market, post_market];[] = 关 digest */
-  digest_windows: string[] | null;
+  /** digest 触发槽位列表;null = 沿用全局 default_slots;[] = 关 digest */
+  digest_slots: DigestSlot[] | null;
   /** 价格异动即时推阈值(百分点);null = 沿用全局 thresholds.price_alert_high_pct */
   price_high_pct_override: number | null;
   /** 强制升 High 即时推的 kind tag 列表;null/[] = 不强升 */
   immediate_kinds: string[] | null;
+  /** 勿扰时段,null = 不启用 */
+  quiet_hours: QuietHoursPrefs | null;
 };
 
 export type NotificationPrefsBundle = {
@@ -939,4 +1007,14 @@ export async function putNotificationPrefs(
   });
   const payload = await parseJson<{ prefs: NotificationPrefs }>(response);
   return payload.prefs;
+}
+
+export async function putLanguage(language: "zh" | "en"): Promise<"zh" | "en"> {
+  const response = await apiFetch("/api/language", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ language }),
+  });
+  const payload = await parseJson<{ language: "zh" | "en" }>(response);
+  return payload.language;
 }

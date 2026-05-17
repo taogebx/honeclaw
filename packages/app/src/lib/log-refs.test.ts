@@ -12,6 +12,13 @@ function entry(partial: Partial<LogEntry>): LogEntry {
   }
 }
 
+function requireValue<T>(value: T | null | undefined, label: string): T {
+  if (value == null) {
+    throw new Error(`${label} was not found`)
+  }
+  return value
+}
+
 describe("extractLogRefs", () => {
   it("returns empty list when nothing structured or matched", () => {
     expect(extractLogRefs(entry({ message: "boom" }))).toEqual([])
@@ -43,26 +50,43 @@ describe("extractLogRefs", () => {
     const refs = extractLogRefs(
       entry({ extra: { session_id: "Actor_web__direct__ME" } }),
     )
-    const sessionRef = refs.find((r) => r.kind === "session")
-    expect(sessionRef).toBeDefined()
-    if (sessionRef && sessionRef.kind === "session") {
-      expect(sessionRef.sessionId).toBe("Actor_web__direct__ME")
-      expect(sessionRef.actor).toEqual({
-        channel: "web",
-        user_id: "ME",
-        channel_scope: undefined,
-      })
+    const sessionRef = requireValue(
+      refs.find((r) => r.kind === "session"),
+      "session ref",
+    )
+    expect(sessionRef.kind).toBe("session")
+    if (sessionRef.kind !== "session") {
+      throw new Error(`expected session ref, got ${sessionRef.kind}`)
     }
-    expect(refs.some((r) => r.kind === "actor")).toBe(true)
+    expect(sessionRef.sessionId).toBe("Actor_web__direct__ME")
+    expect(sessionRef.actor).toEqual({
+      channel: "web",
+      user_id: "ME",
+      channel_scope: undefined,
+    })
+    expect(refs).toContainEqual({
+      kind: "actor",
+      actor: { channel: "web", user_id: "ME", channel_scope: undefined },
+    })
   })
 
   it("extracts session ids from free-text message", () => {
     const refs = extractLogRefs(
       entry({ message: "failed to push notice for Actor_imessage__direct__alice" }),
     )
-    expect(refs.some((r) => r.kind === "session" && r.sessionId.includes("alice"))).toBe(
-      true,
+    const sessionRef = requireValue(
+      refs.find((r) => r.kind === "session"),
+      "session ref",
     )
+    expect(sessionRef).toEqual({
+      kind: "session",
+      sessionId: "Actor_imessage__direct__alice",
+      actor: {
+        channel: "imessage",
+        user_id: "alice",
+        channel_scope: undefined,
+      },
+    })
   })
 
   it("dedupes when extra and message reference the same session", () => {
@@ -72,7 +96,17 @@ describe("extractLogRefs", () => {
         extra: { session_id: "Actor_web__direct__ME" },
       }),
     )
-    expect(refs.filter((r) => r.kind === "session").length).toBe(1)
+    expect(refs.filter((r) => r.kind === "session")).toEqual([
+      {
+        kind: "session",
+        sessionId: "Actor_web__direct__ME",
+        actor: {
+          channel: "web",
+          user_id: "ME",
+          channel_scope: undefined,
+        },
+      },
+    ])
   })
 
   it("emits task ref from extra.task_id", () => {

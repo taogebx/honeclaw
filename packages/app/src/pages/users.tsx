@@ -4,23 +4,21 @@ import { useNavigate, useParams } from "@solidjs/router"
 import { For, Show, createEffect, createMemo } from "solid-js"
 import { CompanyProfileDetail } from "@/components/company-profile-detail"
 import { PortfolioDetail } from "@/components/portfolio-detail"
-import { UserThesisView } from "@/components/user-thesis-view"
+import { UserMainlineView } from "@/components/user-mainline-view"
 import { useBackend } from "@/context/backend"
 import { useCompanyProfiles } from "@/context/company-profiles"
 import { usePortfolio } from "@/context/portfolio"
 import { useResearch } from "@/context/research"
 import { useSessions } from "@/context/sessions"
 import { actorFromUser, actorKey, parseActorKey, type ActorRef } from "@/lib/actors"
-
-type UsersTab = "portfolio" | "profiles" | "thesis" | "sessions" | "research"
-
-const TAB_LIST: { id: UsersTab; label: string; capability?: string }[] = [
-  { id: "portfolio", label: "持仓" },
-  { id: "profiles", label: "公司画像", capability: "company_profiles" },
-  { id: "thesis", label: "蒸馏 thesis" },
-  { id: "sessions", label: "会话" },
-  { id: "research", label: "相关研究", capability: "research" },
-]
+import { USERS } from "@/lib/admin-content/users"
+import { tpl } from "@/lib/i18n"
+import {
+  availableUsersTabs,
+  resolveUsersTab,
+  uniqueSortedSymbols,
+  type UsersTab,
+} from "@/pages/users-model"
 
 function TabBtn(props: { label: string; active: boolean; onClick: () => void }) {
   return (
@@ -77,8 +75,8 @@ function UserSessionsView(props: { actor: ActorRef }) {
         when={userSessions().length > 0}
         fallback={
           <EmptyState
-            title="还没有会话记录"
-            description="该用户尚未在任何渠道发起会话。"
+            title={USERS.sessions.empty_title}
+            description={USERS.sessions.empty_description}
           />
         }
       >
@@ -97,12 +95,12 @@ function UserSessionsView(props: { actor: ActorRef }) {
                     {u.session_label || u.user_id}
                   </div>
                   <div class="text-[11px] text-[color:var(--text-muted)]">
-                    {formatDate(u.last_time)} · {u.message_count} 条消息
+                    {formatDate(u.last_time)} · {tpl(USERS.sessions.message_count, { count: u.message_count })}
                   </div>
                 </div>
                 <div class="mt-2 line-clamp-2 text-xs text-[color:var(--text-secondary)]">
                   <span class="text-[color:var(--text-muted)]">{u.last_role}:</span>{" "}
-                  {u.last_message || "(空)"}
+                  {u.last_message || USERS.sessions.empty_message}
                 </div>
               </button>
             )}
@@ -113,16 +111,13 @@ function UserSessionsView(props: { actor: ActorRef }) {
   )
 }
 
-function UserResearchView(props: { actor: ActorRef }) {
+function UserResearchView() {
   const navigate = useNavigate()
   const portfolio = usePortfolio()
   const research = useResearch()
 
   const symbols = createMemo(() => {
-    const set = new Set<string>()
-    for (const h of portfolio.holdingsList()) set.add(h.symbol.toUpperCase())
-    for (const w of portfolio.watchlist()) set.add(w.symbol.toUpperCase())
-    return Array.from(set).sort()
+    return uniqueSortedSymbols(portfolio.holdingsList(), portfolio.watchlist())
   })
 
   const relatedTasks = createMemo(() => {
@@ -144,13 +139,13 @@ function UserResearchView(props: { actor: ActorRef }) {
         when={symbols().length > 0}
         fallback={
           <EmptyState
-            title="该用户暂无关注的标的"
-            description={'先在「持仓」tab 里添加持仓或关注,这里会列出关联的研究任务。'}
+            title={USERS.research.empty_title}
+            description={USERS.research.empty_description}
           />
         }
       >
         <div class="mb-6 rounded-md border border-[color:var(--border)] bg-[color:var(--panel)] p-4">
-          <div class="mb-2 text-sm font-semibold">该用户的标的</div>
+          <div class="mb-2 text-sm font-semibold">{USERS.research.symbols_title}</div>
           <div class="flex flex-wrap gap-2">
             <For each={symbols()}>
               {(s) => (
@@ -158,7 +153,7 @@ function UserResearchView(props: { actor: ActorRef }) {
                   type="button"
                   class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-1 text-xs font-mono text-[color:var(--text-secondary)] transition hover:border-[color:var(--accent)] hover:bg-[color:var(--accent-soft)] hover:text-[color:var(--text-primary)]"
                   onClick={() => startFor(s)}
-                  title={`为 ${s} 启动研究`}
+                  title={tpl(USERS.research.start_for_title, { symbol: s })}
                 >
                   {s}
                 </button>
@@ -166,16 +161,16 @@ function UserResearchView(props: { actor: ActorRef }) {
             </For>
           </div>
           <div class="mt-2 text-[11px] text-[color:var(--text-muted)]">
-            点击标的可在个股研究模块直接启动新任务
+            {USERS.research.symbols_hint}
           </div>
         </div>
 
-        <div class="text-sm font-semibold mb-3">关联的研究任务</div>
+        <div class="text-sm font-semibold mb-3">{USERS.research.related_title}</div>
         <Show
           when={relatedTasks().length > 0}
           fallback={
             <div class="rounded-md border border-dashed border-[color:var(--border)] p-6 text-center text-sm text-[color:var(--text-muted)]">
-              暂无与该用户标的相关的研究任务。点击上方标的可启动一个。
+              {USERS.research.related_empty}
             </div>
           }
         >
@@ -198,7 +193,7 @@ function UserResearchView(props: { actor: ActorRef }) {
                     </div>
                   </div>
                   <div class="mt-1 text-[11px] text-[color:var(--text-muted)]">
-                    创建于 {formatDate(task.created_at)}
+                    {tpl(USERS.research.created_at, { date: formatDate(task.created_at) })}
                   </div>
                 </button>
               )}
@@ -221,14 +216,10 @@ export default function UsersPage() {
     parseActorKey(params.actorKey ? decodeURIComponent(params.actorKey) : undefined),
   )
 
-  const tab = createMemo<UsersTab>(() => {
-    const t = params.tab as UsersTab | undefined
-    if (t === "profiles" || t === "sessions" || t === "research" || t === "thesis") return t
-    return "portfolio"
-  })
+  const tab = createMemo<UsersTab>(() => resolveUsersTab(params.tab))
 
   const tabsAvailable = createMemo(() =>
-    TAB_LIST.filter((t) => !t.capability || backend.hasCapability(t.capability)),
+    availableUsersTabs((capability) => backend.hasCapability(capability)),
   )
 
   // URL → context 单向同步:把当前 actor 推到 portfolio 和 companyProfiles 两个 store
@@ -251,8 +242,8 @@ export default function UsersPage() {
         fallback={
           <div class="flex h-full items-center justify-center bg-[color:var(--surface)] p-8">
             <EmptyState
-              title="先从左侧选一个用户"
-              description="选定后会在这里横向展开持仓 / 公司画像 / 会话 / 相关研究 4 个视角,无需跨模块重复选人。"
+              title={USERS.page.empty_title}
+              description={USERS.page.empty_description}
             />
           </div>
         }
@@ -279,7 +270,7 @@ export default function UsersPage() {
                     void companyProfiles.refetchProfiles()
                   }}
                 >
-                  刷新
+                  {USERS.page.refresh_button}
                 </Button>
               </div>
             </div>
@@ -287,7 +278,7 @@ export default function UsersPage() {
               <For each={tabsAvailable()}>
                 {(t) => (
                   <TabBtn
-                    label={t.label}
+                    label={USERS.page[t.labelKey]}
                     active={tab() === t.id}
                     onClick={() => switchTab(t.id)}
                   />
@@ -302,14 +293,14 @@ export default function UsersPage() {
               <Show when={tab() === "profiles"}>
                 <CompanyProfileDetail />
               </Show>
-              <Show when={tab() === "thesis"}>
-                <UserThesisView actor={actor()} />
+              <Show when={tab() === "mainline"}>
+                <UserMainlineView actor={actor()} />
               </Show>
               <Show when={tab() === "sessions"}>
                 <UserSessionsView actor={actor()} />
               </Show>
               <Show when={tab() === "research"}>
-                <UserResearchView actor={actor()} />
+                <UserResearchView />
               </Show>
             </div>
           </>

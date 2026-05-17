@@ -2,7 +2,10 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(git rev-parse --show-toplevel)"
+if ! ROOT_DIR="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  echo "install_gitleaks.sh must be run from inside a git checkout" >&2
+  exit 1
+fi
 VERSION="${GITLEAKS_VERSION:-8.30.1}"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH_RAW="$(uname -m)"
@@ -37,21 +40,67 @@ DOWNLOAD_URL="https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}
 
 mkdir -p "$INSTALL_DIR"
 
-if [ ! -x "$BIN_PATH" ]; then
+validate_archive_layout() {
+  local archive_path="$1"
+  local listing
+  if ! listing="$(tar -tzf "$archive_path")"; then
+    echo "failed to inspect gitleaks archive layout: $archive_path" >&2
+    exit 1
+  fi
+
+  local entry
+  while IFS= read -r entry; do
+    if [[ -z "$entry" ]]; then
+      continue
+    fi
+
+    case "$entry" in
+      /*|../*|*/../*|*/..|.|..)
+        echo "gitleaks archive contains unsafe path: $entry" >&2
+        echo "archive: $DOWNLOAD_URL" >&2
+        exit 1
+        ;;
+    esac
+  done <<< "$listing"
+}
+
+if [[ -L "$BIN_PATH" || ! -x "$BIN_PATH" ]]; then
+  if [[ -L "$BIN_PATH" ]]; then
+    rm -f "$BIN_PATH"
+  fi
+
   TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gitleaks-install.XXXXXX")"
   trap 'rm -rf "$TMP_DIR"' EXIT
   ARCHIVE_PATH="$TMP_DIR/$ARCHIVE_NAME"
 
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$DOWNLOAD_URL" -o "$ARCHIVE_PATH"
-  else
-    python3 - <<PY
+    if ! curl --retry 3 --retry-delay 1 -fsSL "$DOWNLOAD_URL" -o "$ARCHIVE_PATH"; then
+      echo "failed to download gitleaks archive: $DOWNLOAD_URL" >&2
+      echo "check network access or set GITLEAKS_VERSION to an available release" >&2
+      exit 1
+    fi
+  elif command -v python3 >/dev/null 2>&1; then
+    if ! python3 - <<PY
 import urllib.request
 urllib.request.urlretrieve("${DOWNLOAD_URL}", "${ARCHIVE_PATH}")
 PY
+    then
+      echo "failed to download gitleaks archive: $DOWNLOAD_URL" >&2
+      echo "check network access or set GITLEAKS_VERSION to an available release" >&2
+      exit 1
+    fi
+  else
+    echo "curl or python3 is required to download gitleaks: $DOWNLOAD_URL" >&2
+    exit 1
   fi
 
+  validate_archive_layout "$ARCHIVE_PATH"
   tar -xzf "$ARCHIVE_PATH" -C "$INSTALL_DIR"
+  if [[ -L "$BIN_PATH" || ! -f "$BIN_PATH" ]]; then
+    echo "downloaded gitleaks archive did not contain expected binary: gitleaks" >&2
+    echo "archive: $DOWNLOAD_URL" >&2
+    exit 1
+  fi
   chmod +x "$BIN_PATH"
 fi
 

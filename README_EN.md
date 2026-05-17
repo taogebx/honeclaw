@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="./resources/logo.svg" alt="Hone honepage - Your Financial Assistant" width="30%">
+  <img src="./resources/logo.svg" alt="Hone homepage - Your Financial Assistant" width="30%">
 </p>
 <p align="center">
   <strong> Hone </strong><br>
   <strong>“Not a chat toy designed to indulge you, but a ruthless defender of your investment discipline.”</strong><br>
-  <em>HoneClaw is dedicated to being a professional investment assistant that truly understands you.</em>
+  <em>Honeclaw is dedicated to being a professional investment assistant that truly understands you.</em>
 
 Why the name Hone:
 
@@ -39,7 +39,7 @@ The public product website is now live at **[hone-claw.com](https://hone-claw.co
 
 - 🧠 **An Absolutely Rational Core**: It does not flatter and does not follow blindly. When you make investment decisions, it cross-checks them against data and predefined discipline, identifying flaws in your reasoning.
 - 📱 **Seamless Cross-Platform Access**: Supports Web, iMessage, Lark, Telegram, and Discord, so you can engage with your investment brain anytime, anywhere.
-- 🗂️ **Company Portraits & Long-term Memory**: Hone can continuously accumulate company profiles and event timelines in Markdown, helping you preserve thesis, key operating metrics, risks, and major developments as a reusable long-term research asset.
+- 🗂️ **Company Portraits & Long-term Memory**: Hone can continuously accumulate company profiles and event timelines in Markdown, helping you preserve investment mainline, key operating metrics, risks, and major developments as a reusable long-term research asset.
 - 📊 **Position Monitoring & Discipline**: Set your take-profit and stop-loss levels, add-to-position logic, and key indicators to watch, and Hone will monitor the market for you like a cold, vigilant sentinel.
 - ⏰ **Powerful Scheduled Tasks (Cron Jobs)**: Supports complex scheduled monitoring tasks, such as pre-market briefings, post-market summaries, and automatic analysis after specific earnings releases.
 - ⚡ **Rust-powered Extreme Performance**: Built entirely in Rust at the core, ensuring millisecond-level responsiveness for messages across multiple platforms with minimal footprint.
@@ -67,7 +67,7 @@ The public product website is now live at **[hone-claw.com](https://hone-claw.co
   <img src="./resources/company_profile.png" alt="Company Portraits - Long-Term Research Memory Dashboard" width="100%">
 </p>
 <p align="center">
-  <em>Company Portraits Dashboard: A centralized UI to manage long-term research memories, sync thesis developments from chats, and review your customized company knowledge base.</em>
+  <em>Company Portraits Dashboard: A centralized UI to manage long-term research memories, sync investment mainline developments from chats, and review your customized company knowledge base.</em>
 </p>
 
 # 3. 🏗️ Getting Started
@@ -118,29 +118,27 @@ hone-cli start
 ```shell
 git clone https://github.com/B-M-Capital-Research/honeclaw.git
 cd honeclaw
-./launch.sh --desktop
+cargo run -p hone-cli -- start --build
 ```
 
 ### What the first startup does
 
-Running `./launch.sh --desktop` walks through **environment prep → builds → process bring-up** in order. The **first** full run usually takes about **10 minutes** (depends on network and CPU).
+Source checkouts use the local CLI build path. Release and Homebrew installs use the packaged `hone-cli start` command. The first source build can take about **10 minutes** depending on network and CPU.
 
-1. **Runtimes & dependencies**: Ensures tools like `bun` and `rustup` are available and installs/syncs project dependencies.
-2. **Build**
-   - **Rust backend**: `hone-desktop` (shell), `hone-web-api` (core API), and per-channel **sidecars**.
-   - **Frontend**: SolidJS + Vite desktop UI, loaded by the shell.
-3. **Bring-up**: Starts the local web stack and data layer under a supervisor and **opens** the desktop window.
+1. **Build**: Compiles `hone-cli`, `hone-console-page`, `hone-mcp`, and enabled channel runtime binaries into the local Cargo target dir.
+2. **Config**: Loads canonical `config.yaml` and generates `data/runtime/effective-config.yaml` for backend and channel processes.
+3. **Bring-up**: Starts the backend and enabled channel listeners in the foreground.
 
-### After the window opens: choose the Agent’s inference backend
+### Choose the Agent’s inference backend
 
-You now decide whether the Agent uses a **local CLI** or an **OpenAI-compatible cloud API**.
+Run the guided setup before starting, or reopen it later:
 
-1. Click **⚙️ Settings** in the lower-left of the main window.
-2. In the **Agent / inference** section, pick one path:
-   - **Local engine (zero config)**: If `gemini cli` or `codex` is installed and running, Hone can discover it—select it from the dropdown; usually no extra fields.
-   - **Cloud API (recommended)**: Otherwise, configure any **OpenAI-compatible** HTTP API (base URL, API key, etc., per provider).
-     - **Suggested pairing**: `OpenRouter` + `Gemini 3.1 Pro` or `Gemini 3.1 Flash`.
-     - **Note**: In our testing, this pairing balances reasoning depth, latency, and context throughput well.
+```shell
+hone-cli onboard
+hone-cli configure --section agent --section channels --section providers
+```
+
+Pick Hone Cloud, a local runner such as Codex ACP or OpenCode ACP, or a legacy local CLI runner such as Gemini / Codex CLI. OpenRouter credentials are configured as provider keys for the routes that need them.
 
 The next section’s screenshots show the full **model and channel** setup.
 
@@ -157,7 +155,7 @@ The next section’s screenshots show the full **model and channel** setup.
   </a>
 </p>
 <p align="center">
-  <em>Left: desktop home—main chat surface, start talking to Hone right away.</em>
+  <em>Left: desktop home—main chat interface, start talking to Hone right away.</em>
   &nbsp;&nbsp;
   <em>Right: Settings—inference backend (cloud or local) and channels such as Feishu, Discord, Telegram, and iMessage.</em>
 </p>
@@ -180,7 +178,7 @@ The next section’s screenshots show the full **model and channel** setup.
 
 These screenshots are illustrative only—Honeclaw supports **many more workflows and setups** you can unlock as you go.
 
-[`CASES_EN.md`](CASES_EN.md) collects **real-style Q&A examples** from Hone (single-stock logic, follow-up questions, daily portfolio-aware suggestions, deep dives, scheduled tasks, theme scouting, and macro). They are laid out as a two-column table on GitHub for quick reading.
+[`CASES_EN.md`](CASES_EN.md) collects **real-world Q&A examples** from Hone (single-stock logic, follow-up questions, daily portfolio-aware suggestions, deep dives, scheduled tasks, theme scouting, and macro). They are laid out as a two-column table on GitHub for quick reading.
 
 # 5. 💡 A Note from the Maintainer
 

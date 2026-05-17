@@ -7,7 +7,7 @@
 //! 3. **解析订阅**:从 `SharedRegistry` 拿到匹配的 (actor, sev) 列表,空则 (0,0);
 //! 4. **per-actor 过滤** loop:LLM 仲裁 / per_actor severity override / quiet
 //!    mode / close-alert demote / prefs filter / high_daily_cap / price band
-//!    cap+gap / same-symbol cooldown;
+//!    advance 规则 / same-symbol cooldown;
 //! 5. **路由**:High → polish + sink.send + delivery_log;
 //!    Medium/Low → digest.enqueue + delivery_log。
 //!
@@ -17,7 +17,7 @@
 use tracing::info;
 
 use crate::digest::time_window::EffectiveTz;
-use crate::event::{MarketEvent, Severity};
+use crate::event::{EventKind, MarketEvent, Severity};
 use crate::prefs::kind_tag;
 use crate::renderer::{self, RenderFormat};
 
@@ -73,11 +73,11 @@ impl NotificationRouter {
             let user_prefs = self.prefs.load(&actor);
             // LLM 仲裁:不确定来源的 Low NewsCritical,按 actor 重要性 prompt
             // 决定是否升 Medium。结果只影响本 actor 的本次分发,不污染原 event。
-            let actor_event_buf;
+            let actor_upgraded_event;
             let (event, sev) = match self.maybe_llm_upgrade_for_actor(event, &user_prefs).await {
                 Some(upgraded) => {
-                    actor_event_buf = upgraded;
-                    (&actor_event_buf, Severity::Medium)
+                    actor_upgraded_event = upgraded;
+                    (&actor_upgraded_event, Severity::Medium)
                 }
                 None => (event, sev),
             };
@@ -126,8 +126,7 @@ impl NotificationRouter {
             // cap=0 关闭该逻辑,与历史行为兼容。
             let mut demoted_by_cap = false;
             let mut demoted_by_cooldown = false;
-            let mut demoted_by_price_cap = false;
-            let mut demoted_by_price_gap = false;
+            let mut demoted_by_price_advance = false;
             let mut effective_sev = if matches!(sev, Severity::High) && self.high_daily_cap > 0 {
                 let since = local_day_start(chrono::Utc::now(), self.tz_offset_hours);
                 let category = event_category(event);
@@ -151,79 +150,122 @@ impl NotificationRouter {
                     }
                     Ok(_) => sev,
                     Err(e) => {
-                        tracing::warn!("count_high_sent_since failed: {e:#}");
+                        tracing::warn!(
+                            actor = %actor_key(&actor),
+                            event_id = %event.id,
+                            source = %event.source,
+                            category = %category,
+                            since = %since,
+                            "count_high_sent_since failed: {e:#}"
+                        );
                         sev
                     }
                 }
             } else {
                 sev
             };
-            if matches!(effective_sev, Severity::High) && is_intraday_price_band_alert(event) {
+            // 价格 band 单一推送规则:新档 pct 必须比当日已 sink-sent 最大档 pct
+            // 至少高出 `price_band_min_advance_pct`,否则降级 digest。这一条规则
+            // 替代了旧的 daily cap + intraday gap —— 因为 band id 已自带「同档位
+            // INSERT IGNORE」防重,所以不再需要时间 gap 兜底;`monotone 新高 + N」
+            // 既保护了「同档位反复震荡不刷屏」(任何 ≤max 的 band 都被挡),又允许
+            // 大行情按节奏全档位推送(每 +N pct 一条)。N=2.0 默认与 band step 一致,
+            // 等价于「每跨一个新 band 必推」。
+            if matches!(effective_sev, Severity::High)
+                && is_intraday_price_band_alert(event)
+                && self.price_band_min_advance_pct > 0.0
+            {
                 if let Some((symbol, direction)) = price_alert_symbol_direction(event) {
-                    if self.price_symbol_direction_daily_cap > 0 {
-                        let since = local_day_start(chrono::Utc::now(), self.tz_offset_hours);
-                        match self.store.count_price_band_sent_since(
+                    let day_start = local_day_start(chrono::Utc::now(), self.tz_offset_hours);
+                    let current_bps = event
+                        .payload
+                        .get("hone_price_band_bps")
+                        .and_then(|v| v.as_i64());
+                    let min_advance_bps = (self.price_band_min_advance_pct * 100.0).round() as i64;
+                    match (
+                        current_bps,
+                        self.store.last_price_band_max_bps_for_symbol_direction(
                             &actor_key(&actor),
                             symbol,
                             direction,
-                            since,
-                        ) {
-                            Ok(n) if n >= self.price_symbol_direction_daily_cap as i64 => {
-                                tracing::info!(
-                                    actor = %actor_key(&actor),
-                                    event_id = %event.id,
-                                    source = %event.source,
-                                    symbol = %symbol,
-                                    direction = %direction,
-                                    today_price_bands = n,
-                                    cap = self.price_symbol_direction_daily_cap,
-                                    "price band demoted to digest (symbol-direction daily cap)"
-                                );
-                                demoted_by_price_cap = true;
-                                effective_sev = Severity::Medium;
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::warn!("count_price_band_sent_since failed: {e:#}");
-                            }
+                            day_start,
+                        ),
+                    ) {
+                        (Some(cur), Ok(Some(prev_max))) if cur < prev_max + min_advance_bps => {
+                            tracing::info!(
+                                actor = %actor_key(&actor),
+                                event_id = %event.id,
+                                source = %event.source,
+                                symbol = %symbol,
+                                direction = %direction,
+                                current_band_bps = cur,
+                                prev_max_band_bps = prev_max,
+                                min_advance_pct = self.price_band_min_advance_pct,
+                                "price band demoted to digest (no monotone advance ≥ min_advance_pct)"
+                            );
+                            demoted_by_price_advance = true;
+                            effective_sev = Severity::Medium;
                         }
-                    }
-                    if matches!(effective_sev, Severity::High)
-                        && self.price_intraday_min_gap_minutes > 0
-                    {
-                        let cutoff = chrono::Utc::now()
-                            - chrono::Duration::minutes(self.price_intraday_min_gap_minutes as i64);
-                        match self.store.last_price_band_sink_send_for_symbol_direction(
-                            &actor_key(&actor),
-                            symbol,
-                            direction,
-                        ) {
-                            Ok(Some(ts)) if ts >= cutoff => {
-                                tracing::info!(
-                                    actor = %actor_key(&actor),
-                                    event_id = %event.id,
-                                    source = %event.source,
-                                    symbol = %symbol,
-                                    direction = %direction,
-                                    last_sent_at = %ts,
-                                    gap_min = self.price_intraday_min_gap_minutes,
-                                    "price band demoted to digest (symbol-direction min gap)"
-                                );
-                                demoted_by_price_gap = true;
-                                effective_sev = Severity::Medium;
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::warn!(
-                                    "last_price_band_sink_send_for_symbol_direction failed for {symbol}: {e:#}"
-                                );
-                            }
+                        (Some(_), Ok(None)) => {
+                            // 当日首条 band —— 直接放行。
+                        }
+                        (Some(_), Ok(Some(_))) => {
+                            // 满足 advance 条件,继续直推。
+                        }
+                        (None, _) => {
+                            // current_bps 取不到,说明 payload 没写 band_bps 字段,
+                            // fallback 到放行(兼容旧事件 / 异常)。
+                        }
+                        (_, Err(e)) => {
+                            tracing::warn!(
+                                "last_price_band_max_bps_for_symbol_direction failed: {e:#}"
+                            );
                         }
                     }
                 }
             }
             // 同 ticker 冷却:如果事件还是 High,且 cooldown>0,检查任一 symbol 最近一次
             // High+sink+sent 的时间戳,若在冷却窗口内则降级进 digest。
+            // AnalystGrade 额外按 gradingCompany 拆冷却 key —— 同 ticker 不同投行
+            // 同分钟到达视为独立信号,不互相冷却(同投行同 ticker 仍受 60min 冷却约束)。
+            // 但同一来源文章(newsURL)拆出的多投行 fanout 仍视为同一批信号,保留
+            // 第一条代表即可,后续降级进 digest。
+            if matches!(effective_sev, Severity::High)
+                && self.same_symbol_cooldown_minutes > 0
+                && matches!(event.kind, EventKind::AnalystGrade)
+            {
+                if let Some((symbol, news_url)) = analyst_grade_source_article_key(event) {
+                    let cutoff = chrono::Utc::now()
+                        - chrono::Duration::minutes(self.same_symbol_cooldown_minutes as i64);
+                    match self.store.last_high_sink_send_for_analyst_news_url(
+                        &actor_key(&actor),
+                        symbol,
+                        news_url,
+                        cutoff,
+                    ) {
+                        Ok(Some(ts)) => {
+                            tracing::info!(
+                                actor = %actor_key(&actor),
+                                event_id = %event.id,
+                                source = %event.source,
+                                symbol = %symbol,
+                                news_url = %news_url,
+                                last_sent_at = %ts,
+                                cooldown_min = self.same_symbol_cooldown_minutes,
+                                "AnalystGrade fanout demoted to digest(same source article already sent)"
+                            );
+                            demoted_by_cooldown = true;
+                            effective_sev = Severity::Medium;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                "last_high_sink_send_for_analyst_news_url failed for {symbol}: {e:#}"
+                            );
+                        }
+                    }
+                }
+            }
             if matches!(effective_sev, Severity::High)
                 && self.same_symbol_cooldown_minutes > 0
                 && !event.symbols.is_empty()
@@ -231,11 +273,21 @@ impl NotificationRouter {
             {
                 let cutoff = chrono::Utc::now()
                     - chrono::Duration::minutes(self.same_symbol_cooldown_minutes as i64);
+                let firm: Option<String> = if matches!(event.kind, EventKind::AnalystGrade) {
+                    event
+                        .payload
+                        .get("gradingCompany")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                } else {
+                    None
+                };
                 for sym in &event.symbols {
                     match self.store.last_high_sink_send_for_symbol_category(
                         &actor_key(&actor),
                         sym,
                         event_category(event),
+                        firm.as_deref(),
                     ) {
                         Ok(Some(ts)) if ts >= cutoff => {
                             tracing::info!(
@@ -359,10 +411,8 @@ impl NotificationRouter {
                             // (sev),方便事后 grep "high + capped/cooled_down" 对账。
                             let status = if demoted_by_cap {
                                 "capped"
-                            } else if demoted_by_price_cap {
-                                "price_capped"
-                            } else if demoted_by_price_gap {
-                                "price_cooled_down"
+                            } else if demoted_by_price_advance {
+                                "price_low_advance"
                             } else if demoted_by_cooldown {
                                 "cooled_down"
                             } else {
@@ -389,7 +439,15 @@ impl NotificationRouter {
                             pending += 1;
                         }
                         Err(e) => {
-                            tracing::warn!("digest enqueue failed: {e:#}");
+                            tracing::warn!(
+                                actor = %actor_key(&actor),
+                                event_id = %event.id,
+                                kind = %kind_tag(&event.kind),
+                                source = %event.source,
+                                symbols = ?event.symbols,
+                                severity = ?sev,
+                                "digest enqueue failed: {e:#}"
+                            );
                             let _ = self.store.log_delivery(
                                 &event.id,
                                 &actor_key(&actor),
@@ -405,4 +463,24 @@ impl NotificationRouter {
         }
         Ok((sent, pending))
     }
+}
+
+fn analyst_grade_source_article_key(event: &MarketEvent) -> Option<(&str, &str)> {
+    if !matches!(event.kind, EventKind::AnalystGrade) {
+        return None;
+    }
+    let symbol = event.symbols.first()?.trim();
+    if symbol.is_empty() {
+        return None;
+    }
+    let news_url = event
+        .payload
+        .get("newsURL")
+        .and_then(|v| v.as_str())
+        .or(event.url.as_deref())?
+        .trim();
+    if news_url.is_empty() {
+        return None;
+    }
+    Some((symbol, news_url))
 }

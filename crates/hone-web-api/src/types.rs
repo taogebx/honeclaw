@@ -25,29 +25,18 @@ pub struct CreateWebInviteRequest {
 }
 
 #[derive(Deserialize)]
-pub struct PublicInviteLoginRequest {
-    pub invite_code: Option<String>,
+pub struct PublicSmsSendRequest {
     pub phone_number: Option<String>,
+    pub captcha_verify_param: Option<String>,
 }
 
 #[derive(Deserialize)]
-pub struct PublicPasswordLoginRequest {
+pub struct PublicSmsLoginRequest {
     pub phone_number: Option<String>,
-    pub password: Option<String>,
+    pub verify_code: Option<String>,
+    pub tos_version: Option<String>,
     #[serde(default)]
     pub remember: bool,
-}
-
-#[derive(Deserialize)]
-pub struct PublicSetPasswordRequest {
-    pub new_password: Option<String>,
-    pub tos_version: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct PublicChangePasswordRequest {
-    pub current_password: Option<String>,
-    pub new_password: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +141,8 @@ pub struct MetaInfo {
     pub api_version: String,
     pub capabilities: Vec<String>,
     pub deployment_mode: String,
+    /// 当前管理员控制台默认语言（"zh" / "en"）
+    pub language: String,
 }
 
 #[derive(Serialize)]
@@ -168,6 +159,11 @@ pub struct WebInviteInfo {
     pub created_at: String,
     pub last_login_at: Option<String>,
     pub revoked_at: Option<String>,
+    pub api_key_prefix: Option<String>,
+    pub api_key_created_at: Option<String>,
+    pub api_key_last_used_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     pub enabled: bool,
     pub active_session_count: u32,
     pub daily_limit: u32,

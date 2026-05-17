@@ -11,8 +11,9 @@ use hone_core::ActorIdentity;
 
 use crate::digest::{DigestItem, DigestPayload, group_by_kind_bucket};
 use crate::event::Severity;
-use crate::renderer::RenderFormat;
+use crate::renderer::{RenderFormat, link_label};
 use crate::router::OutboundSink;
+use crate::sinks::http_error::{format_transport_error, format_upstream_http_error};
 
 pub struct TelegramSink {
     bot_token: String,
@@ -54,11 +55,19 @@ impl TelegramSink {
                 "parse_mode": "HTML",
             }))
             .send()
-            .await?;
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(format_transport_error("telegram", "sendMessage", &err))
+            })?;
         let status = resp.status();
         if !status.is_success() {
             let detail = resp.text().await.unwrap_or_default();
-            anyhow::bail!("telegram sendMessage {status}: {detail}");
+            anyhow::bail!(format_upstream_http_error(
+                "telegram",
+                "sendMessage",
+                status,
+                &detail
+            ));
         }
         Ok(())
     }
@@ -75,7 +84,7 @@ impl OutboundSink for TelegramSink {
     }
 
     /// digest 走 bucket 分组化的 HTML 文本——比扁平 bullet 更易扫读。链接用
-    /// `<a href>` 短锚文本(🔗),`disable_web_page_preview=true` 抑制自动卡片。
+    /// `<a href>` 来源域名锚文本,`disable_web_page_preview=true` 抑制自动卡片。
     /// 主色块用 emoji 球(🔴/🟡/🔵)在标题前缀语义化 severity。
     async fn send_digest(
         &self,
@@ -89,7 +98,7 @@ impl OutboundSink for TelegramSink {
 }
 
 /// 把 `DigestPayload` 渲染成 Telegram `parse_mode=HTML` 文本。bucket 分组,
-/// 标题加 severity 球,链接用 `<a href>🔗</a>` 锚。
+/// 标题加 severity 球,链接用 `<a href>host</a>` 锚。
 pub(crate) fn build_telegram_digest_html(payload: &DigestPayload) -> String {
     let total = payload.total();
     let severity_dot = match payload.max_severity {
@@ -102,21 +111,21 @@ pub(crate) fn build_telegram_digest_html(payload: &DigestPayload) -> String {
     } else {
         format!("{} 📬 {}", severity_dot, payload.label)
     };
-    let mut out = format!("<b>{}</b>", escape_html(&title));
+    let mut html = format!("<b>{}</b>", escape_html(&title));
     let grouped = group_by_kind_bucket(&payload.items);
     for (bucket, items) in grouped {
-        out.push_str("\n\n");
-        out.push_str(&format!(
+        html.push_str("\n\n");
+        html.push_str(&format!(
             "<b>{}</b>",
             escape_html(&format!("{} · {}", bucket.header_label(), items.len()))
         ));
-        for it in items {
-            out.push('\n');
-            out.push_str(&render_telegram_line(it));
+        for item in items {
+            html.push('\n');
+            html.push_str(&render_telegram_line(item));
         }
     }
     if payload.cap_overflow > 0 {
-        out.push_str(&format!(
+        html.push_str(&format!(
             "\n\n<i>{}</i>",
             escape_html(&format!(
                 "另 {} 条因数量上限未展示,发送 /missed 查看完整清单",
@@ -124,19 +133,23 @@ pub(crate) fn build_telegram_digest_html(payload: &DigestPayload) -> String {
             ))
         ));
     }
-    out
+    html
 }
 
-fn render_telegram_line(it: &DigestItem) -> String {
-    let mut out = String::from("• ");
-    if let Some(sym) = &it.primary_symbol {
-        out.push_str(&format!("<b>${}</b> ", escape_html(sym)));
+fn render_telegram_line(item: &DigestItem) -> String {
+    let mut line = String::from("• ");
+    if let Some(symbol) = &item.primary_symbol {
+        line.push_str(&format!("<b>${}</b> ", escape_html(symbol)));
     }
-    out.push_str(&escape_html(it.headline.trim()));
-    if let Some(url) = &it.url {
-        out.push_str(&format!(" <a href=\"{}\">🔗</a>", escape_html_attr(url)));
+    line.push_str(&escape_html(item.headline.trim()));
+    if let Some(url) = &item.url {
+        line.push_str(&format!(
+            " <a href=\"{}\">{}</a>",
+            escape_html_attr(url),
+            escape_html(&link_label(url)),
+        ));
     }
-    out
+    line
 }
 
 fn escape_html(s: &str) -> String {
@@ -213,6 +226,10 @@ mod tests {
             headline: headline.into(),
             url: url.map(String::from),
             occurred_at: Utc::now(),
+            origin: crate::unified_digest::ItemOrigin::Buffered,
+            floor: None,
+            comment: None,
+            mainline_relation: None,
         }
     }
 
@@ -248,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn html_digest_uses_anchor_emoji_link() {
+    fn html_digest_uses_source_anchor_link() {
         let p = payload_with(
             vec![item(
                 EventKind::NewsCritical,
@@ -262,7 +279,7 @@ mod tests {
         );
         let html = build_telegram_digest_html(&p);
         assert!(
-            html.contains(r#"<a href="https://example.com/path">🔗</a>"#),
+            html.contains(r#"<a href="https://example.com/path">example.com</a>"#),
             "html = {html}"
         );
         assert!(html.contains("<b>$MU</b>"));

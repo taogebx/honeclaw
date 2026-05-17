@@ -20,7 +20,9 @@ use super::types::{
     RunnerTimeouts,
 };
 
-pub struct MultiAgentRunner {
+const MULTI_AGENT_LOG_DETAIL_CHARS: usize = 400;
+
+pub(crate) struct MultiAgentRunner {
     system_prompt: String,
     search_config: MultiAgentSearchConfig,
     answer_config: OpencodeAcpConfig,
@@ -31,7 +33,7 @@ pub struct MultiAgentRunner {
 }
 
 impl MultiAgentRunner {
-    pub fn new(
+    pub(crate) fn new(
         system_prompt: String,
         search_config: MultiAgentSearchConfig,
         answer_config: OpencodeAcpConfig,
@@ -181,14 +183,58 @@ Verified search tool transcript (JSON):\n{}",
             .any(|call| matches!(call.name.as_str(), "web_search" | "data_fetch"))
     }
 
+    fn is_trusted_local_direct_return_tool(&self, tool_name: &str) -> bool {
+        matches!(
+            tool_name,
+            "cron_job"
+                | "portfolio"
+                | "local_list_files"
+                | "local_search_files"
+                | "local_read_file"
+        )
+    }
+
+    fn is_local_file_direct_return_tool(&self, tool_name: &str) -> bool {
+        matches!(
+            tool_name,
+            "local_list_files" | "local_search_files" | "local_read_file"
+        )
+    }
+
+    fn is_user_facing_clarification(&self, content: &str) -> bool {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if trimmed.contains('?') || trimmed.contains('？') {
+            return [
+                "请先确认",
+                "请确认",
+                "请提供",
+                "告诉我",
+                "发我",
+                "补充",
+                "确认标的",
+                "确认具体",
+                "哪只",
+                "哪个",
+            ]
+            .iter()
+            .any(|marker| trimmed.contains(marker));
+        }
+        ["请先确认", "请确认", "请提供", "告诉我", "发我"]
+            .iter()
+            .any(|marker| trimmed.starts_with(marker))
+    }
+
     fn build_search_input(&self, runtime_input: &str) -> String {
         format!(
-            "{runtime_input}\n\n[SEARCH STAGE GUIDANCE]\nDecide whether tool use is actually needed for this turn.\nUse `web_search` or `data_fetch` when the answer depends on fresh external facts, live market data, recent news, or other time-sensitive information.\nUse `local_list_files`, `local_search_files`, or `local_read_file` when the answer may exist in the current actor sandbox as local persisted state, such as `company_profiles/`, uploaded files, runtime artifacts, or other user-local notes.\nTreat network search and local file inspection as equal search methods. If local files may materially improve accuracy, inspect them before saying you do not have memory, history, or filesystem access.\nThese local file tools are read-only and scoped to the current actor sandbox only. Do not assume access outside that sandbox.\nDo not call tools just to satisfy workflow.\nIf you do use tools, keep your final search-stage note as a compact internal memo in plain text only.\nDo not use HTML, XML-like tags, Markdown headings, Markdown tables, or channel-specific presentation styles in the search-stage note.\nFocus on factual takeaways and unresolved gaps, not polished formatting.\nGreetings, short meta-chat, and other low-cost turns may be answered directly without tools."
+            "{runtime_input}\n\n[SEARCH STAGE GUIDANCE]\nDecide whether tool use is actually needed for this turn.\nUse `web_search` or `data_fetch` when the answer depends on fresh external facts, live market data, recent news, or other time-sensitive information.\nUse `local_list_files`, `local_search_files`, or `local_read_file` when the answer may exist in the current actor sandbox as local persisted state, such as `company_profiles/`, uploaded files, runtime artifacts, or other user-local notes.\nFor scheduled-task or reminder-management requests such as listing, checking, updating, or deleting the user's tasks, use `cron_job` first (for example `cron_job(action=\"list\")`) instead of market-data tools. Do not substitute `data_fetch` or `web_search` unless the user explicitly asked for fresh external facts.\nIf the user is asking about portfolio state or watchlist state that already lives locally, prefer the dedicated local/state tools before market/news tools.\nFor watchlist reports that ask for stable fields such as hit zones, buy zones, strategy discipline, or 击球区, preserve values found in the current task text, restored context, portfolio/local state, or local files. Use `data_fetch` only for fresh prices, fundamentals, and earnings dates; do not mark existing local hit zones as unknown merely because the market-data tool does not return them.\nTreat the current user message above as the source of truth for search targets. If you call `data_fetch` or `web_search`, the first ticker, company, industry, or query target must be directly derived from the current user message or the most recent explicit topic it clearly follows. Do not revive an older ticker or company from earlier conversation history just because it is present in context.\nFor industry or sector requests such as DRAM, robotics, optical modules, or software infrastructure, search the sector keyword and representative companies first; do not collapse the request to one old ticker unless the current message names that ticker.\nFor short deictic follow-ups after an attachment or recent answer, continue the nearest recent topic. If multiple historical topics could match, ask one brief clarification question instead of picking an older security.\nTreat network search and local file inspection as equal search methods. If local files may materially improve accuracy, inspect them before saying you do not have memory, history, or filesystem access.\nThese local file tools are read-only and scoped to the current actor sandbox only. Do not assume access outside that sandbox.\nDo not call tools just to satisfy workflow.\nIf you do use tools and one trusted local/state lookup already fully resolves the request, return a concise user-ready answer directly instead of a planning memo.\nIf the user message is a short greeting, acknowledgment, or deictic follow-up such as '这个' / '那个' / '上一条', answer directly or ask one brief clarification question. Do not emit a transitional planning sentence as the final output.\nIf you do use tools and still need the answer stage, keep your final search-stage note as a compact internal memo in plain text only.\nDo not use HTML, XML-like tags, Markdown headings, Markdown tables, or channel-specific presentation styles in the search-stage note.\nFocus on factual takeaways and unresolved gaps, not polished formatting.\nGreetings, short meta-chat, and other low-cost turns may be answered directly without tools."
         )
     }
 
     fn should_return_search_response_directly(&self, search_response: &AgentResponse) -> bool {
-        if !search_response.success || !search_response.tool_calls_made.is_empty() {
+        if !search_response.success {
             return false;
         }
         let sanitized = sanitize_user_visible_output(&search_response.content);
@@ -196,10 +242,6 @@ Verified search tool transcript (JSON):\n{}",
             return false;
         }
         let content = sanitized.content.trim();
-        if content.len() > 120 || content.contains('\n') {
-            return false;
-        }
-
         let lowered = content.to_ascii_lowercase();
         let looks_like_working_note = [
             "我先",
@@ -219,7 +261,33 @@ Verified search tool transcript (JSON):\n{}",
         .iter()
         .any(|marker| content.contains(marker) || lowered.contains(marker));
 
-        !looks_like_working_note
+        if looks_like_working_note && !self.is_user_facing_clarification(content) {
+            return false;
+        }
+
+        let only_trusted_local_tools = !search_response.tool_calls_made.is_empty()
+            && search_response.tool_calls_made.len() <= 3
+            && search_response
+                .tool_calls_made
+                .iter()
+                .all(|call| self.is_trusted_local_direct_return_tool(&call.name));
+
+        if only_trusted_local_tools {
+            let includes_local_file_lookup = search_response
+                .tool_calls_made
+                .iter()
+                .any(|call| self.is_local_file_direct_return_tool(&call.name));
+            if includes_local_file_lookup {
+                return content.len() <= 240 && !content.contains('\n');
+            }
+            return true;
+        }
+
+        if content.len() > 240 || content.contains('\n') {
+            return false;
+        }
+
+        search_response.tool_calls_made.is_empty()
     }
 
     fn merge_context_messages(
@@ -307,11 +375,11 @@ impl AgentRunner for MultiAgentRunner {
             "[MultiAgent] session={} actor={} search.provider=openai-compatible search.base_url={} search.model={} answer.runner=opencode_acp answer.base_url={} answer.model={} answer.variant={} answer.max_tool_calls={}",
             request.session_id,
             request.actor.session_id(),
-            self.search_config.base_url,
-            self.search_config.model,
-            self.answer_config.api_base_url,
-            self.answer_config.model,
-            self.answer_config.variant,
+            multi_agent_log_detail(&self.search_config.base_url),
+            multi_agent_log_detail(&self.search_config.model),
+            multi_agent_log_detail(&self.answer_config.api_base_url),
+            multi_agent_log_detail(&self.answer_config.model),
+            multi_agent_log_detail(&self.answer_config.variant),
             self.answer_max_tool_calls,
         );
         let search_started = Instant::now();
@@ -320,8 +388,8 @@ impl AgentRunner for MultiAgentRunner {
                 stage: "multi_agent.search.start",
                 detail: Some(format!(
                     "provider=openai-compatible base_url={} model={} max_iterations={}",
-                    self.search_config.base_url,
-                    self.search_config.model,
+                    multi_agent_log_detail(&self.search_config.base_url),
+                    multi_agent_log_detail(&self.search_config.model),
                     self.search_config.max_iterations
                 )),
             })
@@ -453,7 +521,8 @@ impl AgentRunner for MultiAgentRunner {
                 .emit(AgentRunnerEvent::Progress {
                     stage: "multi_agent.search.direct_return",
                     detail: Some(format!(
-                        "tool_calls=0 content_len={} elapsed_ms={}",
+                        "tool_calls={} content_len={} elapsed_ms={}",
+                        search_response.tool_calls_made.len(),
                         search_response.content.len(),
                         search_elapsed_ms
                     )),
@@ -469,12 +538,8 @@ impl AgentRunner for MultiAgentRunner {
         }
 
         let answer_prompt = format!(
-            "{}\n\n{}",
-            self.system_prompt,
-            format!(
-                "You are in the final answer stage. Prefer the provided verified search results. If absolutely necessary, you may use at most {} extra tool call(s). Follow the active system/channel output format exactly, and do not inherit formatting from search-stage notes unless the system/channel instructions require it.",
-                self.answer_max_tool_calls
-            )
+            "{}\n\nYou are in the final answer stage. Prefer the provided verified search results. If absolutely necessary, you may use at most {} extra tool call(s). Follow the active system/channel output format exactly, and do not inherit formatting from search-stage notes unless the system/channel instructions require it.",
+            self.system_prompt, self.answer_max_tool_calls
         );
         let answer_runtime_input = self.stage_handoff_text(
             &request.runtime_input,
@@ -491,9 +556,9 @@ impl AgentRunner for MultiAgentRunner {
                 stage: "multi_agent.answer.start",
                 detail: Some(format!(
                     "runner=opencode_acp base_url={} model={} variant={} max_tool_calls={}",
-                    self.answer_config.api_base_url,
-                    self.answer_config.model,
-                    self.answer_config.variant,
+                    multi_agent_log_detail(&self.answer_config.api_base_url),
+                    multi_agent_log_detail(&self.answer_config.model),
+                    multi_agent_log_detail(&self.answer_config.variant),
                     self.answer_max_tool_calls
                 )),
             })
@@ -583,9 +648,122 @@ impl AgentRunner for MultiAgentRunner {
     }
 }
 
+fn multi_agent_log_detail(text: &str) -> String {
+    truncate_multi_agent_log_detail(
+        &redact_common_multi_agent_log_secrets(text),
+        MULTI_AGENT_LOG_DETAIL_CHARS,
+    )
+}
+
+fn truncate_multi_agent_log_detail(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    let total = trimmed.chars().count();
+    if total <= max_chars {
+        return trimmed.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let prefix = trimmed.chars().take(keep).collect::<String>();
+    format!("{prefix}…")
+}
+
+fn redact_common_multi_agent_log_secrets(text: &str) -> String {
+    let mut output = redact_multi_agent_marker_value(text, "Bearer ");
+    for key in [
+        "access_token",
+        "accessToken",
+        "api_key",
+        "apiKey",
+        "apikey",
+        "token",
+        "app_secret",
+        "appSecret",
+        "secret",
+        "password",
+    ] {
+        output = redact_multi_agent_marker_value(&output, &format!("{key}="));
+        output = redact_multi_agent_marker_value(&output, &format!("{key}:"));
+        output = redact_multi_agent_json_string_field(&output, key);
+    }
+    output
+}
+
+fn redact_multi_agent_marker_value(text: &str, marker: &str) -> String {
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find(marker) {
+        let value_start = index + marker.len();
+        output.push_str(&remaining[..value_start]);
+        let leading_whitespace = remaining[value_start..]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        output.push_str(&remaining[value_start..value_start + leading_whitespace]);
+        output.push_str("<redacted>");
+        let value_tail = remaining[value_start + leading_whitespace..]
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                (ch == '&'
+                    || ch == ')'
+                    || ch == ','
+                    || ch == '"'
+                    || ch == '\''
+                    || ch == '}'
+                    || ch == ']'
+                    || ch.is_whitespace())
+                .then_some(idx)
+            })
+            .unwrap_or(remaining[value_start + leading_whitespace..].len());
+        remaining = &remaining[value_start + leading_whitespace + value_tail..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn redact_multi_agent_json_string_field(text: &str, key: &str) -> String {
+    let key_marker = format!("\"{key}\"");
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find(&key_marker) {
+        let after_key = index + key_marker.len();
+        let tail = &remaining[after_key..];
+        let Some((colon_offset, _)) = tail.char_indices().find(|(_, ch)| !ch.is_whitespace())
+        else {
+            break;
+        };
+        if !tail[colon_offset..].starts_with(':') {
+            output.push_str(&remaining[..after_key]);
+            remaining = &remaining[after_key..];
+            continue;
+        }
+        let after_colon = &tail[colon_offset + 1..];
+        let Some((quote_offset, _)) = after_colon
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+        else {
+            break;
+        };
+        if !after_colon[quote_offset..].starts_with('"') {
+            output.push_str(&remaining[..after_key]);
+            remaining = &remaining[after_key..];
+            continue;
+        }
+        let value_start = after_key + colon_offset + 1 + quote_offset + 1;
+        output.push_str(&remaining[..value_start]);
+        output.push_str("<redacted>");
+        let value_tail = remaining[value_start..]
+            .char_indices()
+            .find_map(|(idx, ch)| (ch == '"').then_some(idx))
+            .unwrap_or(remaining[value_start..].len());
+        remaining = &remaining[value_start + value_tail..];
+    }
+    output.push_str(remaining);
+    output
+}
+
 #[cfg(test)]
 mod tests {
-    use super::MultiAgentRunner;
+    use super::{MultiAgentRunner, multi_agent_log_detail};
     use hone_core::agent::normalize_agent_messages;
     use hone_core::agent::{AgentContext, AgentMessage, AgentResponse, ToolCallMade};
     use hone_core::config::{MultiAgentSearchConfig, OpencodeAcpConfig};
@@ -613,6 +791,20 @@ mod tests {
             Arc::new(ToolRegistry::new()),
             None,
         )
+    }
+
+    #[test]
+    fn multi_agent_log_detail_redacts_common_secret_shapes() {
+        let detail = multi_agent_log_detail(
+            r#"https://api.example.test/v1?api_key=query-secret model=Bearer bearer-secret {"token":"json-secret"}"#,
+        );
+
+        assert!(detail.contains("api_key=<redacted>"));
+        assert!(detail.contains("Bearer <redacted>"));
+        assert!(detail.contains("\"token\":\"<redacted>\""));
+        assert!(!detail.contains("query-secret"));
+        assert!(!detail.contains("bearer-secret"));
+        assert!(!detail.contains("json-secret"));
     }
 
     #[test]
@@ -740,6 +932,15 @@ mod tests {
         assert!(
             input.contains("Use `local_list_files`, `local_search_files`, or `local_read_file`")
         );
+        assert!(input.contains("use `cron_job` first"));
+        assert!(input.contains("trusted local/state lookup already fully resolves"));
+        assert!(input.contains("stable fields such as hit zones"));
+        assert!(input.contains("do not mark existing local hit zones as unknown"));
+        assert!(input.contains("deictic follow-up"));
+        assert!(input.contains("current user message above as the source of truth"));
+        assert!(input.contains("Do not revive an older ticker"));
+        assert!(input.contains("industry or sector requests such as DRAM"));
+        assert!(input.contains("continue the nearest recent topic"));
         assert!(input.contains("equal search methods"));
         assert!(input.contains("plain text only"));
         assert!(input.contains("Do not use HTML"));
@@ -791,6 +992,21 @@ mod tests {
     }
 
     #[test]
+    fn user_facing_clarification_can_return_directly() {
+        let runner = make_runner();
+        let response = AgentResponse {
+            content: "请先确认具体是哪只股票/资产的 ticker？确认标的后我再校验当前价格、财报、估值倍数和同业，再判断估值是否合理。"
+                .to_string(),
+            tool_calls_made: Vec::new(),
+            iterations: 1,
+            success: true,
+            error: None,
+        };
+
+        assert!(runner.should_return_search_response_directly(&response));
+    }
+
+    #[test]
     fn tool_backed_search_response_does_not_skip_answer_stage() {
         let runner = make_runner();
         let response = AgentResponse {
@@ -811,10 +1027,32 @@ mod tests {
     }
 
     #[test]
-    fn local_file_tool_calls_also_force_answer_stage() {
+    fn concise_local_file_answer_can_return_directly() {
         let runner = make_runner();
         let response = AgentResponse {
-            content: "本地检索摘要".to_string(),
+            content: "当前附件目录里只有之前的图片，没有新的 Markdown 文件落进来。".to_string(),
+            tool_calls_made: vec![ToolCallMade {
+                name: "local_search_files".to_string(),
+                arguments: json!({"query": "AAOI", "path": "company_profiles"}),
+                result: json!({"matches": [{"path": "company_profiles/aaoi/profile.md"}]}),
+                tool_call_id: None,
+            }],
+            iterations: 2,
+            success: true,
+            error: None,
+        };
+
+        assert!(runner.should_return_search_response_directly(&response));
+        assert!(!runner.has_live_search_tool_call(&response.tool_calls_made));
+    }
+
+    #[test]
+    fn multiline_local_file_summary_still_requires_answer_stage() {
+        let runner = make_runner();
+        let response = AgentResponse {
+            content:
+                "我在本地找到了 3 份相关文件：\n1. company_profiles/aaoi/profile.md\n2. uploads/session-1/note.md\n3. uploads/session-1/chart.png"
+                    .to_string(),
             tool_calls_made: vec![ToolCallMade {
                 name: "local_search_files".to_string(),
                 arguments: json!({"query": "AAOI", "path": "company_profiles"}),
@@ -828,6 +1066,91 @@ mod tests {
 
         assert!(!runner.should_return_search_response_directly(&response));
         assert!(!runner.has_live_search_tool_call(&response.tool_calls_made));
+    }
+
+    #[test]
+    fn trusted_local_tool_answer_can_return_directly() {
+        let runner = make_runner();
+        let response = AgentResponse {
+            content: "你当前有 3 个定时任务：1. 早报 09:00；2. 财报提醒 20:30；3. ASTS 价格提醒。"
+                .to_string(),
+            tool_calls_made: vec![ToolCallMade {
+                name: "cron_job".to_string(),
+                arguments: json!({"action": "list"}),
+                result: json!({"success": true, "jobs": [{"id": "1"}, {"id": "2"}, {"id": "3"}]}),
+                tool_call_id: None,
+            }],
+            iterations: 1,
+            success: true,
+            error: None,
+        };
+
+        assert!(runner.should_return_search_response_directly(&response));
+    }
+
+    #[test]
+    fn multiline_trusted_local_tool_answer_can_return_directly() {
+        let runner = make_runner();
+        let response = AgentResponse {
+            content: "你当前有 3 个定时任务：\n1. 早报：每天 09:00\n2. 财报提醒：每天 20:30\n3. ASTS 价格提醒：heartbeat"
+                .to_string(),
+            tool_calls_made: vec![ToolCallMade {
+                name: "cron_job".to_string(),
+                arguments: json!({"action": "list"}),
+                result: json!({
+                    "success": true,
+                    "jobs": [{"id": "1"}, {"id": "2"}, {"id": "3"}]
+                }),
+                tool_call_id: None,
+            }],
+            iterations: 1,
+            success: true,
+            error: None,
+        };
+
+        assert!(runner.should_return_search_response_directly(&response));
+    }
+
+    #[test]
+    fn long_trusted_local_tool_answer_can_return_directly() {
+        let runner = make_runner();
+        let response = AgentResponse {
+            content: "你当前有 3 个定时任务：早报每天 09:00，财报提醒每天 20:30，ASTS 价格提醒按 heartbeat 每 30 分钟轮询，并且都遵守 quiet_hours。"
+                .repeat(3),
+            tool_calls_made: vec![ToolCallMade {
+                name: "cron_job".to_string(),
+                arguments: json!({"action": "list"}),
+                result: json!({
+                    "success": true,
+                    "jobs": [{"id": "1"}, {"id": "2"}, {"id": "3"}]
+                }),
+                tool_call_id: None,
+            }],
+            iterations: 1,
+            success: true,
+            error: None,
+        };
+
+        assert!(runner.should_return_search_response_directly(&response));
+    }
+
+    #[test]
+    fn live_market_tool_answer_still_requires_answer_stage() {
+        let runner = make_runner();
+        let response = AgentResponse {
+            content: "AAPL 最新报价 210.31，盘前跌 0.4%。".to_string(),
+            tool_calls_made: vec![ToolCallMade {
+                name: "data_fetch".to_string(),
+                arguments: json!({"data_type": "quote", "symbol": "AAPL"}),
+                result: json!({"price": 210.31}),
+                tool_call_id: None,
+            }],
+            iterations: 1,
+            success: true,
+            error: None,
+        };
+
+        assert!(!runner.should_return_search_response_directly(&response));
     }
 
     #[test]

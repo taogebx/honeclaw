@@ -16,6 +16,13 @@ struct CapturingSink {
     calls: Mutex<Vec<(String, String)>>,
 }
 
+impl CapturingSink {
+    fn assert_no_calls(&self) {
+        let calls = self.calls.lock().unwrap();
+        assert!(calls.is_empty(), "expected no sink calls, got {calls:?}");
+    }
+}
+
 #[async_trait]
 impl OutboundSink for CapturingSink {
     async fn send(&self, actor: &ActorIdentity, body: &str) -> anyhow::Result<()> {
@@ -250,6 +257,186 @@ async fn same_symbol_cooldown_demotes_second_high_to_digest() {
     assert_eq!(s3 + p3, 0, "未订阅 NVDA,不应 dispatch");
 }
 
+fn analyst_grade_ev(id: &str, symbol: &str, firm: &str) -> MarketEvent {
+    MarketEvent {
+        id: id.into(),
+        kind: EventKind::AnalystGrade,
+        severity: Severity::High,
+        symbols: vec![symbol.into()],
+        occurred_at: Utc::now(),
+        title: format!("{symbol} {firm} upgrade"),
+        summary: String::new(),
+        url: None,
+        source: "fmp.grade".into(),
+        payload: serde_json::json!({"gradingCompany": firm, "action": "upgrade"}),
+    }
+}
+
+#[tokio::test]
+async fn analyst_grade_two_firms_same_symbol_both_pass() {
+    let mut reg = SubscriptionRegistry::new();
+    reg.register(Box::new(PortfolioSubscription::new(
+        actor("u1"),
+        vec!["SNDK".into()],
+    )));
+    let sink = Arc::new(CapturingSink::default());
+    let dir = tempdir().unwrap();
+    let store = Arc::new(EventStore::open(dir.path().join("e.db")).unwrap());
+    let digest = Arc::new(DigestBuffer::new(dir.path().join("digest")).unwrap());
+    let router = NotificationRouter::new(
+        Arc::new(SharedRegistry::from_registry(reg)),
+        sink.clone(),
+        store.clone(),
+        digest,
+    )
+    .with_same_symbol_cooldown_minutes(60);
+
+    let goldman = analyst_grade_ev("grade:SNDK:t1:Goldman Sachs", "SNDK", "Goldman Sachs");
+    store.insert_event(&goldman).unwrap();
+    assert_eq!(router.dispatch(&goldman).await.unwrap(), (1, 0));
+
+    // 同 ticker 不同投行,60min 冷却内仍应直推
+    let raymond = analyst_grade_ev("grade:SNDK:t2:Raymond James", "SNDK", "Raymond James");
+    store.insert_event(&raymond).unwrap();
+    assert_eq!(
+        router.dispatch(&raymond).await.unwrap(),
+        (1, 0),
+        "不同投行不应被同 ticker cooldown 互相阻塞"
+    );
+    assert_eq!(sink.calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn analyst_grade_same_news_url_fanout_demotes_second_firm() {
+    let mut reg = SubscriptionRegistry::new();
+    reg.register(Box::new(PortfolioSubscription::new(
+        actor("u1"),
+        vec!["AMD".into()],
+    )));
+    let sink = Arc::new(CapturingSink::default());
+    let dir = tempdir().unwrap();
+    let store = Arc::new(EventStore::open(dir.path().join("e.db")).unwrap());
+    let digest = Arc::new(DigestBuffer::new(dir.path().join("digest")).unwrap());
+    let router = NotificationRouter::new(
+        Arc::new(SharedRegistry::from_registry(reg)),
+        sink.clone(),
+        store.clone(),
+        digest.clone(),
+    )
+    .with_same_symbol_cooldown_minutes(60);
+
+    let url = "https://thefly.com/ajax/news_get.php?id=4346982";
+    let mut jefferies = analyst_grade_ev("grade:AMD:t:Jefferies", "AMD", "Jefferies");
+    jefferies.url = Some(url.into());
+    jefferies.payload = serde_json::json!({
+        "gradingCompany": "Jefferies",
+        "action": "downgrade",
+        "previousGrade": "Buy",
+        "newGrade": "Hold",
+        "newsURL": url
+    });
+    let mut btig = analyst_grade_ev("grade:AMD:t:BTIG", "AMD", "BTIG");
+    btig.url = Some(url.into());
+    btig.payload = serde_json::json!({
+        "gradingCompany": "BTIG",
+        "action": "upgrade",
+        "previousGrade": null,
+        "newGrade": "Buy",
+        "newsURL": url
+    });
+    store.insert_event(&jefferies).unwrap();
+    store.insert_event(&btig).unwrap();
+
+    assert_eq!(router.dispatch(&jefferies).await.unwrap(), (1, 0));
+    assert_eq!(
+        router.dispatch(&btig).await.unwrap(),
+        (0, 1),
+        "same ticker + same analyst source article should not fan out as multiple sink pushes"
+    );
+    assert_eq!(sink.calls.lock().unwrap().len(), 1);
+    let drained = digest.drain_actor(&actor("u1")).unwrap();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].id, btig.id);
+}
+
+#[tokio::test]
+async fn analyst_grade_same_firm_same_symbol_demotes() {
+    let mut reg = SubscriptionRegistry::new();
+    reg.register(Box::new(PortfolioSubscription::new(
+        actor("u1"),
+        vec!["SNDK".into()],
+    )));
+    let sink = Arc::new(CapturingSink::default());
+    let dir = tempdir().unwrap();
+    let store = Arc::new(EventStore::open(dir.path().join("e.db")).unwrap());
+    let digest = Arc::new(DigestBuffer::new(dir.path().join("digest")).unwrap());
+    let router = NotificationRouter::new(
+        Arc::new(SharedRegistry::from_registry(reg)),
+        sink.clone(),
+        store.clone(),
+        digest,
+    )
+    .with_same_symbol_cooldown_minutes(60);
+
+    let first = analyst_grade_ev("grade:SNDK:t1:Goldman Sachs", "SNDK", "Goldman Sachs");
+    store.insert_event(&first).unwrap();
+    assert_eq!(router.dispatch(&first).await.unwrap(), (1, 0));
+
+    // 同投行同 ticker 60min 内仍应降级 —— 防"同投行刷数据"
+    let second = analyst_grade_ev("grade:SNDK:t2:Goldman Sachs", "SNDK", "Goldman Sachs");
+    store.insert_event(&second).unwrap();
+    assert_eq!(
+        router.dispatch(&second).await.unwrap(),
+        (0, 1),
+        "同投行同 ticker 应被冷却"
+    );
+}
+
+#[tokio::test]
+async fn analyst_grade_missing_grading_company_falls_back_to_global_cooldown() {
+    let mut reg = SubscriptionRegistry::new();
+    reg.register(Box::new(PortfolioSubscription::new(
+        actor("u1"),
+        vec!["SNDK".into()],
+    )));
+    let sink = Arc::new(CapturingSink::default());
+    let dir = tempdir().unwrap();
+    let store = Arc::new(EventStore::open(dir.path().join("e.db")).unwrap());
+    let digest = Arc::new(DigestBuffer::new(dir.path().join("digest")).unwrap());
+    let router = NotificationRouter::new(
+        Arc::new(SharedRegistry::from_registry(reg)),
+        sink.clone(),
+        store.clone(),
+        digest,
+    )
+    .with_same_symbol_cooldown_minutes(60);
+
+    // payload 没 gradingCompany,firm = None,走旧的 analyst 共冷却(防御性 fallback)
+    let mk = |id: &str| MarketEvent {
+        id: id.into(),
+        kind: EventKind::AnalystGrade,
+        severity: Severity::High,
+        symbols: vec!["SNDK".into()],
+        occurred_at: Utc::now(),
+        title: "grade no firm".into(),
+        summary: String::new(),
+        url: None,
+        source: "fmp.grade".into(),
+        payload: serde_json::json!({"action": "upgrade"}),
+    };
+    let a = mk("grade:SNDK:t1:unknown_a");
+    store.insert_event(&a).unwrap();
+    assert_eq!(router.dispatch(&a).await.unwrap(), (1, 0));
+
+    let b = mk("grade:SNDK:t2:unknown_b");
+    store.insert_event(&b).unwrap();
+    assert_eq!(
+        router.dispatch(&b).await.unwrap(),
+        (0, 1),
+        "缺 gradingCompany 时应回落到全 analyst 共冷却"
+    );
+}
+
 #[tokio::test]
 async fn cooldown_zero_means_no_throttle() {
     let mut reg = SubscriptionRegistry::new();
@@ -280,7 +467,9 @@ async fn cooldown_zero_means_no_throttle() {
 }
 
 #[tokio::test]
-async fn price_band_uses_price_specific_gap_instead_of_generic_symbol_cooldown() {
+async fn price_band_bypasses_generic_same_symbol_cooldown() {
+    // 价格 band 的限流走自己的 advance 规则,不应被通用 same_symbol_cooldown
+    // 误伤。AAOI 6→8 即两条单调新高,advance=2 下都应直推。
     let mut reg = SubscriptionRegistry::new();
     reg.register(Box::new(PortfolioSubscription::new(
         actor("u1"),
@@ -297,8 +486,7 @@ async fn price_band_uses_price_specific_gap_instead_of_generic_symbol_cooldown()
         digest,
     )
     .with_same_symbol_cooldown_minutes(60)
-    .with_price_intraday_min_gap_minutes(0)
-    .with_price_symbol_direction_daily_cap(0);
+    .with_price_band_min_advance_pct(2.0);
 
     let first = price_band_ev("AAOI", "up", 600, 6.18);
     let second = price_band_ev("AAOI", "up", 800, 8.12);
@@ -309,13 +497,15 @@ async fn price_band_uses_price_specific_gap_instead_of_generic_symbol_cooldown()
     assert_eq!(
         router.dispatch(&second).await.unwrap(),
         (1, 0),
-        "价格 band 应绕开通用同 ticker cooldown"
+        "价格 band 应绕开通用同 ticker cooldown 走自己的 advance 规则"
     );
     assert_eq!(sink.calls.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
-async fn price_band_min_gap_demotes_next_band_to_digest() {
+async fn price_band_advance_rule_demotes_band_below_min_advance() {
+    // 6% 已 sink-sent 后,7% / 6% / 5% 都不满足 monotone 新高 + 2pct,应降级。
+    // 8% 满足(8 ≥ 6 + 2),允许直推。这是 advance 规则的核心防震荡职责。
     let mut reg = SubscriptionRegistry::new();
     reg.register(Box::new(PortfolioSubscription::new(
         actor("u1"),
@@ -331,54 +521,35 @@ async fn price_band_min_gap_demotes_next_band_to_digest() {
         store.clone(),
         digest,
     )
-    .with_price_intraday_min_gap_minutes(60)
-    .with_price_symbol_direction_daily_cap(0);
+    .with_price_band_min_advance_pct(2.0);
 
     let first = price_band_ev("AAOI", "up", 600, 6.18);
-    let second = price_band_ev("AAOI", "up", 800, 8.12);
+    // 同档位再来一次 —— id 相同,理论上 INSERT IGNORE 已挡掉,但 dispatch 层
+    // 也应直接降级(不依赖 store 防重)。
+    let same_again = price_band_ev("AAOI", "up", 600, 6.50);
+    let advanced = price_band_ev("AAOI", "up", 800, 8.12);
     store.insert_event(&first).unwrap();
-    store.insert_event(&second).unwrap();
+    store.insert_event(&same_again).unwrap();
+    store.insert_event(&advanced).unwrap();
 
     assert_eq!(router.dispatch(&first).await.unwrap(), (1, 0));
-    assert_eq!(router.dispatch(&second).await.unwrap(), (0, 1));
-    assert_eq!(sink.calls.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn price_band_symbol_direction_daily_cap_demotes_third_band() {
-    let mut reg = SubscriptionRegistry::new();
-    reg.register(Box::new(PortfolioSubscription::new(
-        actor("u1"),
-        vec!["AAOI".into()],
-    )));
-    let sink = Arc::new(CapturingSink::default());
-    let dir = tempdir().unwrap();
-    let store = Arc::new(EventStore::open(dir.path().join("e.db")).unwrap());
-    let digest = Arc::new(DigestBuffer::new(dir.path().join("digest")).unwrap());
-    let router = NotificationRouter::new(
-        Arc::new(SharedRegistry::from_registry(reg)),
-        sink.clone(),
-        store.clone(),
-        digest,
-    )
-    .with_price_intraday_min_gap_minutes(0)
-    .with_price_symbol_direction_daily_cap(2);
-
-    let first = price_band_ev("AAOI", "up", 600, 6.18);
-    let second = price_band_ev("AAOI", "up", 800, 8.12);
-    let third = price_band_ev("AAOI", "up", 1000, 10.35);
-    for event in [&first, &second, &third] {
-        store.insert_event(event).unwrap();
-    }
-
-    assert_eq!(router.dispatch(&first).await.unwrap(), (1, 0));
-    assert_eq!(router.dispatch(&second).await.unwrap(), (1, 0));
-    assert_eq!(router.dispatch(&third).await.unwrap(), (0, 1));
+    assert_eq!(
+        router.dispatch(&same_again).await.unwrap(),
+        (0, 1),
+        "同档位再来一次应降级(未达新高 + 2pct)"
+    );
+    assert_eq!(
+        router.dispatch(&advanced).await.unwrap(),
+        (1, 0),
+        "8% 满足 6+2=8 应直推"
+    );
     assert_eq!(sink.calls.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
-async fn price_band_direction_cap_is_independent_for_reversal() {
+async fn price_band_advance_rule_passes_full_aaoi_2026_05_01_sequence() {
+    // POC 标志案例:AAOI 2026-05-01 序列 6→8→10→12→14→16,在 advance=2 规则下
+    // 应当全部 6 条直推 —— 旧 cap=2 仅给 6/8 严重失声,这条测试锁死回归。
     let mut reg = SubscriptionRegistry::new();
     reg.register(Box::new(PortfolioSubscription::new(
         actor("u1"),
@@ -394,10 +565,52 @@ async fn price_band_direction_cap_is_independent_for_reversal() {
         store.clone(),
         digest,
     )
-    .with_price_intraday_min_gap_minutes(0)
-    .with_price_symbol_direction_daily_cap(1);
+    .with_price_band_min_advance_pct(2.0);
 
-    let up = price_band_ev("AAOI", "up", 600, 6.18);
+    let bands = [
+        price_band_ev("AAOI", "up", 600, 6.18),
+        price_band_ev("AAOI", "up", 800, 8.12),
+        price_band_ev("AAOI", "up", 1000, 10.35),
+        price_band_ev("AAOI", "up", 1200, 12.50),
+        price_band_ev("AAOI", "up", 1400, 14.20),
+        price_band_ev("AAOI", "up", 1600, 16.30),
+    ];
+    for ev in &bands {
+        store.insert_event(ev).unwrap();
+    }
+    for ev in &bands {
+        assert_eq!(
+            router.dispatch(ev).await.unwrap(),
+            (1, 0),
+            "band {} 应直推(monotone 新高 + 2pct)",
+            ev.id,
+        );
+    }
+    assert_eq!(sink.calls.lock().unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn price_band_advance_rule_separates_up_and_down_lanes() {
+    // 上行 lane 推过的最大档不应阻挡下行 lane 的首条 band —— direction 相反应
+    // 视为独立信号(行情反转的开盘锤入,值得告知)。
+    let mut reg = SubscriptionRegistry::new();
+    reg.register(Box::new(PortfolioSubscription::new(
+        actor("u1"),
+        vec!["AAOI".into()],
+    )));
+    let sink = Arc::new(CapturingSink::default());
+    let dir = tempdir().unwrap();
+    let store = Arc::new(EventStore::open(dir.path().join("e.db")).unwrap());
+    let digest = Arc::new(DigestBuffer::new(dir.path().join("digest")).unwrap());
+    let router = NotificationRouter::new(
+        Arc::new(SharedRegistry::from_registry(reg)),
+        sink.clone(),
+        store.clone(),
+        digest,
+    )
+    .with_price_band_min_advance_pct(2.0);
+
+    let up = price_band_ev("AAOI", "up", 1200, 12.50);
     let down = price_band_ev("AAOI", "down", 600, -6.30);
     store.insert_event(&up).unwrap();
     store.insert_event(&down).unwrap();
@@ -406,8 +619,41 @@ async fn price_band_direction_cap_is_independent_for_reversal() {
     assert_eq!(
         router.dispatch(&down).await.unwrap(),
         (1, 0),
-        "正向 cap 不应挡住负向独立 lane"
+        "down lane 是独立通道,不该被 up lane 的 max_band 影响"
     );
+    assert_eq!(sink.calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn price_band_advance_rule_disabled_when_zero() {
+    // advance=0 关闭单一规则,所有 band 都直推 —— 与「无脑全推」语义一致,
+    // 仅靠 INSERT IGNORE 防同档位重复。
+    let mut reg = SubscriptionRegistry::new();
+    reg.register(Box::new(PortfolioSubscription::new(
+        actor("u1"),
+        vec!["AAOI".into()],
+    )));
+    let sink = Arc::new(CapturingSink::default());
+    let dir = tempdir().unwrap();
+    let store = Arc::new(EventStore::open(dir.path().join("e.db")).unwrap());
+    let digest = Arc::new(DigestBuffer::new(dir.path().join("digest")).unwrap());
+    let router = NotificationRouter::new(
+        Arc::new(SharedRegistry::from_registry(reg)),
+        sink.clone(),
+        store.clone(),
+        digest,
+    )
+    .with_price_band_min_advance_pct(0.0);
+
+    let first = price_band_ev("AAOI", "up", 800, 8.10);
+    // 反过来推 6%(在 advance>0 下会被降级),advance=0 应允许直推。
+    let lower = price_band_ev("AAOI", "up", 600, 6.20);
+    store.insert_event(&first).unwrap();
+    store.insert_event(&lower).unwrap();
+
+    assert_eq!(router.dispatch(&first).await.unwrap(), (1, 0));
+    assert_eq!(router.dispatch(&lower).await.unwrap(), (1, 0));
+    assert_eq!(sink.calls.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -417,7 +663,7 @@ async fn medium_and_low_are_deferred_to_digest() {
     let (sent_l, pending_l) = router.dispatch(&ev(Severity::Low)).await.unwrap();
     assert_eq!(sent_m + sent_l, 0);
     assert_eq!(pending_m + pending_l, 2);
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 }
 
 #[tokio::test]
@@ -489,7 +735,7 @@ async fn disabled_prefs_skip_send_and_enqueue() {
     let (sent_m, pending_m) = router.dispatch(&ev(Severity::Medium)).await.unwrap();
     assert_eq!(sent_h + sent_m, 0);
     assert_eq!(pending_h + pending_m, 0);
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 }
 
 #[tokio::test]
@@ -546,7 +792,7 @@ async fn portfolio_only_prefs_drop_symbolless_events() {
     macro_ev.symbols.clear();
     let (sent, _pending) = router.dispatch(&macro_ev).await.unwrap();
     assert_eq!(sent, 0);
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 
     // 命中 symbol 的事件仍应送达
     let (sent, _pending) = router.dispatch(&ev(Severity::High)).await.unwrap();
@@ -661,7 +907,7 @@ async fn legal_ad_high_is_demoted_before_sink() {
     let (sent, pending) = router.dispatch(&event).await.unwrap();
     assert_eq!(sent, 0);
     assert_eq!(pending, 1, "法律广告即使误标 High 也应进 digest");
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 }
 
 #[tokio::test]
@@ -718,7 +964,7 @@ async fn low_news_upgrades_to_medium_when_same_day_hard_signal_exists() {
     let (sent, pending) = router.dispatch(&news).await.unwrap();
     assert_eq!(sent, 0);
     assert_eq!(pending, 1, "Low 新闻应被升到 Medium 后入 digest");
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 }
 
 #[tokio::test]
@@ -850,12 +1096,12 @@ async fn low_news_stays_low_without_same_day_signal() {
     let (sent, pending) = router.dispatch(&news).await.unwrap();
     assert_eq!(sent, 0);
     assert_eq!(pending, 1);
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 }
 
 #[tokio::test]
 async fn globally_disabled_kind_is_dropped_before_prefs() {
-    // 部署方把 press_release 放入全局黑名单。即便订阅命中,dispatch 也应
+    // 部署方把 social_post 放入全局黑名单。即便订阅命中,dispatch 也应
     // 返回 (0, 0),既不 sink 也不 enqueue,且 delivery_log 无记录。
     let mut reg = SubscriptionRegistry::new();
     reg.register(Box::new(PortfolioSubscription::new(
@@ -872,24 +1118,24 @@ async fn globally_disabled_kind_is_dropped_before_prefs() {
         store.clone(),
         digest,
     )
-    .with_disabled_kinds(["press_release"]);
+    .with_disabled_kinds(["social_post"]);
 
-    let pr = MarketEvent {
-        id: "pr:AAPL:1".into(),
-        kind: EventKind::PressRelease,
+    let blocked = MarketEvent {
+        id: "social:AAPL:1".into(),
+        kind: EventKind::SocialPost,
         severity: Severity::High,
         symbols: vec!["AAPL".into()],
         occurred_at: Utc::now(),
-        title: "AAPL announces".into(),
+        title: "AAPL chatter".into(),
         summary: String::new(),
         url: None,
         source: "test".into(),
         payload: serde_json::Value::Null,
     };
-    let (sent, pending) = router.dispatch(&pr).await.unwrap();
+    let (sent, pending) = router.dispatch(&blocked).await.unwrap();
     assert_eq!(sent, 0);
     assert_eq!(pending, 0);
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 
     // 非黑名单 kind 不受影响
     let (sent, _) = router.dispatch(&ev(Severity::High)).await.unwrap();
@@ -944,7 +1190,7 @@ async fn llm_classifier_upgrades_uncertain_news_to_medium_for_actor() {
     // 升 Medium 后走 digest,immediate sink 仍为 0
     assert_eq!(sent, 0);
     assert_eq!(pending, 1, "LLM 升级后应进 digest");
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 }
 
 /// e2e:LLM 返回 NotImportant 时,uncertain 源新闻保持 Low,正常进 digest。
@@ -992,7 +1238,7 @@ async fn llm_classifier_keeps_low_when_not_important() {
     let (sent, pending) = router.dispatch(&news).await.unwrap();
     assert_eq!(sent, 0);
     assert_eq!(pending, 1);
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 }
 
 /// e2e:trusted 源 News 不走 LLM(LLM 即便返回 Important 也不应触发,
@@ -1470,7 +1716,7 @@ async fn per_actor_price_threshold_below_system_floor_stays_digest() {
     let (sent, pending) = router.dispatch(&ev).await.unwrap();
     assert_eq!(sent, 0, "低于系统直推地板不应即时推");
     assert_eq!(pending, 1);
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 }
 
 #[tokio::test]
@@ -1635,7 +1881,7 @@ async fn price_close_direct_disabled_keeps_closing_move_in_digest() {
     let (sent, pending) = router.dispatch(&ev).await.unwrap();
     assert_eq!(sent, 0, "默认不应在收盘时间即时推价格异动");
     assert_eq!(pending, 1);
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 }
 
 #[tokio::test]
@@ -1801,7 +2047,7 @@ async fn per_actor_immediate_kinds_does_not_resurrect_low_signal_news() {
     let (sent, pending) = router.dispatch(&news).await.unwrap();
     assert_eq!(sent, 0, "Low news must not be forced into sink");
     assert_eq!(pending, 1, "Low news can still queue normally for digest");
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 }
 
 #[tokio::test]
@@ -1855,7 +2101,7 @@ async fn per_actor_immediate_kinds_skips_noop_analyst_grade() {
     let (sent, pending) = router.dispatch(&ev).await.unwrap();
     assert_eq!(sent, 0, "评级没有变化时不应被 immediate_kinds 强制直推");
     assert_eq!(pending, 1);
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 }
 
 #[tokio::test]
@@ -1958,7 +2204,7 @@ async fn per_actor_overrides_default_off_keeps_legacy_behavior() {
     let (sent, pending) = router.dispatch(&price_low).await.unwrap();
     assert_eq!(sent, 0);
     assert_eq!(pending, 1);
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 }
 
 #[tokio::test]
@@ -1969,7 +2215,7 @@ async fn event_without_subscribers_is_no_op() {
     let (sent, pending) = router.dispatch(&e).await.unwrap();
     assert_eq!(sent, 0);
     assert_eq!(pending, 0);
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 }
 
 /// 构造一个跨当前 UTC 分钟的 quiet_hours 区间(±30min,跨午夜安全)。
@@ -2086,5 +2332,5 @@ async fn quiet_does_not_hold_medium_to_digest() {
     let (sent, pending) = router.dispatch(&event).await.unwrap();
     assert_eq!(sent, 0);
     assert_eq!(pending, 1, "Medium event should still enqueue to digest");
-    assert!(sink.calls.lock().unwrap().is_empty());
+    sink.assert_no_calls();
 }

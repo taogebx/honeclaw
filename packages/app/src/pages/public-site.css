@@ -18,6 +18,10 @@ body {
   background-color: #fff;
 }
 
+html {
+  scroll-padding-top: 72px;
+}
+
 /* Public pages are content-heavy and include page-local style blocks. Keep
    padding and borders inside declared widths so mobile layouts cannot drift. */
 .pub-page *,
@@ -37,6 +41,12 @@ body {
   color: #0f172a;
 }
 
+.hone-landing-v4,
+.hone-roadmap-v4,
+.pub-page {
+  overflow-x: clip;
+}
+
 /* Headings inside public pages always dark unless overridden by inline style */
 .pub-page h1,
 .pub-page h2,
@@ -51,6 +61,21 @@ body {
 }
 .pub-nav-hamburger {
   display: none;
+}
+.pub-github-star-link {
+  min-height: 32px;
+}
+.pub-github-star-count {
+  min-width: 2.2em;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(245, 158, 11, 0.12);
+  color: #b45309;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.2;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Shared public product header used by the home, roadmap, and chat pages. */
@@ -130,8 +155,131 @@ body {
 .header-actions {
   display: flex;
   align-items: center;
-  gap: 20px;
+  gap: 10px;
   min-width: 0;
+}
+.pub-nav,
+.page-header,
+.public-chat-sidebar {
+  font-family: var(--font-sans, "Plus Jakarta Sans", sans-serif);
+}
+.pub-nav-links {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pub-nav-link,
+.pub-nav-cta,
+.pub-github-star-link,
+.pub-nav-lang,
+.star-badge,
+.pub-contact-link,
+.header-contact-link,
+.btn-chat-nav,
+.btn-roadmap-nav {
+  box-sizing: border-box;
+  min-height: 36px;
+  border-radius: 999px;
+  font-family: var(--font-sans, "Plus Jakarta Sans", sans-serif);
+  font-size: 13px;
+  font-weight: 750;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+.pub-nav-link {
+  border: 0;
+  cursor: pointer;
+  padding: 0 13px;
+  color: #475569;
+  background: transparent;
+  transition: color 0.18s ease, background 0.18s ease;
+}
+.pub-nav-link:hover {
+  background: rgba(15, 23, 42, 0.06);
+  color: #0f172a !important;
+}
+.pub-nav-link.is-active {
+  font-weight: 800;
+}
+.pub-nav-cta {
+  min-width: 72px;
+  padding: 0 18px;
+  border: 1px solid #0f172a;
+  background: #0f172a;
+  color: #fff;
+  cursor: pointer;
+  box-shadow: none;
+  transition: background 0.18s ease, border-color 0.18s ease, transform 0.06s ease;
+}
+.pub-nav-cta:hover {
+  background: #1e293b;
+  border-color: #1e293b;
+}
+.pub-nav-cta:active,
+.btn-chat-nav:active,
+.btn-roadmap-nav:active,
+.pub-github-star-link:active,
+.star-badge:active,
+.header-contact-link:active {
+  transform: scale(0.98);
+}
+.pub-github-star-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 12px;
+  border: 1px solid rgba(15, 23, 42, 0.10);
+  color: #475569;
+  text-decoration: none;
+  transition: background 0.18s ease, border-color 0.18s ease, color 0.18s ease;
+}
+.pub-github-star-link:hover {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+  color: #0f172a;
+}
+.pub-nav-lang {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid rgba(15, 23, 42, 0.10);
+  background: rgba(255, 255, 255, 0.72);
+}
+.pub-nav-lang button {
+  min-width: 34px;
+  min-height: 30px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: #64748b;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 750;
+}
+.pub-nav-lang button.is-active {
+  background: #0f172a;
+  color: #fff;
+}
+.pub-nav[data-transparent="true"] .pub-nav-link:hover,
+.pub-nav[data-transparent="true"] .pub-nav-link.is-active {
+  background: rgba(255, 255, 255, 0.12) !important;
+  color: #fff !important;
+}
+.pub-nav[data-transparent="true"] .pub-github-star-link,
+.pub-nav[data-transparent="true"] .pub-nav-lang {
+  border-color: rgba(255,255,255,0.18);
+  background: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.72);
+}
+.pub-nav[data-transparent="true"] .pub-nav-lang button {
+  color: rgba(255,255,255,0.72);
+}
+.pub-nav[data-transparent="true"] .pub-nav-lang button.is-active {
+  background: rgba(255,255,255,0.16);
+  color: #fff;
 }
 .header-socials {
   display: flex;
@@ -154,46 +302,161 @@ body {
   color: #000;
 }
 .star-badge {
-  min-height: 38px;
+  min-height: 36px;
   padding: 0 12px;
-  border-radius: 10px;
-  background: #f1f5f9;
-  color: #1e293b;
+  border: 1px solid rgba(15, 23, 42, 0.10);
+  background: rgba(255, 255, 255, 0.72);
+  color: #475569;
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  font-size: 14px;
-  font-weight: 700;
+  font-variant-numeric: tabular-nums;
   text-decoration: none;
-  transition: background 0.2s;
+  transition: background 0.18s ease, border-color 0.18s ease, color 0.18s ease;
 }
 .star-badge:hover {
-  background: #e2e8f0;
+  border-color: #cbd5e1;
+  background: #f8fafc;
+  color: #0f172a;
 }
 .pub-contact-link,
 .header-contact-link {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   flex-shrink: 0;
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid rgba(15, 23, 42, 0.10);
+  background: rgba(255, 255, 255, 0.72);
+  color: #475569;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.18s ease, border-color 0.18s ease, color 0.18s ease;
+}
+.pub-contact-link:hover,
+.header-contact-link:hover,
+.pub-contact-menu:focus-within .header-contact-link {
+  border-color: #cbd5e1;
+  background: #f8fafc;
+  color: #0f172a;
 }
 .pub-contact-link::before,
 .header-contact-link::before {
-  content: "@";
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  content: "";
+  display: inline-block;
   width: 18px;
   height: 18px;
   border-radius: 999px;
-  background: rgba(245, 158, 11, 0.12);
-  color: #b45309;
-  font-size: 12px;
-  font-weight: 800;
+  background:
+    rgba(245, 158, 11, 0.12)
+      url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23b45309' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='5' width='18' height='14' rx='3'/><path d='M3 7l9 6 9-6'/></svg>")
+      center / 11px 11px no-repeat;
 }
 .pub-contact-label {
   color: #94a3b8;
   font-weight: 600;
+}
+.pub-contact-menu {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+.pub-contact-trigger {
+  position: relative;
+}
+.pub-contact-popover {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  width: min(360px, calc(100vw - 32px));
+  padding: 14px;
+  border: 1px solid rgba(15, 23, 42, 0.10);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 22px 60px rgba(15, 23, 42, 0.16);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-4px);
+  transition: opacity 0.16s ease, transform 0.16s ease;
+  z-index: 300;
+}
+.pub-contact-menu:hover .pub-contact-popover,
+.pub-contact-menu:focus-within .pub-contact-popover {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+.pub-contact-popover-title {
+  padding: 2px 4px 10px;
+  font-size: 12px;
+  font-weight: 800;
+  color: #64748b;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.pub-contact-card-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.pub-contact-card {
+  min-width: 0;
+  min-height: 72px;
+  padding: 12px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 12px;
+  background: #fff;
+  color: #0f172a;
+  text-decoration: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  transition: transform 0.16s ease, border-color 0.16s ease, background 0.16s ease;
+}
+.pub-contact-card:hover {
+  transform: translateY(-1px);
+  border-color: rgba(245, 158, 11, 0.35);
+  background: #fffbeb;
+}
+.pub-contact-card-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 10px;
+  background: #f1f5f9;
+  color: #0f172a;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 900;
+}
+.pub-contact-card--bilibili .pub-contact-card-icon {
+  background: rgba(251, 114, 153, 0.12);
+  color: #db2777;
+}
+.pub-contact-card--youtube .pub-contact-card-icon {
+  background: rgba(239, 68, 68, 0.12);
+  color: #dc2626;
+}
+.pub-contact-card strong,
+.pub-contact-card small {
+  display: block;
+  min-width: 0;
+}
+.pub-contact-card strong {
+  font-size: 13px;
+  font-weight: 800;
+  color: #0f172a;
+}
+.pub-contact-card small {
+  margin-top: 3px;
+  font-size: 11px;
+  line-height: 1.25;
+  color: #64748b;
+  word-break: break-word;
 }
 .divider-v {
   width: 1px;
@@ -201,8 +464,9 @@ body {
   background: #e2e8f0;
 }
 .lang-switch {
-  padding: 3px;
-  border: 1px solid #e2e8f0;
+  min-height: 36px;
+  padding: 2px;
+  border: 1px solid rgba(15, 23, 42, 0.10);
   border-radius: 999px;
   display: inline-flex;
   align-items: center;
@@ -212,7 +476,7 @@ body {
 }
 .lang-switch button {
   min-width: 34px;
-  min-height: 28px;
+  min-height: 30px;
   padding: 0 9px;
   border: none;
   border-radius: 999px;
@@ -220,39 +484,34 @@ body {
   color: #64748b;
   cursor: pointer;
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 750;
   letter-spacing: 0;
   transition: color 0.2s, background 0.2s;
 }
 .lang-switch button.active {
-  background: #000;
+  background: #0f172a;
   color: #fff;
 }
 .btn-chat-nav,
 .btn-roadmap-nav {
-  min-height: 40px;
-  border-radius: 999px;
+  min-height: 36px;
   cursor: pointer;
-  font-size: 14px;
-  font-weight: 700;
-  letter-spacing: 0;
-  white-space: nowrap;
-  transition: color 0.2s, background 0.2s, border-color 0.2s;
+  transition: color 0.18s ease, background 0.18s ease, border-color 0.18s ease, transform 0.06s ease;
 }
 .btn-chat-nav {
-  padding: 0 22px;
-  border: none;
-  background: #000;
+  padding: 0 18px;
+  border: 1px solid #0f172a;
+  background: #0f172a;
   color: #fff;
 }
 .btn-chat-nav:hover {
   background: #1e293b;
 }
 .btn-roadmap-nav {
-  padding: 0 20px;
-  border: 1.5px solid #e2e8f0;
-  background: transparent;
-  color: #64748b;
+  padding: 0 16px;
+  border: 1px solid rgba(15, 23, 42, 0.10);
+  background: rgba(255, 255, 255, 0.72);
+  color: #475569;
 }
 .btn-roadmap-nav:hover {
   border-color: #cbd5e1;
@@ -641,9 +900,21 @@ body {
 
 /* ── Mobile ── */
 @media (max-width: 768px) {
+  html {
+    scroll-padding-top: 56px;
+  }
+  body {
+    width: 100%;
+    max-width: 100vw;
+  }
+  img,
+  video,
+  iframe {
+    max-width: 100%;
+  }
   .page-header {
-    height: 64px !important;
-    padding: 0 16px !important;
+    height: 56px !important;
+    padding: 0 14px !important;
     gap: 10px !important;
     min-width: 0 !important;
   }
@@ -656,10 +927,7 @@ body {
     height: 28px !important;
   }
   .header-logo span {
-    max-width: 96px !important;
-    overflow: hidden !important;
     font-size: 18px !important;
-    text-overflow: ellipsis !important;
     white-space: nowrap !important;
   }
   .header-actions {
@@ -668,6 +936,7 @@ body {
     flex: 0 1 auto !important;
   }
   .header-socials,
+  .header-github-stars,
   .divider-v,
   .mobile-hide {
     display: none !important;
@@ -688,6 +957,28 @@ body {
   .pub-contact-email,
   .pub-contact-label {
     display: none !important;
+  }
+  /* On mobile, anchor the popover to the viewport so it stays inside the screen
+     no matter where the @ button sits within the header row. */
+  .pub-contact-popover {
+    position: fixed;
+    top: calc(56px + 6px);
+    right: 12px;
+    left: 12px;
+    width: auto;
+    padding: 12px;
+  }
+  .pub-contact-card-grid {
+    grid-template-columns: 1fr;
+  }
+  .pub-mobile-contact .pub-contact-card-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .pub-mobile-contact .pub-contact-card {
+    min-height: 78px;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
   }
   .lang-switch {
     flex-shrink: 0 !important;
@@ -712,6 +1003,30 @@ body {
   }
   .pub-nav-hamburger {
     display: flex !important;
+  }
+  .pub-nav {
+    height: 56px !important;
+    padding-right: max(14px, env(safe-area-inset-right)) !important;
+    padding-left: max(14px, env(safe-area-inset-left)) !important;
+  }
+  .pub-nav > div:first-child {
+    min-width: 0 !important;
+    flex: 1 1 auto !important;
+  }
+  /* The OPEN FINANCIAL CONSOLE tagline is decorative — the logo alone identifies
+     the page on mobile, so hide it to free space for the hamburger. */
+  .pub-nav > div:first-child span {
+    display: none !important;
+  }
+  .pub-mobile-menu {
+    overscroll-behavior: contain;
+  }
+  .pub-github-star-link {
+    min-width: 0;
+  }
+  .pub-github-star-count {
+    min-width: 2.6em;
+    padding: 2px 7px;
   }
 
   .pub-hero-grid {
@@ -813,6 +1128,7 @@ body {
     width: 100%;
     max-width: 100vw;
     overflow-x: hidden;
+    overflow-x: clip;
   }
 
   .hone-landing-v4 .main-content {
@@ -839,12 +1155,17 @@ body {
   .hone-landing-v4 .hero-btns {
     width: 100% !important;
     gap: 10px !important;
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) !important;
   }
 
   .hone-landing-v4 .btn-primary.refined,
   .hone-landing-v4 .btn-secondary.refined {
     justify-content: center !important;
     max-width: 100% !important;
+    min-width: 0 !important;
+    padding-right: 16px !important;
+    padding-left: 16px !important;
   }
 
   .hone-landing-v4 .video-container,
@@ -892,6 +1213,17 @@ body {
 
   .hone-landing-v4 .carousel-container {
     gap: 28px !important;
+    align-items: stretch !important;
+  }
+
+  .hone-landing-v4 .carousel-image {
+    aspect-ratio: 4 / 3 !important;
+    flex: none !important;
+  }
+
+  .hone-landing-v4 .feature-img {
+    object-fit: contain !important;
+    background: #f8fafc !important;
   }
 
   .hone-roadmap-v4 .main-content {
@@ -1001,14 +1333,14 @@ body {
     grid-template-columns: 1fr;
   }
 
-  .header-logo span {
-    max-width: 72px !important;
-  }
-
   .btn-roadmap-nav,
   .btn-chat-nav {
     padding-right: 12px !important;
     padding-left: 12px !important;
+  }
+
+  .hone-landing-v4 .hero-btns {
+    grid-template-columns: minmax(0, 1fr) !important;
   }
 
   .hone-landing-v4 .hero-logo {
@@ -1043,10 +1375,6 @@ body {
   .page-header {
     padding-right: 12px !important;
     padding-left: 12px !important;
-  }
-
-  .header-logo span {
-    display: none !important;
   }
 
   .lang-switch button {

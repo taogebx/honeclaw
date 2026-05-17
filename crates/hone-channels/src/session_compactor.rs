@@ -14,16 +14,16 @@ use crate::runtime::sanitize_user_visible_output;
 const POST_COMPACT_MAX_SKILL_SNAPSHOT_CHARS: usize = 12_000;
 const POST_COMPACT_MAX_SKILL_SNAPSHOTS: usize = 4;
 
-pub struct SessionCompactor<'a> {
+pub(crate) struct SessionCompactor<'a> {
     core: &'a HoneBotCore,
 }
 
 impl<'a> SessionCompactor<'a> {
-    pub fn new(core: &'a HoneBotCore) -> Self {
+    pub(crate) fn new(core: &'a HoneBotCore) -> Self {
         Self { core }
     }
 
-    pub async fn compact_session(
+    pub(crate) async fn compact_session(
         &self,
         session_id: &str,
         trigger: &str,
@@ -131,10 +131,13 @@ impl<'a> SessionCompactor<'a> {
         let mut history_text = String::new();
         for message in &messages_to_summarize {
             let content = match message.role.as_str() {
-                "assistant" => replace_local_image_markers(
-                    &sanitize_user_visible_output(&session_message_text(message)).content,
-                    LOCAL_IMAGE_CONTEXT_PLACEHOLDER,
-                ),
+                "assistant" => {
+                    let image_placeholders = replace_local_image_markers(
+                        &session_message_text(message),
+                        LOCAL_IMAGE_CONTEXT_PLACEHOLDER,
+                    );
+                    sanitize_user_visible_output(&image_placeholders).content
+                }
                 "user" => sanitize_user_visible_output(&session_message_text(message)).content,
                 "tool" => String::new(),
                 _ => session_message_text(message),
@@ -216,6 +219,7 @@ impl<'a> SessionCompactor<'a> {
         let messages = vec![hone_llm::Message {
             role: "user".to_string(),
             content: Some(prompt),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -377,10 +381,10 @@ impl<'a> SessionCompactor<'a> {
     }
 
     fn record_llm_audit(&self, record: LlmAuditRecord) {
-        if let Some(sink) = &self.core.llm_audit {
-            if let Err(err) = sink.record(record) {
-                tracing::warn!("[LlmAudit] failed to persist record: {}", err);
-            }
+        if let Some(sink) = &self.core.llm_audit
+            && let Err(err) = sink.record(record)
+        {
+            tracing::warn!("[LlmAudit] failed to persist record: {}", err);
         }
     }
 }

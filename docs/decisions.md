@@ -1,6 +1,6 @@
 # Decisions
 
-Last updated: 2026-04-24
+Last updated: 2026-05-11
 
 ## D-2026-03-07-01 Maintain LLM Collaboration Context In-Repo
 
@@ -72,7 +72,7 @@ Last updated: 2026-04-24
   - The Web chat SSE protocol is now `run_started / assistant_delta / tool_call / run_error / run_finished`
   - Session summaries are no longer encoded as fake `system` messages
   - The breaking config key moved from `agent.provider` to `agent.runner`
-- Note: `opencode_acp` now connects through `opencode acp` over stdio / JSON-RPC, and the ACP session id is written back into Hone session metadata for reuse across turns
+- Note: `opencode_acp` connects through `opencode acp` over stdio / JSON-RPC. Later runner hardening moved ACP continuity back to Hone's local transcript restore: `opencode_acp` and `codex_acp` both seed fresh ACP sessions from local context instead of relying on remote `session/load` replay.
 - Details: See `docs/adr/0002-agent-runtime-acp-refactor.md`
 
 ## D-2026-03-18-01 Make Dynamic Plans Opt-In
@@ -134,7 +134,18 @@ Last updated: 2026-04-24
 - Decision: Price alerts use daily low/close ids plus directional intraday band ids instead of one `price:{symbol}:{date}` id per day. Intraday bands are keyed as `price_band:{symbol}:{date}:{up|down}:{band_bps}` and default to `6%` with `2pp` steps.
 - Impact:
   - A low-magnitude price move can enter digest first, then a later same-day cross of `+6%/+8%` or `-6%/-8%` can still dispatch as a distinct event.
-  - Price bands bypass the generic same-symbol cooldown and use price-specific `price_intraday_min_gap_minutes` plus `price_symbol_direction_daily_cap`.
+  - Price bands use `price_realert_step_pct` to form intraday lanes and `price_band_min_advance_pct` to decide whether a newer band advances far enough for a direct push.
   - Close price alerts are digest-only by default through `price_close_direct_enabled=false`.
   - Digest buffering treats price alerts as latest-state rows per actor/symbol/date/window, replacing older queued price rows instead of appending duplicates.
 - Note: This preserves old event rows in SQLite; it only changes ids and routing for new price observations.
+
+## D-2026-05-11-01 Make LLM Credentials Config-Only
+
+- Status: Accepted
+- Decision: LLM provider/profile/auxiliary/agent credentials are configured only through `config.yaml`; runtime must not use `*_API_KEY`, `*_BASE_URL`, or `api_key_env` fallback as a second truth source
+- Impact:
+  - `llm.providers.<symbol>.api_key/api_keys` is the preferred provider credential path, and `llm.profiles.*.provider` references that symbol
+  - Legacy `llm.openrouter.api_key/api_keys` remains readable only as config-owned migration fallback, not as an env bridge
+  - CLI/Desktop settings should write inline config keys and mask API-key fields in display/logs
+  - Missing credentials should fail with a migration hint pointing to `config.yaml`
+- Note: Child-process bridges such as passing a config-owned OpenRouter key into `opencode` are allowed when the underlying CLI has no config API, but Hone must not read parent process env vars as user LLM config.

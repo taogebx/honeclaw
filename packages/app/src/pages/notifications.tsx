@@ -6,85 +6,41 @@ import {
   onCleanup,
   onMount,
 } from "solid-js"
+import { ActorSelect } from "@/components/actor-select"
 import {
   getNotifications,
   type NotificationHistogramBucket,
   type NotificationRecord,
-  type NotificationsQuery,
   type NotificationsSummary,
 } from "@/lib/api"
+import { actorKey, type ActorRef } from "@/lib/actors"
 import { formatShanghaiDateTime } from "@/lib/time"
-
-// ── 状态映射(对齐 task-detail.tsx 的 sendStatusLabel/executionStatusLabel) ──
-
-const SEND_STATUS_OPTIONS: Array<{ value: string; label: string }> = [
-  { value: "", label: "全部发送状态" },
-  { value: "sent", label: "已发送" },
-  { value: "skipped_noop", label: "未发送(未命中)" },
-  { value: "skipped_error", label: "未发送(执行失败)" },
-  { value: "send_failed", label: "发送失败" },
-  { value: "target_resolution_failed", label: "目标解析失败" },
-  { value: "duplicate_suppressed", label: "已拦截重复发送" },
-]
-
-const EXEC_STATUS_OPTIONS: Array<{ value: string; label: string }> = [
-  { value: "", label: "全部执行状态" },
-  { value: "completed", label: "执行成功" },
-  { value: "noop", label: "未命中" },
-  { value: "execution_failed", label: "执行失败" },
-]
-
-const CHANNEL_OPTIONS: Array<{ value: string; label: string }> = [
-  { value: "", label: "全部渠道" },
-  { value: "telegram", label: "Telegram" },
-  { value: "discord", label: "Discord" },
-  { value: "feishu", label: "飞书" },
-  { value: "imessage", label: "iMessage" },
-]
-
-function sendLabel(s: string): string {
-  return SEND_STATUS_OPTIONS.find((o) => o.value === s)?.label ?? s ?? "—"
-}
-function execLabel(s: string): string {
-  return EXEC_STATUS_OPTIONS.find((o) => o.value === s)?.label ?? s ?? "—"
-}
-
-function sendBadgeClass(s: string): string {
-  switch (s) {
-    case "sent":
-      return "text-emerald-300 bg-emerald-500/15"
-    case "send_failed":
-    case "target_resolution_failed":
-    case "skipped_error":
-      return "text-rose-300 bg-rose-500/15"
-    case "duplicate_suppressed":
-      return "text-amber-300 bg-amber-500/15"
-    case "skipped_noop":
-      return "text-[color:var(--text-muted)] bg-white/5"
-    default:
-      return "text-[color:var(--text-muted)] bg-white/5"
-  }
-}
-
-function bucketHourLabel(iso: string): string {
-  const d = new Date(iso)
-  if (isNaN(d.getTime())) return iso
-  return d.toLocaleString("zh-CN", {
-    timeZone: "Asia/Shanghai",
-    hour: "2-digit",
-    hour12: false,
-  })
-}
+import { NOTIFICATIONS } from "@/lib/admin-content/notifications"
+import { tpl, useLocale } from "@/lib/i18n"
+import {
+  NOTIFICATION_QUERY_LIMIT,
+  bucketHourLabel,
+  buildNotificationsQuery,
+  channelOptions,
+  eventKindLabel,
+  execLabel,
+  execStatusOptions,
+  notificationBucketSegments,
+  notificationPeakBucket,
+  recordSourceLabel,
+  sendBadgeClass,
+  sendLabel,
+  sendStatusOptions,
+} from "./notifications-model"
 
 // ── 组件 ─────────────────────────────────────────────────────────────────────
 
 export default function NotificationsPage() {
   const [channel, setChannel] = createSignal("")
-  const [userId, setUserId] = createSignal("")
+  const [selectedActor, setSelectedActor] = createSignal<ActorRef | null>(null)
   const [execStatus, setExecStatus] = createSignal("")
   const [sendStatus, setSendStatus] = createSignal("")
   const [hours, setHours] = createSignal<number>(24)
-  const [limit, setLimit] = createSignal<number>(200)
 
   const [records, setRecords] = createSignal<NotificationRecord[]>([])
   const [histogram, setHistogram] = createSignal<NotificationHistogramBucket[]>(
@@ -99,30 +55,29 @@ export default function NotificationsPage() {
     distinct_users: 0,
   })
   const [loading, setLoading] = createSignal(false)
-  const [err, setErr] = createSignal<string | null>(null)
+  const [loadError, setLoadError] = createSignal<string | null>(null)
   const [openRecord, setOpenRecord] = createSignal<NotificationRecord | null>(
     null,
   )
 
   async function refresh() {
     setLoading(true)
-    setErr(null)
+    setLoadError(null)
     try {
-      const sinceDate = new Date(Date.now() - hours() * 3600 * 1000)
-      const q: NotificationsQuery = {
-        since: sinceDate.toISOString(),
-        channel: channel() || undefined,
-        user_id: userId().trim() || undefined,
-        execution_status: execStatus() || undefined,
-        message_send_status: sendStatus() || undefined,
-        limit: limit(),
-      }
-      const resp = await getNotifications(q)
-      setRecords(resp.records)
-      setHistogram(resp.histogram_24h)
-      setSummary(resp.summary_24h)
+      const query = buildNotificationsQuery({
+        now: new Date(),
+        hours: hours(),
+        selectedActor: selectedActor(),
+        channel: channel(),
+        execStatus: execStatus(),
+        sendStatus: sendStatus(),
+      })
+      const response = await getNotifications(query)
+      setRecords(response.records)
+      setHistogram(response.histogram_24h)
+      setSummary(response.summary_24h)
     } catch (e) {
-      setErr(String(e))
+      setLoadError(String(e))
     } finally {
       setLoading(false)
     }
@@ -134,23 +89,17 @@ export default function NotificationsPage() {
     onCleanup(() => window.clearInterval(timer))
   })
 
-  const peakBucket = createMemo(() => {
-    let max = 0
-    for (const b of histogram()) {
-      if (b.total > max) max = b.total
-    }
-    return max
-  })
+  const peakBucket = createMemo(() => notificationPeakBucket(histogram()))
 
   return (
     <div class="flex h-full min-h-0 flex-col gap-4 p-4 text-sm">
       {/* 顶栏 + 过滤器 */}
       <div class="flex flex-wrap items-center gap-3">
         <h1 class="text-lg font-semibold text-[color:var(--text-primary)]">
-          推送日志
+          {NOTIFICATIONS.page.title}
         </h1>
         <div class="flex items-center gap-1 text-xs text-[color:var(--text-muted)]">
-          <span>窗口</span>
+          <span>{NOTIFICATIONS.page.window_label}</span>
           <select
             value={hours()}
             onChange={(e) => {
@@ -167,28 +116,31 @@ export default function NotificationsPage() {
           </select>
         </div>
         <div class="flex items-center gap-1 text-xs text-[color:var(--text-muted)]">
-          <span>渠道</span>
+          <span>{NOTIFICATIONS.page.channel_label}</span>
           <select
             value={channel()}
+            disabled={!!selectedActor()}
             onChange={(e) => {
               setChannel(e.currentTarget.value)
               void refresh()
             }}
-            class="rounded border border-[color:var(--border)] bg-transparent px-2 py-1 text-xs text-[color:var(--text-primary)]"
+            class="rounded border border-[color:var(--border)] bg-transparent px-2 py-1 text-xs text-[color:var(--text-primary)] disabled:opacity-50"
           >
-            <For each={CHANNEL_OPTIONS}>
-              {(o) => <option value={o.value}>{o.label}</option>}
+            <For each={channelOptions()}>
+              {(option) => <option value={option.value}>{option.label}</option>}
             </For>
           </select>
         </div>
         <div class="flex items-center gap-1 text-xs text-[color:var(--text-muted)]">
-          <span>用户</span>
-          <input
-            value={userId()}
-            placeholder="user_id"
-            onInput={(e) => setUserId(e.currentTarget.value)}
-            onChange={() => void refresh()}
-            class="w-32 rounded border border-[color:var(--border)] bg-transparent px-2 py-1 text-xs text-[color:var(--text-primary)]"
+          <span>{NOTIFICATIONS.page.user_label}</span>
+          <ActorSelect
+            allowAll
+            allLabel={NOTIFICATIONS.page.all_users}
+            value={selectedActor() ? actorKey(selectedActor()!) : ""}
+            onChange={(actor) => {
+              setSelectedActor(actor)
+              void refresh()
+            }}
           />
         </div>
         <div class="flex items-center gap-1 text-xs text-[color:var(--text-muted)]">
@@ -200,8 +152,8 @@ export default function NotificationsPage() {
             }}
             class="rounded border border-[color:var(--border)] bg-transparent px-2 py-1 text-xs text-[color:var(--text-primary)]"
           >
-            <For each={SEND_STATUS_OPTIONS}>
-              {(o) => <option value={o.value}>{o.label}</option>}
+            <For each={sendStatusOptions()}>
+              {(option) => <option value={option.value}>{option.label}</option>}
             </For>
           </select>
         </div>
@@ -214,8 +166,8 @@ export default function NotificationsPage() {
             }}
             class="rounded border border-[color:var(--border)] bg-transparent px-2 py-1 text-xs text-[color:var(--text-primary)]"
           >
-            <For each={EXEC_STATUS_OPTIONS}>
-              {(o) => <option value={o.value}>{o.label}</option>}
+            <For each={execStatusOptions()}>
+              {(option) => <option value={option.value}>{option.label}</option>}
             </For>
           </select>
         </div>
@@ -224,60 +176,66 @@ export default function NotificationsPage() {
           disabled={loading()}
           class="rounded border border-[color:var(--border)] px-3 py-1 text-xs hover:bg-white/5 disabled:opacity-50"
         >
-          {loading() ? "刷新中…" : "刷新"}
+          {loading() ? NOTIFICATIONS.page.refreshing_button : NOTIFICATIONS.page.refresh_button}
         </button>
       </div>
 
-      <Show when={err()}>
+      <Show when={loadError()}>
         <div class="rounded border border-rose-500/40 bg-rose-500/10 p-3 text-rose-300">
-          {err()}
+          {loadError()}
         </div>
       </Show>
 
       {/* 24h 汇总数字 */}
       <section class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-        <SummaryCard label="24h 总数" value={summary().total} />
-        <SummaryCard label="已发送" value={summary().sent} tone="ok" />
-        <SummaryCard label="发送失败" value={summary().failed} tone="bad" />
-        <SummaryCard label="主动跳过" value={summary().skipped} tone="muted" />
+        <SummaryCard label={NOTIFICATIONS.page.summary_total} value={summary().total} />
+        <SummaryCard label={NOTIFICATIONS.page.summary_sent} value={summary().sent} tone="ok" />
+        <SummaryCard label={NOTIFICATIONS.page.summary_failed} value={summary().failed} tone="bad" />
+        <SummaryCard label={NOTIFICATIONS.page.summary_skipped} value={summary().skipped} tone="muted" />
         <SummaryCard
-          label="重复拦截"
+          label={NOTIFICATIONS.page.summary_duplicate}
           value={summary().duplicate_suppressed}
           tone="warn"
         />
-        <SummaryCard label="覆盖用户" value={summary().distinct_users} />
+        <SummaryCard label={NOTIFICATIONS.page.summary_users} value={summary().distinct_users} />
       </section>
 
       {/* 24h 直方图 */}
       <section class="space-y-2">
         <div class="text-[10px] uppercase tracking-widest text-[color:var(--text-muted)]">
-          24h 推送频率(每小时一桶,左→右 = 旧→新)
+          {NOTIFICATIONS.page.histogram_title}
         </div>
         <div class="rounded border border-[color:var(--border)] p-3">
           <div class="flex h-24 items-end gap-[2px]">
             <For each={histogram()}>
-              {(b) => {
+              {(bucket) => {
                 const peak = peakBucket()
-                const heightPct = peak > 0 ? (b.total / peak) * 100 : 0
-                const sentPct = b.total > 0 ? (b.sent / b.total) * 100 : 0
-                const failedPct =
-                  b.total > 0 ? (b.failed / b.total) * 100 : 0
+                const segments = notificationBucketSegments(bucket, peak)
                 return (
                   <div
                     class="group relative flex flex-1 flex-col justify-end"
-                    title={`${formatShanghaiDateTime(b.bucket_start)}\n总 ${b.total} · 发送 ${b.sent} · 失败 ${b.failed} · 跳过 ${b.skipped}`}
+                    title={tpl(NOTIFICATIONS.page.histogram_tooltip, {
+                      ts: formatShanghaiDateTime(bucket.bucket_start),
+                      total: bucket.total,
+                      sent: bucket.sent,
+                      failed: bucket.failed,
+                      skipped: bucket.skipped,
+                    })}
                   >
                     <div
                       class="flex w-full flex-col-reverse overflow-hidden rounded-sm bg-white/[0.04]"
-                      style={{ height: `${heightPct}%`, "min-height": b.total > 0 ? "2px" : "0" }}
+                      style={{
+                        height: `${segments.heightPct}%`,
+                        "min-height": segments.minHeight,
+                      }}
                     >
                       <div
                         class="bg-emerald-500/70"
-                        style={{ height: `${sentPct}%` }}
+                        style={{ height: `${segments.sentPct}%` }}
                       />
                       <div
                         class="bg-rose-500/70"
-                        style={{ height: `${failedPct}%` }}
+                        style={{ height: `${segments.failedPct}%` }}
                       />
                       <div class="flex-1 bg-[color:var(--text-muted)]/30" />
                     </div>
@@ -289,20 +247,21 @@ export default function NotificationsPage() {
           <div class="mt-1 flex items-center justify-between text-[9px] text-[color:var(--text-muted)]">
             <span>
               <Show when={histogram().length > 0}>
-                {bucketHourLabel(histogram()[0].bucket_start)}时
+                {bucketHourLabel(histogram()[0].bucket_start, useLocale())}{NOTIFICATIONS.page.histogram_hour_suffix}
               </Show>
             </span>
             <span class="flex items-center gap-3">
-              <Legend color="bg-emerald-500/70" label="发送" />
-              <Legend color="bg-rose-500/70" label="失败" />
-              <Legend color="bg-[color:var(--text-muted)]/30" label="跳过" />
+              <Legend color="bg-emerald-500/70" label={NOTIFICATIONS.page.legend_sent} />
+              <Legend color="bg-rose-500/70" label={NOTIFICATIONS.page.legend_failed} />
+              <Legend color="bg-[color:var(--text-muted)]/30" label={NOTIFICATIONS.page.legend_skipped} />
             </span>
             <span>
               <Show when={histogram().length > 0}>
                 {bucketHourLabel(
                   histogram()[histogram().length - 1].bucket_start,
+                  useLocale(),
                 )}
-                时
+                {NOTIFICATIONS.page.histogram_hour_suffix}
               </Show>
             </span>
           </div>
@@ -312,19 +271,20 @@ export default function NotificationsPage() {
       {/* 推送列表 */}
       <section class="flex min-h-0 flex-col gap-2">
         <div class="flex items-center justify-between text-[10px] uppercase tracking-widest text-[color:var(--text-muted)]">
-          <span>推送记录(最多 {limit()} 条,倒序)</span>
-          <span>共 {records().length} 条</span>
+          <span>{tpl(NOTIFICATIONS.page.list_caption, { limit: NOTIFICATION_QUERY_LIMIT })}</span>
+          <span>{tpl(NOTIFICATIONS.page.list_count, { count: records().length })}</span>
         </div>
         <div class="flex-1 overflow-auto rounded border border-[color:var(--border)]">
           <table class="w-full text-xs">
             <thead class="sticky top-0 bg-[color:var(--panel)] text-[color:var(--text-muted)]">
               <tr>
-                <th class="px-3 py-2 text-left font-normal">时间</th>
-                <th class="px-3 py-2 text-left font-normal">用户</th>
-                <th class="px-3 py-2 text-left font-normal">渠道</th>
-                <th class="px-3 py-2 text-left font-normal">任务</th>
-                <th class="px-3 py-2 text-left font-normal">发送状态</th>
-                <th class="px-3 py-2 text-left font-normal">摘要</th>
+                <th class="px-3 py-2 text-left font-normal">{NOTIFICATIONS.page.col_time}</th>
+                <th class="px-3 py-2 text-left font-normal">{NOTIFICATIONS.page.col_user}</th>
+                <th class="px-3 py-2 text-left font-normal">{NOTIFICATIONS.page.col_channel}</th>
+                <th class="px-3 py-2 text-left font-normal">{NOTIFICATIONS.page.col_event}</th>
+                <th class="px-3 py-2 text-left font-normal">{NOTIFICATIONS.page.col_job}</th>
+                <th class="px-3 py-2 text-left font-normal">{NOTIFICATIONS.page.col_send_status}</th>
+                <th class="px-3 py-2 text-left font-normal">{NOTIFICATIONS.page.col_summary}</th>
               </tr>
             </thead>
             <tbody>
@@ -333,44 +293,53 @@ export default function NotificationsPage() {
                 fallback={
                   <tr>
                     <td
-                      colspan={6}
+                      colspan={7}
                       class="px-3 py-8 text-center text-[color:var(--text-muted)]"
                     >
-                      该窗口内没有匹配的推送记录。
+                      {NOTIFICATIONS.page.empty_records}
                     </td>
                   </tr>
                 }
               >
                 <For each={records()}>
-                  {(r) => (
+                  {(record) => (
                     <tr
                       class="cursor-pointer border-t border-[color:var(--border)] hover:bg-white/[0.03]"
-                      onClick={() => setOpenRecord(r)}
+                      onClick={() => setOpenRecord(record)}
                     >
                       <td
                         class="whitespace-nowrap px-3 py-2 font-mono text-[11px] text-[color:var(--text-muted)]"
-                        title={r.executed_at}
+                        title={record.executed_at}
                       >
-                        {formatShanghaiDateTime(r.executed_at)}
+                        {formatShanghaiDateTime(record.executed_at)}
                       </td>
                       <td class="px-3 py-2 font-mono text-[11px]">
-                        {r.user_id}
-                        <Show when={r.channel_scope}>
+                        {record.user_id}
+                        <Show when={record.channel_scope}>
                           <span class="ml-1 text-[10px] text-[color:var(--text-muted)]">
-                            {r.channel_scope}
+                            {record.channel_scope}
                           </span>
                         </Show>
                       </td>
                       <td class="px-3 py-2 text-[11px] text-[color:var(--text-secondary)]">
-                        {r.channel}
+                        {record.channel}
+                        <div class="font-mono text-[10px] text-[color:var(--text-muted)]">
+                          {record.channel_target}
+                        </div>
+                      </td>
+                      <td class="px-3 py-2">
+                        <span class="inline-block rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-[color:var(--text-secondary)]">
+                          {eventKindLabel(record.event_kind)}
+                        </span>
                       </td>
                       <td class="px-3 py-2">
                         <div class="font-medium text-[color:var(--text-primary)]">
-                          {r.job_name}
+                          {record.job_name}
                         </div>
                         <div class="text-[10px] text-[color:var(--text-muted)]">
-                          {execLabel(r.execution_status)}
-                          <Show when={r.heartbeat}>
+                          {recordSourceLabel(record.record_source)} ·{" "}
+                          {execLabel(record.execution_status)}
+                          <Show when={record.heartbeat}>
                             <span class="ml-1 rounded bg-white/5 px-1 py-[1px] text-[9px] uppercase">
                               heartbeat
                             </span>
@@ -379,20 +348,20 @@ export default function NotificationsPage() {
                       </td>
                       <td class="px-3 py-2">
                         <span
-                          class={`inline-block rounded px-1.5 py-0.5 text-[10px] ${sendBadgeClass(r.message_send_status)}`}
+                          class={`inline-block rounded px-1.5 py-0.5 text-[10px] ${sendBadgeClass(record.message_send_status)}`}
                         >
-                          {sendLabel(r.message_send_status)}
+                          {sendLabel(record.message_send_status)}
                         </span>
                       </td>
                       <td class="max-w-[28rem] px-3 py-2">
-                        <Show when={r.response_preview}>
+                        <Show when={record.response_preview}>
                           <div class="line-clamp-2 break-words text-[color:var(--text-secondary)]">
-                            {r.response_preview}
+                            {record.response_preview}
                           </div>
                         </Show>
-                        <Show when={r.error_message}>
+                        <Show when={record.error_message}>
                           <div class="line-clamp-2 break-words text-rose-300/80">
-                            {r.error_message}
+                            {record.error_message}
                           </div>
                         </Show>
                       </td>
@@ -406,8 +375,8 @@ export default function NotificationsPage() {
       </section>
 
       <Show when={openRecord()}>
-        {(rec) => (
-          <RecordDrawer record={rec()} onClose={() => setOpenRecord(null)} />
+        {(record) => (
+          <RecordDrawer record={record()} onClose={() => setOpenRecord(null)} />
         )}
       </Show>
     </div>
@@ -474,41 +443,43 @@ function RecordDrawer(props: {
             onClick={props.onClose}
             class="rounded border border-[color:var(--border)] px-2 py-1 text-xs hover:bg-white/5"
           >
-            关闭
+            {NOTIFICATIONS.page.drawer_close}
           </button>
         </div>
 
         <dl class="mt-4 grid grid-cols-3 gap-x-3 gap-y-2 text-[12px]">
-          <DetailItem label="用户" value={props.record.user_id} />
-          <DetailItem label="渠道" value={props.record.channel} />
+          <DetailItem label={NOTIFICATIONS.page.drawer_label_source} value={recordSourceLabel(props.record.record_source)} />
+          <DetailItem label={NOTIFICATIONS.page.drawer_label_event_kind} value={eventKindLabel(props.record.event_kind)} />
+          <DetailItem label={NOTIFICATIONS.page.drawer_label_user} value={props.record.user_id} />
+          <DetailItem label={NOTIFICATIONS.page.drawer_label_channel} value={props.record.channel} />
           <DetailItem
-            label="Channel Scope"
+            label={NOTIFICATIONS.page.drawer_label_channel_scope}
             value={props.record.channel_scope ?? "—"}
           />
-          <DetailItem label="目标" value={props.record.channel_target} />
+          <DetailItem label={NOTIFICATIONS.page.drawer_label_target} value={props.record.channel_target} />
           <DetailItem
-            label="执行状态"
+            label={NOTIFICATIONS.page.drawer_label_exec_status}
             value={execLabel(props.record.execution_status)}
           />
           <DetailItem
-            label="发送状态"
+            label={NOTIFICATIONS.page.drawer_label_send_status}
             value={sendLabel(props.record.message_send_status)}
           />
           <DetailItem
-            label="should_deliver"
+            label={NOTIFICATIONS.page.drawer_label_should_deliver}
             value={String(props.record.should_deliver)}
           />
           <DetailItem
-            label="delivered"
+            label={NOTIFICATIONS.page.drawer_label_delivered}
             value={String(props.record.delivered)}
           />
-          <DetailItem label="job_id" value={props.record.job_id} />
+          <DetailItem label={NOTIFICATIONS.page.drawer_label_job_id} value={props.record.job_id} />
         </dl>
 
         <Show when={props.record.response_preview}>
           <div class="mt-4">
             <div class="text-[10px] uppercase tracking-widest text-[color:var(--text-muted)]">
-              响应预览
+              {NOTIFICATIONS.page.drawer_response_preview}
             </div>
             <pre class="mt-1 whitespace-pre-wrap rounded border border-[color:var(--border)] bg-black/20 p-2 text-[12px]">
               {props.record.response_preview}
@@ -519,7 +490,7 @@ function RecordDrawer(props: {
         <Show when={props.record.error_message}>
           <div class="mt-4">
             <div class="text-[10px] uppercase tracking-widest text-rose-300/80">
-              错误
+              {NOTIFICATIONS.page.drawer_error}
             </div>
             <pre class="mt-1 whitespace-pre-wrap rounded border border-rose-500/40 bg-rose-500/10 p-2 text-[12px] text-rose-200">
               {props.record.error_message}
@@ -536,7 +507,7 @@ function RecordDrawer(props: {
         >
           <div class="mt-4">
             <div class="text-[10px] uppercase tracking-widest text-[color:var(--text-muted)]">
-              detail
+              {NOTIFICATIONS.page.drawer_detail}
             </div>
             <pre class="mt-1 whitespace-pre-wrap rounded border border-[color:var(--border)] bg-black/20 p-2 text-[11px] text-[color:var(--text-secondary)]">
               {JSON.stringify(props.record.detail, null, 2)}

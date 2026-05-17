@@ -9,20 +9,361 @@ fn temp_test_dir(prefix: &str) -> PathBuf {
     dir
 }
 
+fn yaml_key<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a Value> {
+    mapping.get(Value::String(key.to_string()))
+}
+
+fn yaml_has_key(mapping: &serde_yaml::Mapping, key: &str) -> bool {
+    mapping.contains_key(Value::String(key.to_string()))
+}
+
+fn assert_config_example_roots(root: &serde_yaml::Mapping) {
+    let actual_roots = root
+        .keys()
+        .map(|key| key.as_str().unwrap_or_default())
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected_roots = [
+        "admins",
+        "agent",
+        "discord",
+        "event_engine",
+        "feishu",
+        "fmp",
+        "group_context",
+        "imessage",
+        "language",
+        "llm",
+        "logging",
+        "nano_banana",
+        "search",
+        "security",
+        "storage",
+        "telegram",
+        "web",
+    ]
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(actual_roots, expected_roots);
+}
+
+fn assert_yaml_omits_keys(mapping: &serde_yaml::Mapping, prefix: &str, keys: &[&str]) {
+    for stale_key in keys {
+        assert!(
+            !yaml_has_key(mapping, stale_key),
+            "{prefix}.{stale_key} is not a YAML config field"
+        );
+    }
+}
+
+fn assert_config_example_channel_sections(root: &serde_yaml::Mapping) {
+    let imessage = yaml_key(root, "imessage").unwrap().as_mapping().unwrap();
+    assert!(yaml_has_key(imessage, "listen_addr"));
+
+    let discord = yaml_key(root, "discord").unwrap().as_mapping().unwrap();
+    let discord_watch = yaml_key(discord, "watch").unwrap().as_mapping().unwrap();
+    assert!(yaml_has_key(discord_watch, "enabled"));
+    assert!(yaml_has_key(discord_watch, "channel_ids"));
+    assert!(yaml_has_key(discord_watch, "loop"));
+    assert!(yaml_has_key(discord_watch, "verbose"));
+}
+
+fn assert_config_example_event_sections(root: &serde_yaml::Mapping) {
+    let nano_banana = yaml_key(root, "nano_banana").unwrap().as_mapping().unwrap();
+    assert_yaml_omits_keys(
+        nano_banana,
+        "nano_banana",
+        &[
+            "timeout_seconds",
+            "download_timeout_seconds",
+            "max_retries",
+            "max_tokens",
+            "temperature",
+            "http_referrer",
+            "x_title",
+            "extra_params",
+        ],
+    );
+
+    let fmp = yaml_key(root, "fmp").unwrap().as_mapping().unwrap();
+    assert!(yaml_has_key(fmp, "api_keys"));
+
+    let event_engine = yaml_key(root, "event_engine")
+        .unwrap()
+        .as_mapping()
+        .unwrap();
+    assert!(yaml_has_key(event_engine, "news_importance_prompt"));
+    let sources = yaml_key(event_engine, "sources")
+        .unwrap()
+        .as_mapping()
+        .unwrap();
+    assert!(yaml_has_key(sources, "extended_hours"));
+    assert!(yaml_has_key(sources, "rss_feeds"));
+    assert!(yaml_has_key(sources, "telegram_channels"));
+}
+
+fn assert_config_example_agent_section(root: &serde_yaml::Mapping) {
+    let agent = yaml_key(root, "agent").unwrap().as_mapping().unwrap();
+    assert!(
+        !yaml_has_key(agent, "debug_log"),
+        "agent.debug_log is controlled by HONE_AGENT_DEBUG, not YAML"
+    );
+    let codex_acp = yaml_key(agent, "codex_acp").unwrap().as_mapping().unwrap();
+    assert!(yaml_has_key(codex_acp, "sandbox_mode"));
+    assert!(yaml_has_key(codex_acp, "approval_policy"));
+    assert!(yaml_has_key(codex_acp, "sandbox_permissions"));
+    assert!(yaml_has_key(agent, "gemini_acp"));
+    assert!(yaml_has_key(agent, "opencode"));
+    assert!(yaml_has_key(agent, "hone_cloud"));
+    assert!(yaml_has_key(agent, "multi_agent"));
+}
+
+fn assert_config_example_multi_agent_fallback_docs(example: &str) {
+    assert!(
+        example.contains("agent.multi_agent.search.api_key"),
+        "config.example.yaml should document the multi-agent search key source"
+    );
+    assert!(
+        example.contains("legacy llm.auxiliary.api_key"),
+        "config.example.yaml should document the legacy multi-agent search fallback"
+    );
+    assert!(
+        example.contains("answer.api_key"),
+        "config.example.yaml should document the multi-agent answer key override"
+    );
+    assert!(
+        example.contains("llm.providers.openrouter.api_key"),
+        "config.example.yaml should document the multi-agent answer provider-key fallback"
+    );
+    assert!(
+        example.contains("api_key/api_keys"),
+        "config.example.yaml should document that the multi-agent answer fallback accepts OpenRouter key pools"
+    );
+}
+
+fn assert_config_example_storage_and_logging(root: &serde_yaml::Mapping) {
+    let storage = yaml_key(root, "storage").unwrap().as_mapping().unwrap();
+    assert!(!yaml_has_key(storage, "base_path"));
+    assert!(
+        !yaml_has_key(storage, "session_db_path"),
+        "storage.session_db_path was a draft name; use session_sqlite_db_path"
+    );
+    assert!(yaml_has_key(storage, "sessions_dir"));
+    assert!(yaml_has_key(storage, "session_sqlite_db_path"));
+    assert!(yaml_has_key(storage, "session_sqlite_shadow_write_enabled"));
+    assert!(yaml_has_key(storage, "session_runtime_backend"));
+    assert!(yaml_has_key(storage, "conversation_quota_dir"));
+    assert!(yaml_has_key(storage, "gen_images_dir"));
+    assert!(yaml_has_key(storage, "notif_prefs_dir"));
+
+    let logging = yaml_key(root, "logging").unwrap().as_mapping().unwrap();
+    assert_yaml_omits_keys(
+        logging,
+        "logging",
+        &[
+            "colorize",
+            "enqueue",
+            "rotation",
+            "retention",
+            "compression",
+        ],
+    );
+    assert!(yaml_has_key(logging, "udp_port"));
+}
+
+fn assert_config_example_public_auth_env_docs(example: &str) {
+    assert!(
+        !example.contains("all API tokens are read from config.yaml"),
+        "config.example.yaml should not claim every token is config-owned"
+    );
+    assert!(
+        example.contains("public SMS/Captcha"),
+        "config.example.yaml should call out public auth runtime env"
+    );
+
+    for env_name in [
+        "ALIBABA_CLOUD_ACCESS_KEY_ID",
+        "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
+        "ALIYUN_ACCESS_KEY_*",
+        "HONE_ALIYUN_ACCESS_KEY_*",
+        "HONE_ALIYUN_SMS_ENDPOINT",
+        "HONE_ALIYUN_SMS_COUNTRY_CODE",
+        "HONE_ALIYUN_SMS_SIGN_NAME",
+        "HONE_ALIYUN_SMS_TEMPLATE_CODE",
+        "HONE_ALIYUN_SMS_TEMPLATE_PARAM",
+        "HONE_PUBLIC_SECURE_COOKIE",
+        "HONE_ALIYUN_CAPTCHA_PREFIX",
+        "HONE_ALIYUN_CAPTCHA_SCENE_ID",
+        "HONE_ALIYUN_CAPTCHA_REGION",
+        "HONE_ALIYUN_CAPTCHA_ENDPOINT",
+        "HONE_ALIYUN_CAPTCHA_ENABLED",
+    ] {
+        assert!(
+            example.contains(env_name),
+            "config.example.yaml should document public auth env {env_name}"
+        );
+    }
+}
+
+fn legacy_agent_migration_canonical_yaml() -> &'static str {
+    r#"
+agent:
+  runner: codex_cli
+  multi_agent:
+    search:
+      api_key: ""
+    answer:
+      api_key: ""
+  opencode:
+    api_key: ""
+llm:
+  auxiliary:
+    api_key: ""
+  openrouter:
+    api_key: ""
+    api_keys: []
+search:
+  api_keys: []
+fmp:
+  api_key: ""
+  api_keys: []
+feishu:
+  enabled: false
+  app_id: ""
+  app_secret: ""
+telegram:
+  enabled: false
+  bot_token: ""
+  chat_scope: DM_ONLY
+discord:
+  enabled: false
+  bot_token: ""
+  chat_scope: DM_ONLY
+"#
+}
+
+fn legacy_agent_migration_runtime_yaml() -> &'static str {
+    r#"
+agent:
+  runner: multi-agent
+  multi_agent:
+    search:
+      base_url: "https://api.minimaxi.com/v1"
+      api_key: "legacy-search"
+      model: "MiniMax-M2.7-highspeed"
+      max_iterations: 8
+    answer:
+      api_base_url: "https://openrouter.ai/api/v1"
+      api_key: "legacy-answer"
+      model: "google/gemini-3.1-pro-preview"
+      variant: "high"
+      max_tool_calls: 1
+  opencode:
+    api_base_url: "https://openrouter.ai/api/v1"
+    api_key: "legacy-answer"
+    model: "google/gemini-3.1-pro-preview"
+    variant: "high"
+llm:
+  auxiliary:
+    base_url: "https://api.minimaxi.com/v1"
+    api_key: "legacy-search"
+    model: "MiniMax-M2.7-highspeed"
+  openrouter:
+    api_key: "legacy-openrouter"
+    api_keys:
+      - legacy-openrouter-1
+      - legacy-openrouter-2
+search:
+  provider: tavily
+  api_keys:
+    - tvly-one
+    - tvly-two
+  search_depth: advanced
+  topic: finance
+fmp:
+  api_key: "legacy-fmp"
+  api_keys:
+    - legacy-fmp-2
+  base_url: "https://financialmodelingprep.com/api"
+  timeout: 30
+feishu:
+  enabled: true
+  app_id: "cli_test"
+  app_secret: "secret"
+telegram:
+  enabled: true
+  bot_token: "tg-token"
+  dm_only: false
+discord:
+  enabled: true
+  bot_token: "discord-token"
+  dm_only: false
+"#
+}
+
+fn assert_legacy_agent_migration_changed_paths(changed: &[String]) {
+    for path in [
+        "agent.multi_agent",
+        "agent.opencode",
+        "llm.auxiliary",
+        "llm.providers.openrouter.api_keys",
+        "agent.runner",
+        "search.api_keys",
+        "fmp.api_key",
+        "fmp.api_keys",
+        "feishu.enabled",
+        "telegram.enabled",
+        "discord.enabled",
+    ] {
+        assert!(changed.contains(&path.to_string()), "missing {path}");
+    }
+}
+
+fn assert_legacy_agent_migration_config(config: &HoneConfig) {
+    assert_eq!(config.agent.runner, "multi-agent");
+    assert_eq!(config.agent.multi_agent.search.api_key, "legacy-search");
+    assert_eq!(config.agent.multi_agent.answer.api_key, "legacy-answer");
+    assert_eq!(config.agent.opencode.api_key, "legacy-answer");
+    assert_eq!(config.llm.auxiliary.api_key, "legacy-search");
+    assert_eq!(config.llm.openrouter.api_key, "");
+    let provider = config.llm.providers.get("openrouter").unwrap();
+    assert_eq!(
+        provider.api_keys,
+        vec![
+            "legacy-openrouter-1".to_string(),
+            "legacy-openrouter-2".to_string()
+        ]
+    );
+    assert_eq!(
+        config.search.api_keys,
+        vec!["tvly-one".to_string(), "tvly-two".to_string()]
+    );
+    assert_eq!(config.fmp.api_key, "legacy-fmp");
+    assert_eq!(config.fmp.api_keys, vec!["legacy-fmp-2".to_string()]);
+    assert!(config.feishu.enabled);
+    assert_eq!(config.feishu.app_id, "cli_test");
+    assert_eq!(config.feishu.app_secret, "secret");
+    assert!(config.telegram.enabled);
+    assert_eq!(config.telegram.bot_token, "tg-token");
+    assert_eq!(config.telegram.chat_scope, ChatScope::All);
+    assert!(config.discord.enabled);
+    assert_eq!(config.discord.bot_token, "discord-token");
+    assert_eq!(config.discord.chat_scope, ChatScope::All);
+}
+
 #[test]
-fn test_default_config() {
+fn default_config_sets_current_llm_defaults() {
     let config = HoneConfig::default();
     assert_eq!(config.llm.provider, "openrouter");
     assert_eq!(config.llm.openrouter.model, "moonshotai/kimi-k2.5");
     assert_eq!(config.llm.openrouter.sub_model, "moonshotai/kimi-k2.5");
-    assert_eq!(config.llm.auxiliary.api_key_env, "MINIMAX_API_KEY");
+    assert!(config.llm.auxiliary.api_key.is_empty());
     assert!(config.llm.auxiliary.base_url.is_empty());
     assert_eq!(config.llm.openrouter.timeout, 120);
     assert_eq!(config.llm.openrouter.max_tokens, 32768);
 }
 
 #[test]
-fn test_deserialize_minimal_yaml() {
+fn minimal_yaml_deserializes_with_defaults() {
     let yaml = r#"
 llm:
   provider: openrouter
@@ -37,14 +378,162 @@ llm:
 }
 
 #[test]
-fn test_runtime_overlay_path() {
+fn config_example_yaml_matches_current_schema() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("hone-core crate lives under crates/");
+    let raw = std::fs::read_to_string(repo_root.join("config.example.yaml")).unwrap();
+    let config: HoneConfig = serde_yaml::from_str(&raw).unwrap();
+
+    assert_eq!(config.agent.runner, "hone_cloud");
+    assert_eq!(config.agent.hone_cloud.base_url, "https://hone-claw.com");
+    assert_eq!(config.agent.hone_cloud.model, "hone-cloud");
+    assert!(config.agent.hone_cloud.api_key.is_empty());
+    assert!(config.agent.opencode.model.is_empty());
+    assert!(config.agent.opencode.api_base_url.is_empty());
+    assert!(config.agent.opencode.api_key.is_empty());
+    assert_eq!(config.storage.sessions_dir, "./data/sessions");
+    assert_eq!(
+        config.storage.session_sqlite_db_path,
+        "./data/sessions.sqlite3"
+    );
+    assert!(config.storage.session_sqlite_shadow_write_enabled);
+    assert_eq!(config.storage.session_runtime_backend, "json");
+    assert_eq!(
+        config.storage.conversation_quota_dir,
+        "./data/conversation_quota"
+    );
+    assert_eq!(config.llm.default_profile, "main");
+    assert_eq!(config.llm.auxiliary_profile, "aux");
+    assert!(config.llm.profiles.contains_key("main"));
+    assert!(config.llm.profiles.contains_key("aux"));
+    assert!(config.llm.profiles.contains_key("digest_fast"));
+    assert!(config.llm.profiles.contains_key("digest_strong"));
+    assert_eq!(
+        config.event_engine.news_importance_prompt,
+        "公司或潜在影响公司长期逻辑和宏观叙事的重大事件"
+    );
+    assert_eq!(config.event_engine.sources.rss_feeds.len(), 3);
+}
+
+#[test]
+fn llm_profile_registry_accepts_generation_params() {
+    let yaml = r#"
+llm:
+  default_profile: main
+  providers:
+    openrouter:
+      kind: openai_compatible
+      base_url: https://openrouter.ai/api/v1
+      api_key: test-openrouter
+      timeout: 60
+      max_retries: 1
+  auxiliary_profile: digest_strong
+  profiles:
+    digest_strong:
+      provider: openrouter
+      model: x-ai/grok-4.1-fast
+      params:
+        max_tokens: 1200
+        temperature: 0.2
+        top_p: 0.9
+        reasoning:
+          effort: medium
+          max_tokens: 2048
+        response_format:
+          type: json_object
+        extra_body:
+          custom_flag: true
+      provider_options:
+        openrouter:
+          extra_body:
+            usage:
+              include: true
+"#;
+    let config: HoneConfig = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(config.llm.default_profile, "main");
+    assert_eq!(config.llm.auxiliary_profile, "digest_strong");
+    let provider = config.llm.providers.get("openrouter").unwrap();
+    assert_eq!(provider.kind, "openai_compatible");
+    assert_eq!(provider.effective_key_pool().keys(), &["test-openrouter"]);
+    assert_eq!(provider.timeout, Some(60));
+
+    let profile = config.llm.profiles.get("digest_strong").unwrap();
+    assert_eq!(profile.provider, "openrouter");
+    assert_eq!(profile.model, "x-ai/grok-4.1-fast");
+    assert_eq!(profile.params.max_tokens, Some(1200));
+    assert_eq!(profile.params.temperature, Some(0.2));
+    assert_eq!(
+        profile.params.reasoning.as_ref().unwrap().effort.as_deref(),
+        Some("medium")
+    );
+    assert_eq!(
+        profile
+            .params
+            .response_format
+            .as_ref()
+            .and_then(|value| value.get("type"))
+            .and_then(|value| value.as_str()),
+        Some("json_object")
+    );
+    assert_eq!(
+        profile
+            .provider_options
+            .get("openrouter")
+            .and_then(|options| options.extra_body.get("usage"))
+            .and_then(|value| value.get("include"))
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
+fn event_engine_llm_profile_refs_are_optional() {
+    let yaml = r#"
+event_engine:
+  news_classifier_llm: news_classifier
+  renderer:
+    polish_llm: aux
+  earnings:
+    quality_review:
+      llm: earnings_quality
+  sec_filings:
+    enrichment:
+      llm: filing_summary
+  global_digest:
+    pass1_llm: digest_fast
+    pass2_llm: digest_strong
+    event_dedupe_llm: digest_strong
+    mainline_distill_llm: mainline_short
+"#;
+    let config: HoneConfig = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(config.event_engine.news_classifier_llm, "news_classifier");
+    assert_eq!(config.event_engine.renderer.polish_llm, "aux");
+    assert_eq!(
+        config.event_engine.earnings.quality_review.llm,
+        "earnings_quality"
+    );
+    assert_eq!(
+        config.event_engine.sec_filings.enrichment.llm,
+        "filing_summary"
+    );
+    assert_eq!(config.event_engine.global_digest.pass1_llm, "digest_fast");
+    assert_eq!(
+        config.event_engine.global_digest.mainline_distill_llm,
+        "mainline_short"
+    );
+}
+
+#[test]
+fn runtime_overlay_path_uses_config_stem() {
     let path = Path::new("/tmp/config.yaml");
     let overlay = runtime_overlay_path(path);
     assert_eq!(overlay, PathBuf::from("/tmp/config.overrides.yaml"));
 }
 
 #[test]
-fn test_merge_yaml_value_recursively() {
+fn merge_yaml_value_recursively_overlays_nested_mappings() {
     let mut base: Value = serde_yaml::from_str(
         r#"
 imessage:
@@ -100,7 +589,7 @@ new_section:
 }
 
 #[test]
-fn test_read_merged_yaml_value_applies_runtime_overlay() {
+fn read_merged_yaml_value_applies_runtime_overlay() {
     let dir = temp_test_dir("from-file");
     let config_path = dir.join("config.yaml");
     let overlay_path = runtime_overlay_path(&config_path);
@@ -163,7 +652,7 @@ custom_section:
 }
 
 #[test]
-fn test_from_file_applies_runtime_overlay() {
+fn from_file_applies_runtime_overlay() {
     let dir = temp_test_dir("from-file-runtime-overlay");
     let config_path = dir.join("config.yaml");
     let overlay_path = runtime_overlay_path(&config_path);
@@ -195,7 +684,7 @@ feishu:
 }
 
 #[test]
-fn test_diff_yaml_value_keeps_only_changes() {
+fn diff_yaml_value_keeps_only_changed_branches() {
     let base: Value = serde_yaml::from_str(
         r#"
 imessage:
@@ -260,7 +749,7 @@ logging:
 }
 
 #[test]
-fn test_deserialize_agent_codex_model() {
+fn agent_codex_cli_deserializes_runner_and_model() {
     let yaml = r#"
 agent:
   runner: codex_cli
@@ -272,7 +761,7 @@ agent:
 }
 
 #[test]
-fn test_deserialize_agent_opencode_model_and_variant() {
+fn agent_opencode_acp_deserializes_model_and_variant() {
     let yaml = r#"
 agent:
   runner: opencode_acp
@@ -287,7 +776,7 @@ agent:
 }
 
 #[test]
-fn test_default_agent_opencode_inherits_local_config_when_unset() {
+fn default_agent_opencode_keeps_local_config_inheritance() {
     let config = HoneConfig::default();
     assert!(config.agent.opencode.model.is_empty());
     assert!(config.agent.opencode.variant.is_empty());
@@ -300,22 +789,22 @@ fn test_default_agent_opencode_inherits_local_config_when_unset() {
 }
 
 #[test]
-fn test_deserialize_agent_gemini_acp() {
+fn agent_gemini_acp_deserializes_model_and_api_key() {
     let yaml = r#"
 agent:
   runner: gemini_acp
   gemini_acp:
     model: "gemini-2.5-pro"
-    api_key_env: "GEMINI_API_KEY"
+    api_key: "gemini-key"
 "#;
     let config: HoneConfig = serde_yaml::from_str(yaml).unwrap();
     assert_eq!(config.agent.runner, "gemini_acp");
     assert_eq!(config.agent.gemini_acp.model, "gemini-2.5-pro");
-    assert_eq!(config.agent.gemini_acp.api_key_env, "GEMINI_API_KEY");
+    assert_eq!(config.agent.gemini_acp.api_key, "gemini-key");
 }
 
 #[test]
-fn test_deserialize_agent_codex_acp_sandbox_controls() {
+fn agent_codex_acp_deserializes_sandbox_controls() {
     let yaml = r#"
 agent:
   runner: codex_acp
@@ -345,7 +834,7 @@ agent:
 }
 
 #[test]
-fn test_deserialize_agent_multi_agent() {
+fn agent_multi_agent_deserializes_search_and_answer_settings() {
     let yaml = r#"
 agent:
   runner: multi-agent
@@ -388,7 +877,7 @@ agent:
 }
 
 #[test]
-fn test_deserialize_feishu_config() {
+fn feishu_config_deserializes_allowlists_and_admins() {
     let yaml = r#"
 feishu:
   enabled: true
@@ -429,7 +918,7 @@ admins:
 }
 
 #[test]
-fn test_deserialize_discord_group_reply() {
+fn discord_group_reply_deserializes_pretrigger_window() {
     let yaml = r#"
 group_context:
   pretrigger_window_enabled: false
@@ -448,7 +937,7 @@ discord:
 }
 
 #[test]
-fn test_chat_scope_defaults_to_dm_only() {
+fn chat_scope_defaults_to_dm_only() {
     let config = HoneConfig::default();
     assert_eq!(config.feishu.chat_scope, ChatScope::DmOnly);
     assert_eq!(config.telegram.chat_scope, ChatScope::DmOnly);
@@ -456,7 +945,7 @@ fn test_chat_scope_defaults_to_dm_only() {
 }
 
 #[test]
-fn test_legacy_dm_only_false_maps_to_all() {
+fn legacy_dm_only_false_maps_to_all() {
     let yaml = r#"
 telegram:
   dm_only: false
@@ -466,7 +955,7 @@ telegram:
 }
 
 #[test]
-fn test_chat_scope_overrides_legacy_dm_only() {
+fn chat_scope_overrides_legacy_dm_only() {
     let yaml = r#"
 discord:
   chat_scope: GROUPCHAT_ONLY
@@ -477,7 +966,7 @@ discord:
 }
 
 #[test]
-fn test_read_config_path_value_supports_nested_mapping_and_sequence() {
+fn read_config_path_value_supports_nested_mapping_and_sequence() {
     let dir = temp_test_dir("path-get");
     let config_path = dir.join("config.yaml");
     std::fs::write(
@@ -513,7 +1002,7 @@ agent:
 }
 
 #[test]
-fn test_apply_config_mutations_updates_canonical_config_directly() {
+fn apply_config_mutations_updates_canonical_config_directly() {
     let dir = temp_test_dir("mutations");
     let config_path = dir.join("config.yaml");
     let overlay_path = runtime_overlay_path(&config_path);
@@ -568,7 +1057,7 @@ search:
 }
 
 #[test]
-fn test_apply_config_mutations_rejects_invalid_path_shape() {
+fn apply_config_mutations_rejects_invalid_path_shape() {
     let dir = temp_test_dir("mutations-error");
     let config_path = dir.join("config.yaml");
     std::fs::write(
@@ -596,7 +1085,7 @@ agent:
 }
 
 #[test]
-fn test_apply_overlay_mutations_writes_only_to_overlay() {
+fn apply_overlay_mutations_writes_only_to_overlay() {
     let dir = temp_test_dir("overlay-mutations");
     let config_path = dir.join("config.yaml");
     let overlay_path = runtime_overlay_path(&config_path);
@@ -604,7 +1093,7 @@ fn test_apply_overlay_mutations_writes_only_to_overlay() {
 event_engine:
   global_digest:
     enabled: false
-    schedules: ["09:00"]
+    lookback_hours: 24
     pass2_top_n: 15
 "#;
     std::fs::write(&config_path, base).unwrap();
@@ -617,11 +1106,8 @@ event_engine:
                 value: Value::Bool(true),
             },
             ConfigMutation::Set {
-                path: "event_engine.global_digest.schedules".to_string(),
-                value: Value::Sequence(vec![
-                    Value::String("09:00".to_string()),
-                    Value::String("21:00".to_string()),
-                ]),
+                path: "event_engine.global_digest.lookback_hours".to_string(),
+                value: Value::Number(48.into()),
             },
         ],
     )
@@ -636,21 +1122,18 @@ event_engine:
     assert!(overlay_path.exists());
     let overlay_text = std::fs::read_to_string(&overlay_path).unwrap();
     assert!(overlay_text.contains("enabled: true"));
-    assert!(overlay_text.contains("21:00"));
+    assert!(overlay_text.contains("48"));
     assert!(!overlay_text.contains("pass2_top_n")); // 未改动的字段不该出现
 
     // 启动时合并后的 effective config 反映改动
     assert!(result.config.event_engine.global_digest.enabled);
-    assert_eq!(
-        result.config.event_engine.global_digest.schedules,
-        vec!["09:00".to_string(), "21:00".to_string()]
-    );
+    assert_eq!(result.config.event_engine.global_digest.lookback_hours, 48);
     // 未改动的字段保持 base 值
     assert_eq!(result.config.event_engine.global_digest.pass2_top_n, 15);
 }
 
 #[test]
-fn test_apply_overlay_mutations_unset_removes_from_overlay() {
+fn apply_overlay_mutations_unset_removes_from_overlay() {
     let dir = temp_test_dir("overlay-unset");
     let config_path = dir.join("config.yaml");
     let overlay_path = runtime_overlay_path(&config_path);
@@ -686,7 +1169,7 @@ fn test_apply_overlay_mutations_unset_removes_from_overlay() {
 }
 
 #[test]
-fn test_apply_overlay_mutations_rejects_invalid_merged_config() {
+fn apply_overlay_mutations_rejects_invalid_merged_config() {
     let dir = temp_test_dir("overlay-invalid");
     let config_path = dir.join("config.yaml");
     std::fs::write(&config_path, "feishu:\n  chat_scope: ALL\n").unwrap();
@@ -712,7 +1195,7 @@ fn test_apply_overlay_mutations_rejects_invalid_merged_config() {
 }
 
 #[test]
-fn test_redact_sensitive_value_masks_scalars_and_sequences() {
+fn redact_sensitive_value_masks_scalars_and_sequences() {
     assert_eq!(
         redact_sensitive_value(
             "agent.opencode.api_key",
@@ -740,7 +1223,7 @@ fn test_redact_sensitive_value_masks_scalars_and_sequences() {
 }
 
 #[test]
-fn test_generate_effective_config_copies_relative_prompt_asset() {
+fn generate_effective_config_copies_relative_prompt_asset() {
     let dir = temp_test_dir("effective-config");
     let canonical = dir.join("config.yaml");
     let runtime_dir = dir.join("data/runtime");
@@ -768,158 +1251,23 @@ agent:
 }
 
 #[test]
-fn test_promote_legacy_runtime_agent_settings_migrates_blank_multi_agent_and_runner() {
+fn promote_legacy_runtime_agent_settings_migrates_blank_multi_agent_and_runner() {
     let dir = temp_test_dir("legacy-agent-migrate");
     let canonical = dir.join("config.yaml");
     let legacy = dir.join("data/runtime/config_runtime.yaml");
     std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-    std::fs::write(
-        &canonical,
-        r#"
-agent:
-  runner: codex_cli
-  multi_agent:
-    search:
-      api_key: ""
-    answer:
-      api_key: ""
-  opencode:
-    api_key: ""
-llm:
-  auxiliary:
-    api_key: ""
-  openrouter:
-    api_key: ""
-    api_keys: []
-search:
-  api_keys: []
-fmp:
-  api_key: ""
-  api_keys: []
-feishu:
-  enabled: false
-  app_id: ""
-  app_secret: ""
-telegram:
-  enabled: false
-  bot_token: ""
-  chat_scope: DM_ONLY
-discord:
-  enabled: false
-  bot_token: ""
-  chat_scope: DM_ONLY
-"#,
-    )
-    .unwrap();
-    std::fs::write(
-        &legacy,
-        r#"
-agent:
-  runner: multi-agent
-  multi_agent:
-    search:
-      base_url: "https://api.minimaxi.com/v1"
-      api_key: "legacy-search"
-      model: "MiniMax-M2.7-highspeed"
-      max_iterations: 8
-    answer:
-      api_base_url: "https://openrouter.ai/api/v1"
-      api_key: "legacy-answer"
-      model: "google/gemini-3.1-pro-preview"
-      variant: "high"
-      max_tool_calls: 1
-  opencode:
-    api_base_url: "https://openrouter.ai/api/v1"
-    api_key: "legacy-answer"
-    model: "google/gemini-3.1-pro-preview"
-    variant: "high"
-llm:
-  auxiliary:
-    base_url: "https://api.minimaxi.com/v1"
-    api_key: "legacy-search"
-    model: "MiniMax-M2.7-highspeed"
-  openrouter:
-    api_key: "legacy-openrouter"
-    api_keys:
-      - legacy-openrouter-1
-      - legacy-openrouter-2
-search:
-  provider: tavily
-  api_keys:
-    - tvly-one
-    - tvly-two
-  search_depth: advanced
-  topic: finance
-fmp:
-  api_key: "legacy-fmp"
-  api_keys:
-    - legacy-fmp-2
-  base_url: "https://financialmodelingprep.com/api"
-  timeout: 30
-feishu:
-  enabled: true
-  app_id: "cli_test"
-  app_secret: "secret"
-telegram:
-  enabled: true
-  bot_token: "tg-token"
-  dm_only: false
-discord:
-  enabled: true
-  bot_token: "discord-token"
-  dm_only: false
-"#,
-    )
-    .unwrap();
+    std::fs::write(&canonical, legacy_agent_migration_canonical_yaml()).unwrap();
+    std::fs::write(&legacy, legacy_agent_migration_runtime_yaml()).unwrap();
 
     let changed = promote_legacy_runtime_agent_settings(&canonical, &legacy).unwrap();
-
-    assert!(changed.contains(&"agent.multi_agent".to_string()));
-    assert!(changed.contains(&"agent.opencode".to_string()));
-    assert!(changed.contains(&"llm.auxiliary".to_string()));
-    assert!(changed.contains(&"llm.openrouter.api_key".to_string()));
-    assert!(changed.contains(&"llm.openrouter.api_keys".to_string()));
-    assert!(changed.contains(&"agent.runner".to_string()));
-    assert!(changed.contains(&"search.api_keys".to_string()));
-    assert!(changed.contains(&"fmp.api_key".to_string()));
-    assert!(changed.contains(&"fmp.api_keys".to_string()));
-    assert!(changed.contains(&"feishu.enabled".to_string()));
-    assert!(changed.contains(&"telegram.enabled".to_string()));
-    assert!(changed.contains(&"discord.enabled".to_string()));
+    assert_legacy_agent_migration_changed_paths(&changed);
 
     let config = HoneConfig::from_file(&canonical).unwrap();
-    assert_eq!(config.agent.runner, "multi-agent");
-    assert_eq!(config.agent.multi_agent.search.api_key, "legacy-search");
-    assert_eq!(config.agent.multi_agent.answer.api_key, "legacy-answer");
-    assert_eq!(config.agent.opencode.api_key, "legacy-answer");
-    assert_eq!(config.llm.auxiliary.api_key, "legacy-search");
-    assert_eq!(config.llm.openrouter.api_key, "legacy-openrouter");
-    assert_eq!(
-        config.llm.openrouter.api_keys,
-        vec![
-            "legacy-openrouter-1".to_string(),
-            "legacy-openrouter-2".to_string()
-        ]
-    );
-    assert_eq!(
-        config.search.api_keys,
-        vec!["tvly-one".to_string(), "tvly-two".to_string()]
-    );
-    assert_eq!(config.fmp.api_key, "legacy-fmp");
-    assert_eq!(config.fmp.api_keys, vec!["legacy-fmp-2".to_string()]);
-    assert!(config.feishu.enabled);
-    assert_eq!(config.feishu.app_id, "cli_test");
-    assert_eq!(config.feishu.app_secret, "secret");
-    assert!(config.telegram.enabled);
-    assert_eq!(config.telegram.bot_token, "tg-token");
-    assert_eq!(config.telegram.chat_scope, ChatScope::All);
-    assert!(config.discord.enabled);
-    assert_eq!(config.discord.bot_token, "discord-token");
-    assert_eq!(config.discord.chat_scope, ChatScope::All);
+    assert_legacy_agent_migration_config(&config);
 }
 
 #[test]
-fn test_promote_legacy_runtime_agent_settings_migrates_openrouter_key_pool() {
+fn promote_legacy_runtime_agent_settings_migrates_openrouter_key_pool() {
     let dir = temp_test_dir("legacy-openrouter-pool");
     let canonical = dir.join("config.yaml");
     let legacy = dir.join("data/runtime/config_runtime.yaml");
@@ -948,25 +1296,29 @@ llm:
     .unwrap();
 
     let changed = promote_legacy_runtime_agent_settings(&canonical, &legacy).unwrap();
-    assert_eq!(changed, vec!["llm.openrouter.api_keys".to_string()]);
+    assert_eq!(
+        changed,
+        vec!["llm.providers.openrouter.api_keys".to_string()]
+    );
 
     let config = HoneConfig::from_file(&canonical).unwrap();
     assert_eq!(config.llm.openrouter.api_key, "");
+    let provider = config.llm.providers.get("openrouter").unwrap();
     assert_eq!(
-        config.llm.openrouter.api_keys,
+        provider.api_keys,
         vec![
             "legacy-openrouter-1".to_string(),
             "legacy-openrouter-2".to_string()
         ]
     );
     assert_eq!(
-        config.llm.openrouter.effective_key_pool().keys(),
+        config.llm.openrouter_key_pool().keys(),
         &["legacy-openrouter-1", "legacy-openrouter-2"]
     );
 }
 
 #[test]
-fn test_promote_legacy_runtime_agent_settings_keeps_configured_canonical_values() {
+fn promote_legacy_runtime_agent_settings_keeps_configured_canonical_values() {
     let dir = temp_test_dir("legacy-agent-preserve");
     let canonical = dir.join("config.yaml");
     let legacy = dir.join("data/runtime/config_runtime.yaml");
@@ -1053,7 +1405,7 @@ discord:
 }
 
 #[test]
-fn test_promote_legacy_runtime_agent_settings_preserves_blank_opencode_key_inheritance() {
+fn promote_legacy_runtime_agent_settings_preserves_blank_opencode_key_inheritance() {
     let dir = temp_test_dir("legacy-agent-opencode-inheritance");
     let canonical = dir.join("config.yaml");
     let legacy = dir.join("data/runtime/config_runtime.yaml");
@@ -1099,7 +1451,35 @@ agent:
 }
 
 #[test]
-fn test_agent_runner_timeouts_default_to_step_plus_overall() {
+fn normalize_runtime_storage_rollout_settings_enables_session_shadow_write() {
+    let dir = temp_test_dir("runtime-storage-rollout");
+    let canonical = dir.join("config.yaml");
+    std::fs::write(
+        &canonical,
+        r#"
+storage:
+  session_sqlite_shadow_write_enabled: false
+  session_runtime_backend: "json"
+"#,
+    )
+    .unwrap();
+
+    let changed = normalize_runtime_storage_rollout_settings(&canonical).unwrap();
+    assert_eq!(
+        changed,
+        vec!["storage.session_sqlite_shadow_write_enabled".to_string()]
+    );
+
+    let config = HoneConfig::from_file(&canonical).unwrap();
+    assert!(config.storage.session_sqlite_shadow_write_enabled);
+
+    let second = normalize_runtime_storage_rollout_settings(&canonical).unwrap();
+    assert!(second.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn agent_runner_timeouts_default_to_step_plus_overall() {
     let yaml = r#"
 agent:
   runner: codex_acp
@@ -1110,7 +1490,7 @@ agent:
 }
 
 #[test]
-fn test_agent_runner_timeout_override_preserves_explicit_values() {
+fn agent_runner_timeout_override_preserves_explicit_values() {
     let yaml = r#"
 agent:
   runner: codex_acp
@@ -1120,4 +1500,67 @@ agent:
     let config: HoneConfig = serde_yaml::from_str(yaml).unwrap();
     assert_eq!(config.agent.step_timeout_seconds, 120);
     assert_eq!(config.agent.overall_timeout_seconds, 600);
+}
+
+#[test]
+fn default_language_is_zh() {
+    let config = HoneConfig::default();
+    assert_eq!(config.language, super::Locale::Zh);
+}
+
+#[test]
+fn language_parses_en() {
+    let yaml = "language: en\n";
+    let config: HoneConfig = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(config.language, super::Locale::En);
+}
+
+#[test]
+fn language_parses_zh() {
+    let yaml = "language: zh\n";
+    let config: HoneConfig = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(config.language, super::Locale::Zh);
+}
+
+#[test]
+fn language_mutation_round_trip() {
+    let dir = temp_test_dir("language-mutation");
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, "llm:\n  provider: openrouter\n").unwrap();
+
+    let result = apply_config_mutations(
+        &config_path,
+        &[ConfigMutation::Set {
+            path: "language".to_string(),
+            value: Value::String("en".to_string()),
+        }],
+    )
+    .unwrap();
+    assert_eq!(result.config.language, super::Locale::En);
+    assert!(result.apply.applied_live, "language is hot-reloadable");
+    assert!(!result.apply.restart_required);
+    assert!(result.apply.restarted_components.is_empty());
+}
+
+#[test]
+fn config_example_avoids_stale_config_knobs() {
+    let example_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config.example.yaml");
+    let example = std::fs::read_to_string(example_path).unwrap();
+    let root_value: Value = serde_yaml::from_str(&example).unwrap();
+    HoneConfig::from_merged_value(root_value.clone()).unwrap();
+    let root = root_value.as_mapping().unwrap();
+    assert_config_example_roots(root);
+
+    assert!(
+        !yaml_has_key(root, "discord_watch"),
+        "discord watcher belongs under discord.watch"
+    );
+    assert!(!yaml_has_key(root, "tools"));
+    assert!(!yaml_has_key(root, "server"));
+    assert_config_example_channel_sections(root);
+    assert_config_example_event_sections(root);
+    assert_config_example_agent_section(root);
+    assert_config_example_multi_agent_fallback_docs(&example);
+    assert_config_example_storage_and_logging(root);
+    assert_config_example_public_auth_env_docs(&example);
 }

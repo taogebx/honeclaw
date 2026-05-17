@@ -22,9 +22,9 @@ pub(super) const DIGEST_MAX_ITEMS_PER_DOMAIN: usize = 2;
 pub(super) const DIGEST_MACRO_LOOKAHEAD_HOURS: i64 = 48;
 
 #[derive(Debug)]
-pub(super) struct DigestCuration {
-    pub(super) kept: Vec<MarketEvent>,
-    pub(super) omitted: Vec<MarketEvent>,
+pub(crate) struct DigestCuration {
+    pub(crate) kept: Vec<MarketEvent>,
+    pub(crate) omitted: Vec<MarketEvent>,
 }
 
 impl DigestCuration {
@@ -42,78 +42,90 @@ pub(crate) fn curate_digest_events_with_omitted_at(
 ) -> DigestCuration {
     let mut kept = Vec::with_capacity(events.len());
     let mut omitted = Vec::new();
-    let mut social_count = 0usize;
-    let mut by_symbol: HashMap<String, usize> = HashMap::new();
-    let mut by_source: HashMap<String, usize> = HashMap::new();
-    let mut by_domain: HashMap<String, usize> = HashMap::new();
-    let mut title_keys: HashSet<String> = HashSet::new();
-    let mut topic_tokens: Vec<(String, HashSet<String>)> = Vec::new();
+    let mut curation_state = DigestCurationState::default();
 
     for event in events {
         let is_high = event.severity.rank() >= crate::event::Severity::High.rank();
-        if !is_high {
-            if should_omit_from_digest(&event, now) {
-                omitted.push(event);
-                continue;
-            }
-            if matches!(event.kind, EventKind::SocialPost) {
-                if social_count >= DIGEST_MAX_SOCIAL_ITEMS {
-                    omitted.push(event);
-                    continue;
-                }
-            }
-            if let Some(symbol) = primary_symbol_key(&event) {
-                if by_symbol.get(&symbol).copied().unwrap_or(0) >= DIGEST_MAX_ITEMS_PER_SYMBOL {
-                    omitted.push(event);
-                    continue;
-                }
-            }
-            if !event.source.is_empty()
-                && by_source.get(&event.source).copied().unwrap_or(0) >= DIGEST_MAX_ITEMS_PER_SOURCE
-            {
-                omitted.push(event);
-                continue;
-            }
-            if let Some(domain) = event_domain_key(&event) {
-                if by_domain.get(&domain).copied().unwrap_or(0) >= DIGEST_MAX_ITEMS_PER_DOMAIN {
-                    omitted.push(event);
-                    continue;
-                }
-            }
-            if let Some(title_key) = digest_title_dedupe_key(&event) {
-                if !title_keys.insert(title_key) {
-                    omitted.push(event);
-                    continue;
-                }
-            }
-            if let Some((topic_key, tokens)) = digest_topic_tokens(&event) {
-                if topic_tokens
-                    .iter()
-                    .any(|(key, seen)| key == &topic_key && token_jaccard(seen, &tokens) >= 0.55)
-                {
-                    omitted.push(event);
-                    continue;
-                }
-                topic_tokens.push((topic_key, tokens));
-            }
+        if !is_high && curation_state.should_omit_non_high_event(&event, now) {
+            omitted.push(event);
+            continue;
         }
 
-        if matches!(event.kind, EventKind::SocialPost) {
-            social_count += 1;
-        }
-        if let Some(symbol) = primary_symbol_key(&event) {
-            *by_symbol.entry(symbol).or_default() += 1;
-        }
-        if !event.source.is_empty() {
-            *by_source.entry(event.source.clone()).or_default() += 1;
-        }
-        if let Some(domain) = event_domain_key(&event) {
-            *by_domain.entry(domain).or_default() += 1;
-        }
+        curation_state.record_kept_event(&event);
         kept.push(event);
     }
 
     DigestCuration { kept, omitted }
+}
+
+#[derive(Default)]
+struct DigestCurationState {
+    social_count: usize,
+    by_symbol: HashMap<String, usize>,
+    by_source: HashMap<String, usize>,
+    by_domain: HashMap<String, usize>,
+    title_keys: HashSet<String>,
+    topic_tokens: Vec<(String, HashSet<String>)>,
+}
+
+impl DigestCurationState {
+    fn should_omit_non_high_event(&mut self, event: &MarketEvent, now: DateTime<Utc>) -> bool {
+        if should_omit_from_digest(event, now) {
+            return true;
+        }
+        if matches!(event.kind, EventKind::SocialPost)
+            && self.social_count >= DIGEST_MAX_SOCIAL_ITEMS
+        {
+            return true;
+        }
+        if let Some(symbol) = primary_symbol_key(event)
+            && self.by_symbol.get(&symbol).copied().unwrap_or(0) >= DIGEST_MAX_ITEMS_PER_SYMBOL
+        {
+            return true;
+        }
+        if !event.source.is_empty()
+            && self.by_source.get(&event.source).copied().unwrap_or(0)
+                >= DIGEST_MAX_ITEMS_PER_SOURCE
+        {
+            return true;
+        }
+        if let Some(domain) = event_domain_key(event)
+            && self.by_domain.get(&domain).copied().unwrap_or(0) >= DIGEST_MAX_ITEMS_PER_DOMAIN
+        {
+            return true;
+        }
+        if let Some(title_key) = digest_title_dedupe_key(event)
+            && !self.title_keys.insert(title_key)
+        {
+            return true;
+        }
+        if let Some((topic_key, tokens)) = digest_topic_tokens(event) {
+            let duplicate = self
+                .topic_tokens
+                .iter()
+                .any(|(key, seen)| key == &topic_key && token_jaccard(seen, &tokens) >= 0.55);
+            if duplicate {
+                return true;
+            }
+            self.topic_tokens.push((topic_key, tokens));
+        }
+        false
+    }
+
+    fn record_kept_event(&mut self, event: &MarketEvent) {
+        if matches!(event.kind, EventKind::SocialPost) {
+            self.social_count += 1;
+        }
+        if let Some(symbol) = primary_symbol_key(event) {
+            *self.by_symbol.entry(symbol).or_default() += 1;
+        }
+        if !event.source.is_empty() {
+            *self.by_source.entry(event.source.clone()).or_default() += 1;
+        }
+        if let Some(domain) = event_domain_key(event) {
+            *self.by_domain.entry(domain).or_default() += 1;
+        }
+    }
 }
 
 pub(crate) fn suppress_recent_digest_topics_with_omitted(
@@ -171,7 +183,7 @@ pub(crate) fn digest_score(event: &MarketEvent) -> i32 {
         EventKind::EarningsReleased | EventKind::SecFiling { .. } => 50,
         EventKind::EarningsCallTranscript => 15,
         EventKind::PriceAlert { ref window, .. } if window != "close" => 35,
-        EventKind::Dividend | EventKind::Split | EventKind::Buyback => 30,
+        EventKind::Dividend | EventKind::Split => 30,
         EventKind::MacroEvent => 20,
         EventKind::NewsCritical => 10,
         EventKind::SocialPost => -35,
@@ -257,21 +269,11 @@ fn event_domain_key(event: &MarketEvent) -> Option<String> {
 }
 
 fn digest_title_dedupe_key(event: &MarketEvent) -> Option<String> {
-    if !matches!(
-        event.kind,
-        EventKind::NewsCritical | EventKind::PressRelease | EventKind::SocialPost
-    ) {
+    if !matches!(event.kind, EventKind::NewsCritical | EventKind::SocialPost) {
         return None;
     }
     let title = super::render::digest_event_title(event);
-    let normalized: Vec<String> = title
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter_map(|token| {
-            let token = token.trim().to_ascii_lowercase();
-            (token.len() > 2).then_some(token)
-        })
-        .take(10)
-        .collect();
+    let normalized: Vec<String> = digest_title_tokens(&title).into_iter().take(10).collect();
     if normalized.is_empty() {
         return None;
     }
@@ -287,29 +289,49 @@ fn digest_topic_tokens(event: &MarketEvent) -> Option<(String, HashSet<String>)>
     // 标题模式化太强(`AAPL earnings tomorrow`),容易误判成同主题。
     if !matches!(
         event.kind,
-        EventKind::NewsCritical
-            | EventKind::PressRelease
-            | EventKind::SocialPost
-            | EventKind::MacroEvent
+        EventKind::NewsCritical | EventKind::SocialPost | EventKind::MacroEvent
     ) {
         return None;
     }
-    let tokens: HashSet<String> = super::render::digest_event_title(event)
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter_map(|token| {
-            let token = token.trim().to_ascii_lowercase();
-            if token.len() <= 2 || DIGEST_STOPWORDS.contains(&token.as_str()) {
-                None
-            } else {
-                Some(token)
-            }
-        })
+    let tokens: HashSet<String> = digest_title_tokens(&super::render::digest_event_title(event))
+        .into_iter()
         .collect();
     if tokens.len() < 3 {
         return None;
     }
     let symbol = primary_symbol_key(event).unwrap_or_else(|| "-".into());
     Some((format!("{symbol}:{}", kind_topic_tag(&event.kind)), tokens))
+}
+
+fn digest_title_tokens(title: &str) -> Vec<String> {
+    title
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter_map(|token| {
+            normalize_digest_token(token).and_then(|token| {
+                if DIGEST_STOPWORDS.contains(&token.as_str()) {
+                    None
+                } else {
+                    Some(token)
+                }
+            })
+        })
+        .collect()
+}
+
+fn normalize_digest_token(token: &str) -> Option<String> {
+    let token = token.trim().to_ascii_lowercase();
+    if token.len() <= 2 {
+        return None;
+    }
+    Some(match token.as_str() {
+        "delivers" | "delivered" | "delivering" => "deliver".into(),
+        "raises" | "raised" | "raising" => "raise".into(),
+        "lowers" | "lowered" | "lowering" => "lower".into(),
+        "boosts" | "boosted" | "boosting" => "boost".into(),
+        "jumps" | "jumped" | "rallies" | "rallied" => "rally".into(),
+        "final" => "last".into(),
+        _ => token,
+    })
 }
 
 fn token_jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
@@ -325,7 +347,6 @@ fn token_jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
 fn kind_topic_tag(kind: &EventKind) -> &'static str {
     match kind {
         EventKind::SocialPost => "social",
-        EventKind::PressRelease => "press",
         EventKind::MacroEvent => "macro",
         _ => "news",
     }
@@ -339,6 +360,8 @@ fn is_low_quality_social_source(event: &MarketEvent) -> bool {
 const DIGEST_STOPWORDS: &[&str] = &[
     "the",
     "and",
+    "are",
+    "but",
     "for",
     "with",
     "from",
@@ -349,6 +372,16 @@ const DIGEST_STOPWORDS: &[&str] = &[
     "into",
     "over",
     "under",
+    "will",
+    "his",
+    "her",
+    "its",
+    "their",
+    "just",
+    "today",
+    "officially",
+    "end",
+    "era",
     "says",
     "said",
     "stock",

@@ -1,6 +1,6 @@
 //! NewsPoller — 拉取 FMP `v3/stock_news`，产出 `NewsCritical` 事件。
 //!
-//! MVP 行为：
+//! 当前行为：
 //! - `poll()` 从 FMP 拉一页最新新闻（可选 ticker 过滤，`None` 表示全局流）
 //! - 默认 severity = Low；title/text 命中关键词库 → 升级为 High
 //! - id 直接用文章 URL 做稳定去重；缺 URL 则回落到 "title+date" 组合
@@ -279,12 +279,13 @@ impl EventSource for NewsPoller {
 
 /// FMP stock_news 响应 → MarketEvent 列表。
 fn events_from_stock_news(raw: &Value, keywords: &[String]) -> Vec<MarketEvent> {
-    let arr = match raw.as_array() {
-        Some(a) => a,
+    let articles = match raw.as_array() {
+        Some(items) => items,
         None => return vec![],
     };
 
-    arr.iter()
+    articles
+        .iter()
         .filter_map(|item| {
             let title = item.get("title")?.as_str()?.to_string();
             let published_raw = item.get("publishedDate")?.as_str()?.to_string();
@@ -529,6 +530,29 @@ mod tests {
             "url": "https://fool.com/x"
         }]);
         let events = events_from_stock_news(&raw, &default_kws());
+        assert_eq!(events[0].severity, Severity::Low);
+        assert_eq!(
+            events[0]
+                .payload
+                .get("source_class")
+                .and_then(|v| v.as_str()),
+            Some("opinion_blog")
+        );
+    }
+
+    #[test]
+    fn zacks_generic_stock_template_is_low_opinion_blog() {
+        let raw = serde_json::json!([{
+            "symbol": "VST",
+            "publishedDate": "2026-04-30 01:04:00",
+            "title": "Vistra Corp. (VST) is Attracting Investor Attention: Here is What You Should Know",
+            "site": "zacks.com",
+            "text": "A template-style stock attention article.",
+            "url": "https://www.zacks.com/stock/news/2910545/vistra-corp-vst-is-attracting-investor-attention-here-is-what-you-should-know?cid=CS-STOCKNEWSAPI-FT-tale_of_the_tape|most_searched_stocks-2910545"
+        }]);
+        let events = events_from_stock_news(&raw, &default_kws());
+
+        assert_eq!(events.len(), 1);
         assert_eq!(events[0].severity, Severity::Low);
         assert_eq!(
             events[0]

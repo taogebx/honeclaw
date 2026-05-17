@@ -1,13 +1,13 @@
 //! Public 端用户可见的 digest 配置展示 API:
 //!
-//! - GET /api/public/digest-context  → 当前用户(web 邀请登录态)的蒸馏 thesis
+//! - GET /api/public/digest-context  → 当前用户(web 邀请登录态)的蒸馏投资主线
 //!   map、整体投资风格、上次蒸馏时间、跳过的 ticker 列表、其 sandbox 里现有
 //!   公司画像列表(ticker + dir name + profile.md 摘要前 N 字)
 //! - GET /api/public/company-profile?ticker=XXX → 单只 ticker 完整 profile.md
 //!   (read-only,不暴露写入路径 —— 编辑请通过 chat agent 触发 company_portrait skill)
 //! - POST /api/public/digest-context/refresh → 立即触发一次蒸馏(对当前用户)
 //!
-//! 与 admin 端 /api/event-engine/thesis-distill 区别:public 端 actor 限定为
+//! 与 admin 端 /api/event-engine/mainline-distill 区别:public 端 actor 限定为
 //! 自己(由 session 推导),admin 端可以代任何 actor 操作。
 
 use std::path::PathBuf;
@@ -45,7 +45,7 @@ pub(crate) async fn handle_get_digest_context(
         Err(resp) => return resp,
     };
 
-    // prefs(thesis 蒸馏结果)
+    // prefs(投资主线蒸馏结果)
     let prefs_storage = match hone_event_engine::prefs::FilePrefsStorage::new(
         &state.core.config.storage.notif_prefs_dir,
     ) {
@@ -60,7 +60,7 @@ pub(crate) async fn handle_get_digest_context(
     use hone_event_engine::prefs::PrefsProvider;
     let prefs = prefs_storage.load(&actor);
 
-    // 持仓(用于显示哪些 ticker 应该有 thesis 但没有)
+    // 持仓(用于显示哪些 ticker 应该有投资主线但没有)
     let portfolio_storage =
         hone_memory::PortfolioStorage::new(&state.core.config.storage.portfolio_dir);
     let holdings: Vec<String> = match portfolio_storage.load(&actor) {
@@ -78,12 +78,10 @@ pub(crate) async fn handle_get_digest_context(
             "channel": "web",
             "user_id": actor.user_id,
         },
-        "investment_global_style": prefs.investment_global_style,
-        "investment_theses": prefs.investment_theses.clone().unwrap_or_default(),
-        "global_digest_enabled": prefs.global_digest_enabled,
-        "global_digest_floor_macro_picks": prefs.global_digest_floor_macro_picks,
-        "last_thesis_distilled_at": prefs.last_thesis_distilled_at,
-        "thesis_distill_skipped": prefs.thesis_distill_skipped,
+        "mainline_style": prefs.mainline_style,
+        "mainline_by_ticker": prefs.mainline_by_ticker.clone().unwrap_or_default(),
+        "last_mainline_distilled_at": prefs.last_mainline_distilled_at,
+        "mainline_distill_skipped": prefs.mainline_distill_skipped,
         "holdings": holdings,
         "profile_list": profile_summaries,
     }))
@@ -148,7 +146,7 @@ pub(crate) async fn handle_refresh_digest_context(
         Ok(None) => {
             return json_error(
                 StatusCode::NOT_FOUND,
-                "actor 没有 portfolio,无法蒸馏 thesis(请先建仓)",
+                "actor 没有 portfolio,无法蒸馏投资主线(请先建仓)",
             );
         }
         Err(e) => {
@@ -167,24 +165,31 @@ pub(crate) async fn handle_refresh_digest_context(
         return json_error(StatusCode::BAD_REQUEST, "portfolio 持仓为空");
     }
 
-    let provider: Arc<dyn hone_llm::LlmProvider> =
-        match hone_llm::OpenRouterProvider::from_config(&state.core.config) {
-            Ok(p) => Arc::new(p),
-            Err(e) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("OpenRouter provider 不可用: {e}"),
-                );
-            }
-        };
-    let model = state
-        .core
-        .config
-        .event_engine
-        .global_digest
-        .event_dedupe_model
-        .clone();
-    let distiller = hone_event_engine::global_digest::LlmThesisDistiller::new(provider, model);
+    let gd = &state.core.config.event_engine.global_digest;
+    let profile_ref = if gd.mainline_distill_llm.trim().is_empty() {
+        &gd.event_dedupe_llm
+    } else {
+        &gd.mainline_distill_llm
+    };
+    let created = match hone_llm::LlmResolver::new(&state.core.config)
+        .provider_for_profile_or_openrouter_model(
+            Some(profile_ref),
+            &gd.event_dedupe_model,
+            &gd.event_dedupe_model,
+            Some(1200),
+        ) {
+        Ok(created) => created,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("LLM provider 不可用: {e}"),
+            );
+        }
+    };
+    let distiller = hone_event_engine::global_digest::LlmMainlineDistiller::new(
+        created.provider,
+        created.model,
+    );
 
     let prefs_storage = match hone_event_engine::prefs::FilePrefsStorage::new(
         &state.core.config.storage.notif_prefs_dir,
@@ -216,10 +221,10 @@ pub(crate) async fn handle_refresh_digest_context(
 
     Json(json!({
         "ok": true,
-        "theses_count": updated.investment_theses.as_ref().map(|m| m.len()).unwrap_or(0),
-        "global_style_set": updated.investment_global_style.is_some(),
-        "skipped_tickers": updated.thesis_distill_skipped,
-        "last_distilled_at": updated.last_thesis_distilled_at,
+        "mainline_count": updated.mainline_by_ticker.as_ref().map(|m| m.len()).unwrap_or(0),
+        "mainline_style_set": updated.mainline_style.is_some(),
+        "skipped_tickers": updated.mainline_distill_skipped,
+        "last_distilled_at": updated.last_mainline_distilled_at,
     }))
     .into_response()
 }

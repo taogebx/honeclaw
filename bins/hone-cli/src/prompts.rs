@@ -5,8 +5,8 @@
 //!   / `prompt_select_index` —— dialoguer 的薄包装,统一错误类型
 //! - `RequiredFieldEmptyAction` / `RequiredFieldResolution` / `ProviderEmptyAction`
 //!   —— 通用「必填项空值 / Provider key 空值」恢复决策类型
-//! - `resolve_required_field_attempt` / `resolve_required_secret_attempt` ——
-//!   把用户输入 + 已有配置值 + 恢复动作组合成最终 resolution
+//! - `resolve_required_secret_attempt` ——
+//!   把用户输入 + 已有配置值 + 延迟恢复动作组合成最终 resolution
 //! - `prompt_channel_recovery_action` / `prompt_provider_recovery_action` ——
 //!   面对空必填项 / 空 provider key 时让用户选择「重试 / 放弃」
 //! - `normalize_credential_value` / `normalize_credential_value_opt` ——
@@ -16,6 +16,8 @@
 //! primitive 组装各自的业务步骤。
 
 use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
+
+use crate::i18n::{Lang, t, tpl};
 
 /// 必填项为空时,用户的 2 选 1 决策。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,31 +55,7 @@ pub(crate) fn normalize_credential_value_opt(raw: Option<&str>) -> Option<String
         .filter(|value| !value.is_empty())
 }
 
-/// 统一解析「必填项输入」。
-///
-/// 优先使用本次 prompt 的返回值;若为空则退回到已有配置值;若仍为空则按
-/// `on_empty` 决定重试或禁用。用于同步(非交互)上下文;interactive 场景
-/// 见 [`resolve_required_secret_attempt`] 接 FnOnce 的版本。
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn resolve_required_field_attempt(
-    attempted: Option<String>,
-    current: &str,
-    on_empty: RequiredFieldEmptyAction,
-) -> RequiredFieldResolution {
-    if let Some(value) = normalize_credential_value_opt(attempted.as_deref()) {
-        return RequiredFieldResolution::Value(value);
-    }
-    if let Some(value) = normalize_credential_value_opt(Some(current)) {
-        return RequiredFieldResolution::Value(value);
-    }
-    match on_empty {
-        RequiredFieldEmptyAction::Retry => RequiredFieldResolution::Retry,
-        RequiredFieldEmptyAction::DisableChannel => RequiredFieldResolution::DisableChannel,
-    }
-}
-
-/// [`resolve_required_field_attempt`] 的 interactive 变体：`on_empty` 是一个
-/// 在真的需要决策时才被调用的 `FnOnce`,避免无意义地 prompt。
+/// `on_empty` 在真的需要决策时才被调用,避免无意义地 prompt。
 pub(crate) fn resolve_required_secret_attempt<F>(
     attempted: Option<String>,
     current: &str,
@@ -127,14 +105,11 @@ pub(crate) fn prompt_bool(
 /// `keep_note=true` 会在提示里追加「留空保持现有值」。
 pub(crate) fn prompt_secret(
     theme: &ColorfulTheme,
+    lang: Lang,
     prompt: &str,
     keep_note: bool,
 ) -> Result<Option<String>, String> {
-    let prompt = if keep_note {
-        format!("{prompt}（留空保持现有值）")
-    } else {
-        prompt.to_string()
-    };
+    let prompt = decorate_keep_note_prompt(lang, prompt, keep_note);
     let value = Password::with_theme(theme)
         .with_prompt(prompt)
         .allow_empty_password(true)
@@ -147,15 +122,12 @@ pub(crate) fn prompt_secret(
 /// 与 [`prompt_secret`] 的区别：输入时显示、允许预填 `current`。
 pub(crate) fn prompt_visible_credential(
     theme: &ColorfulTheme,
+    lang: Lang,
     prompt: &str,
     keep_note: bool,
     current: &str,
 ) -> Result<Option<String>, String> {
-    let prompt = if keep_note {
-        format!("{prompt}（留空保持现有值）")
-    } else {
-        prompt.to_string()
-    };
+    let prompt = decorate_keep_note_prompt(lang, prompt, keep_note);
     let mut input = Input::<String>::with_theme(theme);
     input = input.with_prompt(prompt).allow_empty(true);
     if !current.is_empty() {
@@ -163,6 +135,18 @@ pub(crate) fn prompt_visible_credential(
     }
     let value = input.interact_text().map_err(|e| e.to_string())?;
     Ok(normalize_credential_value_opt(Some(&value)))
+}
+
+/// `prompt` 后追加一段「留空保持现有值」的提示。
+fn decorate_keep_note_prompt(lang: Lang, prompt: &str, keep_note: bool) -> String {
+    if !keep_note {
+        return prompt.to_string();
+    }
+    let suffix = match lang {
+        Lang::Zh => "（留空保持现有值）",
+        Lang::En => " (leave blank to keep existing)",
+    };
+    format!("{prompt}{suffix}")
 }
 
 pub(crate) fn prompt_select_index(
@@ -182,16 +166,23 @@ pub(crate) fn prompt_select_index(
 /// 必填项为空时让用户选:重试 / 回退并禁用整个渠道。
 pub(crate) fn prompt_channel_recovery_action(
     theme: &ColorfulTheme,
+    lang: Lang,
     channel_label: &str,
     field_label: &str,
 ) -> Result<RequiredFieldEmptyAction, String> {
     let items = vec![
-        "重试当前字段".to_string(),
-        format!("返回并禁用 {channel_label} 渠道"),
+        t(lang, "recovery.option_retry").to_string(),
+        tpl(
+            t(lang, "recovery.option_disable_channel"),
+            &[("label", &channel_label)],
+        ),
     ];
     let idx = prompt_select_index(
         theme,
-        &format!("{channel_label} 的必填项“{field_label}”为空，下一步？"),
+        &tpl(
+            t(lang, "recovery.channel_required_empty_prompt"),
+            &[("label", &channel_label), ("field", &field_label)],
+        ),
         &items,
         0,
     )?;
@@ -204,15 +195,22 @@ pub(crate) fn prompt_channel_recovery_action(
 /// Provider API key 为空时让用户选:重试 / 本轮跳过。
 pub(crate) fn prompt_provider_recovery_action(
     theme: &ColorfulTheme,
+    lang: Lang,
     provider_label: &str,
 ) -> Result<ProviderEmptyAction, String> {
     let items = vec![
-        "重试当前字段".to_string(),
-        format!("跳过 {provider_label} API key 配置"),
+        t(lang, "recovery.option_retry").to_string(),
+        tpl(
+            t(lang, "recovery.option_provider_skip"),
+            &[("label", &provider_label)],
+        ),
     ];
     let idx = prompt_select_index(
         theme,
-        &format!("{provider_label} API key 为空，下一步？"),
+        &tpl(
+            t(lang, "recovery.provider_empty_prompt"),
+            &[("label", &provider_label)],
+        ),
         &items,
         0,
     )?;
@@ -227,34 +225,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_required_field_attempt_disables_channel_when_empty_and_no_current_value() {
-        let resolution = resolve_required_field_attempt(
-            Some(String::new()),
-            "",
-            RequiredFieldEmptyAction::DisableChannel,
-        );
+    fn resolve_required_secret_attempt_disables_channel_when_empty_and_no_current_value() {
+        let resolution = resolve_required_secret_attempt(Some(String::new()), "", || {
+            Ok(RequiredFieldEmptyAction::DisableChannel)
+        })
+        .unwrap();
 
         assert_eq!(resolution, RequiredFieldResolution::DisableChannel);
     }
 
     #[test]
-    fn resolve_required_field_attempt_retries_when_empty_and_no_current_value() {
-        let resolution = resolve_required_field_attempt(
-            Some(String::new()),
-            "",
-            RequiredFieldEmptyAction::Retry,
-        );
+    fn resolve_required_secret_attempt_retries_when_empty_and_no_current_value() {
+        let resolution = resolve_required_secret_attempt(Some(String::new()), "", || {
+            Ok(RequiredFieldEmptyAction::Retry)
+        })
+        .unwrap();
 
         assert_eq!(resolution, RequiredFieldResolution::Retry);
     }
 
     #[test]
-    fn resolve_required_field_attempt_keeps_existing_value_on_empty_input() {
-        let resolution = resolve_required_field_attempt(
-            Some(String::new()),
-            "existing-secret",
-            RequiredFieldEmptyAction::DisableChannel,
-        );
+    fn resolve_required_secret_attempt_keeps_existing_value_on_empty_input() {
+        let resolution =
+            resolve_required_secret_attempt(Some(String::new()), "existing-secret", || {
+                Ok(RequiredFieldEmptyAction::DisableChannel)
+            })
+            .unwrap();
 
         assert_eq!(
             resolution,
@@ -263,12 +259,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_required_field_attempt_trims_secret_values() {
-        let resolution = resolve_required_field_attempt(
-            Some("  new-secret  ".to_string()),
-            "",
-            RequiredFieldEmptyAction::DisableChannel,
-        );
+    fn resolve_required_secret_attempt_trims_secret_values() {
+        let resolution =
+            resolve_required_secret_attempt(Some("  new-secret  ".to_string()), "", || {
+                Ok(RequiredFieldEmptyAction::DisableChannel)
+            })
+            .unwrap();
 
         assert_eq!(
             resolution,

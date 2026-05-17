@@ -20,7 +20,9 @@ use hone_channels::ingress::{
 };
 use hone_channels::outbound::{ReasoningVisibility, attach_stream_activity_probe};
 use hone_channels::prompt::PromptOptions;
-use hone_channels::runtime::{sanitize_user_visible_output, user_visible_error_message};
+use hone_channels::runtime::{
+    is_runner_usage_limit_error, sanitize_user_visible_output, user_visible_error_message,
+};
 use hone_channels::think::{ThinkRenderStyle, ThinkStreamFormatter, render_think_blocks};
 use hone_core::{ActorIdentity, SessionIdentity};
 use serde_json::{Value, json};
@@ -81,12 +83,25 @@ fn build_failed_reply_text(
     error: Option<&str>,
 ) -> String {
     let partial = sanitize_failed_partial_reply(final_text);
-    let display = if saw_stream_delta && !partial.is_empty() {
+    let user_visible_error = user_visible_error_message(error);
+    let display = if should_prefer_error_over_partial(error) {
+        user_visible_error
+    } else if saw_stream_delta && !partial.is_empty() {
         format!("{}\n\n_(处理中发生错误，内容可能不完整)_", partial)
     } else {
-        user_visible_error_message(error)
+        user_visible_error
     };
     prepend_reply_prefix(reply_prefix, &display)
+}
+
+fn should_prefer_error_over_partial(error: Option<&str>) -> bool {
+    let Some(value) = error else {
+        return false;
+    };
+    if value.contains("已达到今日对话上限") {
+        return true;
+    }
+    is_runner_usage_limit_error(value)
 }
 
 fn sanitize_failed_partial_reply(text: &str) -> String {
@@ -96,25 +111,73 @@ fn sanitize_failed_partial_reply(text: &str) -> String {
         .filter(|line| !looks_like_progress_trace_line(line))
         .collect::<Vec<_>>()
         .join("\n");
-    kept.trim().to_string()
+    let trimmed = kept.trim().to_string();
+    if trimmed.is_empty() || looks_like_transitional_planning_partial(&trimmed) {
+        String::new()
+    } else {
+        trimmed
+    }
+}
+
+fn looks_like_transitional_planning_partial(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().count() >= 200
+        || trimmed.contains('？')
+        || trimmed.contains('?')
+    {
+        return false;
+    }
+    let starts_like_internal_planning = [
+        "我先",
+        "我再",
+        "我需要先",
+        "我还缺",
+        "我需要补",
+        "先看本地",
+        "先补查",
+        "先调取",
+        "先核验",
+        "先抓取",
+        "还缺一件事",
+        "我还需要先",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix));
+    starts_like_internal_planning
 }
 
 fn looks_like_progress_trace_line(line: &str) -> bool {
-    let trimmed = line.trim();
+    let trimmed = line.trim().trim_start_matches("- ").trim();
     if trimmed.is_empty() {
         return false;
     }
-    trimmed.starts_with("正在调用 Tool:")
+    trimmed == THINKING_PLACEHOLDER_TEXT
+        || trimmed.starts_with("正在调用 Tool:")
         || trimmed.starts_with("正在调用 tool:")
         || trimmed.starts_with("正在调用工具")
+        || trimmed.starts_with("正在调用 Searching the Web")
         || trimmed.starts_with("正在执行：")
+        || trimmed.starts_with("执行完成：")
+        || trimmed == "工具执行完成"
+        || trimmed == "本地命令完成"
+        || trimmed == "Searching the Web完成"
+        || trimmed == "处理中发生错误，内容可能不完整"
+        || trimmed == "_(处理中发生错误，内容可能不完整)_"
         || trimmed.starts_with("Tool: ")
+        || trimmed == "工具执行完成"
+        || trimmed == "Searching the Web"
         || trimmed.starts_with("工具调用")
         || trimmed.contains("hone/data_fetch")
         || trimmed.contains("hone/web_search")
         || trimmed.contains("hone/skill_tool")
         || trimmed.contains("tool_call")
         || trimmed.contains("runner.stage=")
+}
+
+fn stream_buffer_visible_final(text: &str) -> Option<String> {
+    let sanitized = sanitize_failed_partial_reply(text);
+    (!sanitized.is_empty()).then_some(sanitized)
 }
 
 fn persist_visible_assistant_message(
@@ -151,12 +214,11 @@ impl EventHandler for FeishuEventHandler {
                     });
                     if let Err(err) = join.await {
                         error!("[Feishu] message handler join failed: {}", err);
-                        if err.is_panic() {
-                            if let Err(fallback_err) =
+                        if err.is_panic()
+                            && let Err(fallback_err) =
                                 send_panic_fallback(&panic_state, &panic_msg).await
-                            {
-                                warn!("[Feishu] panic fallback send failed: {}", fallback_err);
-                            }
+                        {
+                            warn!("[Feishu] panic fallback send failed: {}", fallback_err);
                         }
                     }
                 });
@@ -287,15 +349,22 @@ pub(crate) async fn run() {
 
     let stream_handle = stream_client.spawn();
 
-    let (scheduler, event_rx) = core.create_scheduler(vec!["feishu".to_string()]);
-    tokio::spawn(async move {
-        scheduler.start().await;
-    });
+    if std::env::var("HONE_FEISHU_DISABLE_SCHEDULER")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+    {
+        warn!("HONE_FEISHU_DISABLE_SCHEDULER is set; Feishu cron scheduler is disabled");
+    } else {
+        let (scheduler, event_rx) = core.create_scheduler(vec!["feishu".to_string()]);
+        tokio::spawn(async move {
+            scheduler.start().await;
+        });
 
-    let scheduler_state = state.clone();
-    tokio::spawn(async move {
-        handle_scheduler_events(scheduler_state, event_rx).await;
-    });
+        let scheduler_state = state.clone();
+        tokio::spawn(async move {
+            handle_scheduler_events(scheduler_state, event_rx).await;
+        });
+    }
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
@@ -876,7 +945,8 @@ async fn process_incoming_message(state: Arc<AppState>, msg: FeishuIncomingMessa
     let saw_stream_delta = stream_probe.saw_stream_delta();
     let mut final_text = render_think_blocks(response.content.trim(), ThinkRenderStyle::Hidden);
     if final_text.is_empty() {
-        final_text = content_buf.read().unwrap().trim().to_string();
+        let buffer_text = content_buf.read().unwrap().trim().to_string();
+        final_text = stream_buffer_visible_final(&buffer_text).unwrap_or_default();
     }
 
     if !response.success {
@@ -895,8 +965,17 @@ async fn process_incoming_message(state: Arc<AppState>, msg: FeishuIncomingMessa
         if let Some(ck) = &cardkit_session {
             ck.close(&preprocess_markdown_for_feishu(&display, true))
                 .await;
+            state.core.log_message_step(
+                "feishu",
+                &log_user,
+                &session_id,
+                "reply.send",
+                "failure_fallback cardkit.close",
+                Some(&msg.message_id),
+                None,
+            );
         } else {
-            if let Err(err) = update_or_send_plain_text(
+            match update_or_send_plain_text(
                 &state.facade,
                 &outbound_receive_id,
                 outbound_receive_id_type,
@@ -905,7 +984,29 @@ async fn process_incoming_message(state: Arc<AppState>, msg: FeishuIncomingMessa
             )
             .await
             {
-                warn!("[Feishu] 发送失败兜底消息失败: {}", err);
+                Ok(sent_segments) => {
+                    state.core.log_message_step(
+                        "feishu",
+                        &log_user,
+                        &session_id,
+                        "reply.send",
+                        &format!("failure_fallback segments.sent={sent_segments}"),
+                        Some(&msg.message_id),
+                        None,
+                    );
+                }
+                Err(err) => {
+                    warn!("[Feishu] 发送失败兜底消息失败: {}", err);
+                    state.core.log_message_step(
+                        "feishu",
+                        &log_user,
+                        &session_id,
+                        "reply.send",
+                        "failure_fallback failed",
+                        Some(&msg.message_id),
+                        None,
+                    );
+                }
             }
         }
         return;
@@ -924,8 +1025,17 @@ async fn process_incoming_message(state: Arc<AppState>, msg: FeishuIncomingMessa
         );
         if let Some(ck) = &cardkit_session {
             ck.close(&fallback).await;
+            state.core.log_message_step(
+                "feishu",
+                &log_user,
+                &session_id,
+                "reply.send",
+                "empty_fallback cardkit.close",
+                Some(&msg.message_id),
+                None,
+            );
         } else {
-            if let Err(err) = update_or_send_plain_text(
+            match update_or_send_plain_text(
                 &state.facade,
                 &outbound_receive_id,
                 outbound_receive_id_type,
@@ -934,7 +1044,29 @@ async fn process_incoming_message(state: Arc<AppState>, msg: FeishuIncomingMessa
             )
             .await
             {
-                warn!("[Feishu] 发送空回复兜底消息失败: {}", err);
+                Ok(sent_segments) => {
+                    state.core.log_message_step(
+                        "feishu",
+                        &log_user,
+                        &session_id,
+                        "reply.send",
+                        &format!("empty_fallback segments.sent={sent_segments}"),
+                        Some(&msg.message_id),
+                        None,
+                    );
+                }
+                Err(err) => {
+                    warn!("[Feishu] 发送空回复兜底消息失败: {}", err);
+                    state.core.log_message_step(
+                        "feishu",
+                        &log_user,
+                        &session_id,
+                        "reply.send",
+                        "empty_fallback failed",
+                        Some(&msg.message_id),
+                        None,
+                    );
+                }
             }
         }
         return;
@@ -1055,14 +1187,12 @@ async fn parse_feishu_event(state: &Arc<AppState>, event: Event) -> Option<Feish
             if let Some(t) = content.get("text").and_then(|v| v.as_str()) {
                 text = t.to_string();
             }
-            if content
+            let content_has_mentions = content
                 .get("mentions")
                 .and_then(|v| v.as_array())
                 .map(|list| !list.is_empty())
-                .unwrap_or(false)
-            {
-                has_mention = true;
-            } else if text.contains("<at ") {
+                .unwrap_or(false);
+            if content_has_mentions || text.contains("<at ") {
                 has_mention = true;
             }
         }
@@ -1232,19 +1362,17 @@ async fn download_attachment(
             attachment.content_type = content_type.clone();
 
             let mut final_filename = fallback_name.to_string();
-            if let Some(ct) = &content_type {
-                if let Some(ext) = preferred_extension_for_content_type(ct) {
-                    if final_filename.ends_with(".bin")
-                        || final_filename.ends_with(".dat")
-                        || final_filename.ends_with(".tmp")
-                        || !final_filename.contains('.')
-                    {
-                        if let Some(dot_idx) = final_filename.rfind('.') {
-                            final_filename = format!("{}{}", &final_filename[..dot_idx], ext);
-                        } else {
-                            final_filename = format!("{}{}", final_filename, ext);
-                        }
-                    }
+            if let Some(ct) = &content_type
+                && let Some(ext) = preferred_extension_for_content_type(ct)
+                && (final_filename.ends_with(".bin")
+                    || final_filename.ends_with(".dat")
+                    || final_filename.ends_with(".tmp")
+                    || !final_filename.contains('.'))
+            {
+                if let Some(dot_idx) = final_filename.rfind('.') {
+                    final_filename = format!("{}{}", &final_filename[..dot_idx], ext);
+                } else {
+                    final_filename = format!("{}{}", final_filename, ext);
                 }
             }
             attachment.filename = final_filename.clone();
@@ -1333,23 +1461,21 @@ fn is_allowed_contact(
         return true;
     }
 
-    if let Some(email) = email {
-        if allow_emails
+    if let Some(email) = email
+        && allow_emails
             .iter()
             .any(|item| item.trim().eq_ignore_ascii_case(email))
-        {
-            return true;
-        }
+    {
+        return true;
     }
 
-    if let Some(mobile) = mobile {
-        if allow_mobiles
+    if let Some(mobile) = mobile
+        && allow_mobiles
             .iter()
             .map(|item| normalize_mobile(item))
             .any(|item| !item.is_empty() && item == mobile)
-        {
-            return true;
-        }
+    {
+        return true;
     }
 
     false
@@ -1384,6 +1510,52 @@ pub(crate) async fn resolve_receive_id(
     Ok(target.to_string())
 }
 
+pub(crate) async fn resolve_scheduler_receive_id(
+    facade: &FeishuApiClient,
+    channel_target: &str,
+    allow_emails: &[String],
+    allow_mobiles: &[String],
+) -> hone_core::HoneResult<String> {
+    let target = scheduler_resolution_target(channel_target, allow_emails, allow_mobiles);
+    resolve_receive_id(facade, target.unwrap_or(channel_target)).await
+}
+
+fn scheduler_resolution_target<'a>(
+    channel_target: &'a str,
+    allow_emails: &'a [String],
+    allow_mobiles: &'a [String],
+) -> Option<&'a str> {
+    let target = channel_target.trim();
+    if target.contains('@') || looks_like_mobile(target) {
+        return None;
+    }
+    if !looks_like_feishu_open_id(target) {
+        return None;
+    }
+    single_direct_contact_target(allow_emails, allow_mobiles)
+}
+
+fn single_direct_contact_target<'a>(
+    allow_emails: &'a [String],
+    allow_mobiles: &'a [String],
+) -> Option<&'a str> {
+    let emails: Vec<_> = allow_emails
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && *value != "*")
+        .collect();
+    let mobiles: Vec<_> = allow_mobiles
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && *value != "*")
+        .collect();
+    match (emails.as_slice(), mobiles.as_slice()) {
+        ([email], []) => Some(*email),
+        ([], [mobile]) => Some(*mobile),
+        _ => None,
+    }
+}
+
 fn looks_like_mobile(target: &str) -> bool {
     let trimmed = target.trim();
     if trimmed.is_empty() {
@@ -1397,6 +1569,10 @@ fn looks_like_mobile(target: &str) -> bool {
     }
     let normalized = normalize_mobile(target);
     !normalized.is_empty() && normalized.chars().filter(|ch| ch.is_ascii_digit()).count() >= 7
+}
+
+fn looks_like_feishu_open_id(target: &str) -> bool {
+    target.trim().starts_with("ou_")
 }
 
 pub(crate) fn scheduler_receive_id_for_target(
@@ -1538,6 +1714,60 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_resolution_target_re_resolves_stale_open_id_with_unique_contact() {
+        let emails = vec!["alice@example.com".to_string()];
+        let mobiles = vec!["+8613800138000".to_string()];
+
+        assert_eq!(
+            scheduler_resolution_target("ou_stale", &emails, &[]),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            scheduler_resolution_target("ou_stale", &[], &mobiles),
+            Some("+8613800138000")
+        );
+        assert_eq!(
+            scheduler_resolution_target("alice@example.com", &emails, &[]),
+            None
+        );
+        assert_eq!(
+            scheduler_resolution_target("+8613800138000", &[], &mobiles),
+            None
+        );
+    }
+
+    #[test]
+    fn scheduler_resolution_target_does_not_guess_ambiguous_contacts() {
+        assert_eq!(
+            scheduler_resolution_target(
+                "ou_stale",
+                &["alice@example.com".to_string()],
+                &["+8613800138000".to_string()],
+            ),
+            None
+        );
+        assert_eq!(
+            scheduler_resolution_target(
+                "ou_stale",
+                &[
+                    "alice@example.com".to_string(),
+                    "bob@example.com".to_string()
+                ],
+                &[],
+            ),
+            None
+        );
+        assert_eq!(
+            scheduler_resolution_target("ou_stale", &["*".to_string()], &[]),
+            None
+        );
+        assert_eq!(
+            scheduler_resolution_target("plain-target", &["alice@example.com".to_string()], &[]),
+            None
+        );
+    }
+
+    #[test]
     fn direct_scheduler_always_falls_through_to_api_resolution() {
         let actor = ActorIdentity::new("feishu", "ou_creator", None::<String>).expect("actor");
         // All targets return None so the caller always invokes resolve_receive_id
@@ -1580,6 +1810,45 @@ mod tests {
     }
 
     #[test]
+    fn failed_reply_text_keeps_quota_error_over_placeholder_partial() {
+        assert_eq!(
+            build_failed_reply_text(
+                None,
+                true,
+                THINKING_PLACEHOLDER_TEXT,
+                Some("已达到今日对话上限（12/12，北京时间 2026-05-01），请明天再试"),
+            ),
+            "已达到今日对话上限（12/12，北京时间 2026-05-01），请明天再试"
+        );
+    }
+
+    #[test]
+    fn failed_reply_text_keeps_wrapped_quota_error_over_placeholder_partial() {
+        assert_eq!(
+            build_failed_reply_text(
+                None,
+                true,
+                THINKING_PLACEHOLDER_TEXT,
+                Some("工具执行错误: 已达到今日对话上限（12/12，北京时间 2026-05-01），请明天再试"),
+            ),
+            "已达到今日对话上限（12/12，北京时间 2026-05-01），请明天再试"
+        );
+    }
+
+    #[test]
+    fn failed_reply_text_keeps_codex_usage_limit_over_partial_stream() {
+        assert_eq!(
+            build_failed_reply_text(
+                None,
+                true,
+                "阶段性草稿",
+                Some("codex acp error: You've reached your usage limit. Try again later."),
+            ),
+            "当前执行额度已用尽，暂时无法继续处理。请稍后再试。"
+        );
+    }
+
+    #[test]
     fn failed_reply_text_drops_tool_progress_only_partial_stream() {
         assert_eq!(
             build_failed_reply_text(
@@ -1589,6 +1858,58 @@ mod tests {
                 Some("codex acp session/prompt idle timeout (180s)"),
             ),
             "抱歉，处理超时了。请稍后再试。"
+        );
+    }
+
+    #[test]
+    fn failed_reply_text_drops_compact_tool_progress_only_partial_stream() {
+        assert_eq!(
+            build_failed_reply_text(
+                None,
+                true,
+                "执行完成：本地命令\n正在调用 Searching the Web...\n工具执行完成\n_(处理中发生错误，内容可能不完整)_",
+                Some("codex acp prompt ended before tool completion: Searching the Web"),
+            ),
+            "抱歉，这次处理失败了。请稍后再试。"
+        );
+    }
+
+    #[test]
+    fn failed_reply_text_drops_transitional_planning_partial_stream() {
+        assert_eq!(
+            build_failed_reply_text(
+                None,
+                true,
+                "我先核验持仓里还没建画像的公司，再批量补建。",
+                Some("codex acp session/prompt idle timeout (180s)"),
+            ),
+            "抱歉，处理超时了。请稍后再试。"
+        );
+    }
+
+    #[test]
+    fn failed_reply_text_drops_placeholder_only_partial_stream() {
+        assert_eq!(
+            build_failed_reply_text(
+                None,
+                true,
+                THINKING_PLACEHOLDER_TEXT,
+                Some("codex acp session/prompt idle timeout (180s)"),
+            ),
+            "抱歉，处理超时了。请稍后再试。"
+        );
+    }
+
+    #[test]
+    fn stream_buffer_visible_final_rejects_placeholder_and_progress() {
+        assert_eq!(stream_buffer_visible_final(THINKING_PLACEHOLDER_TEXT), None);
+        assert_eq!(
+            stream_buffer_visible_final("正在思考中...\n- 正在执行：本地命令"),
+            None
+        );
+        assert_eq!(
+            stream_buffer_visible_final("最终答案"),
+            Some("最终答案".to_string())
         );
     }
 

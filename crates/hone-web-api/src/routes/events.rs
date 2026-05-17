@@ -15,7 +15,7 @@ use hone_channels::prompt::PromptOptions;
 use hone_channels::scheduler;
 use hone_memory::cron_job::CronJobExecutionInput;
 use hone_memory::session_message_text;
-use hone_scheduler::SchedulerEvent;
+use hone_scheduler::{SchedulerEvent, execution_detail_with_delivery_key};
 
 use crate::routes::normalized_query_actor;
 use crate::state::{AppState, PushEvent};
@@ -57,6 +57,26 @@ pub(crate) async fn handle_events(
     )]);
 
     Sse::new(init.chain(stream)).keep_alive(KeepAlive::default())
+}
+
+fn web_scheduler_delivery_status(_console_event_sent: bool) -> (String, bool) {
+    // Web scheduled results are already persisted to the conversation by this point.
+    // The SSE event only controls whether an online console sees the update in real time.
+    ("sent".to_string(), true)
+}
+
+fn web_scheduler_delivery_detail(
+    scheduler_metadata: serde_json::Value,
+    console_event_sent: bool,
+    channel: &str,
+) -> serde_json::Value {
+    json!({
+        "scheduler": scheduler_metadata,
+        "console_event_sent": console_event_sent,
+        "system_push_supported": false,
+        "system_push_sent": false,
+        "delivery_channel": channel,
+    })
 }
 
 /// 接收调度器事件，为每个触发的任务启动独立处理协程
@@ -147,7 +167,10 @@ pub(crate) async fn handle_scheduler_events(
                             failure_trace
                                 .then(|| "内部错误已抑制，已写入用户可见失败提示".to_string())
                         }),
-                        detail: result.metadata.clone(),
+                        detail: execution_detail_with_delivery_key(
+                            result.metadata.clone(),
+                            &event.delivery_key,
+                        ),
                     },
                 );
                 return;
@@ -175,14 +198,14 @@ pub(crate) async fn handle_scheduler_events(
             });
 
             // 2. 若是 iMessage 渠道，把结果通过 hone-imessage 内置 HTTP 服务投递给用户
-            let mut message_send_status = "sent".to_string();
-            let mut delivered = true;
+            let (mut message_send_status, mut delivered) =
+                web_scheduler_delivery_status(push_result.is_ok());
             let mut error_message = result.error.clone();
-            let mut detail = json!({
-                "scheduler": result.metadata,
-                "console_event_sent": push_result.is_ok(),
-                "delivery_channel": event.channel.clone(),
-            });
+            let mut detail = web_scheduler_delivery_detail(
+                result.metadata.clone(),
+                push_result.is_ok(),
+                &event.channel,
+            );
             if event.channel == "imessage" {
                 let url = format!(
                     "http://{}/api/send",
@@ -272,7 +295,7 @@ pub(crate) async fn handle_scheduler_events(
                     delivered,
                     response_preview: Some(response),
                     error_message,
-                    detail,
+                    detail: execution_detail_with_delivery_key(detail, &event.delivery_key),
                 },
             );
         });
@@ -300,7 +323,16 @@ async fn run_scheduled_task(
         scheduler::execute_scheduler_event(state.core.clone(), event, prompt_options, run_options)
             .await;
     if !result.should_deliver {
-        info!("⏰ [{}] 心跳任务未命中，跳过发送", actor.user_id);
+        if let Some(err) = result.error.as_deref() {
+            error!(
+                "⏰ [{}] 定时任务执行失败，跳过发送: failure_kind={} err={}",
+                actor.user_id,
+                scheduler::scheduled_task_failure_kind(&result).unwrap_or("execution_failed"),
+                err.replace('\n', "\\n")
+            );
+        } else {
+            info!("⏰ [{}] 心跳任务未命中，跳过发送", actor.user_id);
+        }
     } else if let Some(err) = result.error.as_deref() {
         error!("⏰ [{}] 定时任务执行失败: {}", actor.user_id, err);
     } else {
@@ -403,5 +435,23 @@ mod tests {
     fn scheduler_failure_trace_required_ignores_clean_noop() {
         let result = scheduled_result(None, json!({ "parse_kind": "JsonNoop" }));
         assert!(!scheduler_failure_trace_required(&result));
+    }
+
+    #[test]
+    fn web_scheduler_offline_console_still_counts_as_sent() {
+        let (message_send_status, delivered) = web_scheduler_delivery_status(false);
+
+        assert_eq!(message_send_status, "sent");
+        assert!(delivered);
+    }
+
+    #[test]
+    fn web_scheduler_detail_distinguishes_session_delivery_from_system_push() {
+        let detail = web_scheduler_delivery_detail(json!({"status": "triggered"}), false, "web");
+
+        assert_eq!(detail["delivery_channel"], "web");
+        assert_eq!(detail["console_event_sent"], false);
+        assert_eq!(detail["system_push_supported"], false);
+        assert_eq!(detail["system_push_sent"], false);
     }
 }

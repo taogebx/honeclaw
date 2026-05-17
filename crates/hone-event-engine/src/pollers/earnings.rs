@@ -3,8 +3,8 @@
 //! **Read-time derivation**(v0.1.46 重构):
 //! - Poller 只产出"事实":`earnings:{SYMBOL}:{DATE}` teaser(Medium),id 稳定,
 //!   EventStore 去重保证同一场财报只入库一次,Poller 的 cron 漂移不影响推送精度
-//! - T-3/T-2/T-1 每日倒计时**不再由 Poller 产出**,改由 `DigestScheduler` 在
-//!   每次 flush 时刻根据 `now` 现算(见 `synthesize_countdowns`)——这样用户
+//! - T-3/T-2/T-1 每日倒计时**不再由 Poller 产出**,改由 `UnifiedDigestScheduler` 在
+//!   每个 slot 触发时刻根据 `now` 现算(见 `synthesize_countdowns`)——这样用户
 //!   重启时机、poller 漂移、跨时区都不会让倒计时 off-by-one
 //! - 整条 lifecycle 仍共享 `EventKind::EarningsUpcoming`,用户把它放进
 //!   `blocked_kinds` 就能一次静音 teaser + 所有倒计时
@@ -67,21 +67,21 @@ impl EventSource for EarningsPoller {
 /// EventStore 去重保证同一场财报只入库一次。倒计时由 `synthesize_countdowns`
 /// 在 digest flush 时刻按 `now` 现算,不在这里产出。
 fn events_from_calendar(raw: &Value) -> Vec<MarketEvent> {
-    let arr = match raw.as_array() {
-        Some(a) => a,
+    let earning_items = match raw.as_array() {
+        Some(items) => items,
         None => return vec![],
     };
 
-    let mut out = Vec::new();
-    for item in arr.iter() {
-        let Some(symbol) = item
+    let mut events = Vec::new();
+    for earning_item in earning_items {
+        let Some(symbol) = earning_item
             .get("symbol")
             .and_then(|v| v.as_str())
             .map(str::to_string)
         else {
             continue;
         };
-        let Some(date_str) = item
+        let Some(date_str) = earning_item
             .get("date")
             .and_then(|v| v.as_str())
             .map(str::to_string)
@@ -96,8 +96,10 @@ fn events_from_calendar(raw: &Value) -> Vec<MarketEvent> {
         };
         let occurred_at = Utc.from_utc_datetime(&dt).to_utc();
 
-        let eps_est = item.get("epsEstimated").and_then(|v| v.as_f64());
-        let rev_est = item.get("revenueEstimated").and_then(|v| v.as_f64());
+        let eps_est = earning_item.get("epsEstimated").and_then(|v| v.as_f64());
+        let rev_est = earning_item
+            .get("revenueEstimated")
+            .and_then(|v| v.as_f64());
         let summary = match (eps_est, rev_est) {
             (Some(e), Some(r)) => format!("EPS est {e:.2} · Rev est {r:.0}"),
             (Some(e), None) => format!("EPS est {e:.2}"),
@@ -105,7 +107,7 @@ fn events_from_calendar(raw: &Value) -> Vec<MarketEvent> {
             (None, None) => String::new(),
         };
 
-        out.push(MarketEvent {
+        events.push(MarketEvent {
             id: format!("earnings:{symbol}:{date_str}"),
             kind: EventKind::EarningsUpcoming,
             severity: Severity::Medium,
@@ -115,14 +117,14 @@ fn events_from_calendar(raw: &Value) -> Vec<MarketEvent> {
             summary,
             url: None,
             source: "fmp.earning_calendar".into(),
-            payload: item.clone(),
+            payload: earning_item.clone(),
         });
     }
-    out
+    events
 }
 
 /// 根据一批已入库的 earnings teaser + 当前本地日期,现算出 T-3/T-2/T-1 倒计时
-/// "虚拟事件"列表。用于 `DigestScheduler` 在 flush 时刻覆盖到每个 actor 的推送
+/// "虚拟事件"列表。用于 `UnifiedDigestScheduler` 在 slot 触发时覆盖到每个 actor 的推送
 /// payload 上;这些事件**不入库**,不会触发 dedup,天然幂等。
 ///
 /// 输入 `teasers` 应是 `EventStore::list_upcoming_earnings` 的结果(今天到未来
@@ -134,8 +136,8 @@ fn events_from_calendar(raw: &Value) -> Vec<MarketEvent> {
 /// - 同一天同一场财报只会产一条倒计时(render 侧 dedup 依赖 id)
 ///
 /// Severity 统一 Medium:T-1 不再升 High,因为 digest flush 本身就是在用户
-/// 配置的 pre_market/post_market 时刻触发——T-1 teaser 在 pre_market 那晚的
-/// 19:00 CN flush 里恰好是"明早盘前提醒",不需要再绕过 digest。
+/// 配置的 digest slot 触发——T-1 teaser 会出现在对应 slot 的摘要里,
+/// 不需要再绕过 digest。
 pub fn synthesize_countdowns(teasers: &[MarketEvent], today: NaiveDate) -> Vec<MarketEvent> {
     let mut out = Vec::new();
     for t in teasers {
@@ -209,7 +211,7 @@ mod tests {
 
     #[test]
     fn poller_never_emits_countdown_events() {
-        // v0.1.46 起 poller 只产 teaser,倒计时由 DigestScheduler 现算
+        // v0.1.46 起 poller 只产 teaser,倒计时由 UnifiedDigestScheduler 现算
         let raw = serde_json::json!([
             {"symbol": "AAPL", "date": "2026-04-30"},
             {"symbol": "MSFT", "date": "2026-05-02"},

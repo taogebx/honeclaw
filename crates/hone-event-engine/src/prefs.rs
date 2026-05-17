@@ -34,6 +34,7 @@ use hone_core::ActorIdentity;
 use serde::{Deserialize, Serialize};
 
 use crate::event::{EventKind, MarketEvent, Severity};
+use crate::unified_digest::DigestSlot;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -55,9 +56,9 @@ pub struct NotificationPrefs {
     /// 用户所在 IANA 时区,如 `"Asia/Shanghai"`、`"America/New_York"`。
     /// `None` → 沿用全局 `digest.timezone`。仅影响 digest 窗口的本地时刻解释。
     pub timezone: Option<String>,
-    /// 用户希望触发 digest 的本地时刻列表(`"HH:MM"`,按 `timezone` 解释)。
-    /// `None` → 沿用全局 `[pre_market, post_market]`。`Some(vec![])` = 完全关 digest。
-    pub digest_windows: Option<Vec<String>>,
+    /// Unified digest 的触发槽位列表。每条 slot = 一次推送。
+    /// `None` → 走全局默认 `event_engine.digest.default_slots`;`Some(vec![])` = 完全关 digest。
+    pub digest_slots: Option<Vec<DigestSlot>>,
     /// 价格异动即时推阈值(百分点,绝对值)。`None` → 沿用全局
     /// `thresholds.price_alert_high_pct`(目前 6.0)。例如 `Some(3.5)` = 任何
     /// `|pct| >= 3.5%` 的 PriceAlert 在本 actor 路由阶段升 High。
@@ -80,30 +81,27 @@ pub struct NotificationPrefs {
     /// 当 router 能从事件 payload 读到 portfolio_weight / portfolio_weight_pct 时，
     /// 高仓位标的允许使用更敏感的用户阈值直推；低仓位仍受系统最小直推阈值保护。
     pub large_position_weight_pct: Option<f64>,
-    /// 是否接收"今日全球要闻"全局 digest(LLM 精读后每天 N 次推送)。
-    /// 与 ticker 命中的 per-actor digest 完全独立。默认开启。
-    pub global_digest_enabled: bool,
     /// 全局 digest Pass 2 personalize 时使用的"投资风格"自由文本。
     /// 例如:"长期叙事派,重视行业结构性叙事,轻视短期估值/技术形态/分析师评级"。
     /// LLM 会按此风格剔除用户视角下的噪音。`None` → 走 baseline 排序,不做风格过滤。
-    pub investment_global_style: Option<String>,
-    /// 每个 ticker 的投资逻辑(thesis)。LLM 在 personalize 时按此重排:印证 thesis 的
-    /// 优先,反证保留并标注,thesis 视角下的噪音剔除。例如 `MU → "看 NAND/DRAM 长期
+    #[serde(alias = "investment_global_style")]
+    pub mainline_style: Option<String>,
+    /// 每个 ticker 的投资主线。LLM 在 personalize 时按此重排:印证主线的优先,
+    /// 证伪保留并标注,主线视角下的噪音剔除。例如 `MU → "看 NAND/DRAM 长期
     /// 稀缺性,噪音是估值过热/单日大涨大跌"`。`None` / 空 map → 不做 per-ticker 重排。
-    pub investment_theses: Option<HashMap<String, String>>,
-    /// 即使 `investment_theses` 把所有宏观料剔除,Pass 2 personalize 也至少保留多少条
-    /// macro_floor 条目(联储/地缘/油价/政策等大盘背景)。POC 验证 1 条足够 —— 用户
-    /// 需要知道叙事可能被宏观证伪。0 = 关闭 floor。
-    pub global_digest_floor_macro_picks: u32,
-    /// **系统蒸馏元数据**(2026-04-26 起):`investment_theses` / `investment_global_style`
-    /// 由后台 cron 周扫用户 sandbox `company_profiles/*/profile.md` 自动蒸馏写入,
-    /// 用户不再通过 NL tool 直接编辑。本字段是 RFC3339 时间戳记录最近一次蒸馏成功时刻,
-    /// 让前端可以展示"上次更新"和判断是否需要手动刷一次。`None` = 还没蒸过(老数据兼容)。
-    pub last_thesis_distilled_at: Option<String>,
+    #[serde(alias = "investment_theses")]
+    pub mainline_by_ticker: Option<HashMap<String, String>>,
+    /// **系统蒸馏元数据**(2026-04-26 起):`mainline_by_ticker` / `mainline_style`
+    /// 由后台 cron 按"缺失持仓主线优先、覆盖完整后每周刷新"策略读取用户 sandbox
+    /// `company_profiles/*/profile.md` 自动蒸馏写入,用户不再通过 NL tool 直接编辑。
+    /// 本字段是 RFC3339 时间戳记录最近一次蒸馏成功时刻,让前端可以展示"上次更新"
+    /// 和判断是否需要手动刷一次。`None` = 还没蒸过(老数据兼容)。
+    #[serde(alias = "last_thesis_distilled_at")]
+    pub last_mainline_distilled_at: Option<String>,
     /// 蒸馏过程中跳过的 ticker(无 profile / LLM 失败 / 画像没有 ticker 标识)。
     /// 用于前端提示"这些持仓还没有画像或最近一次蒸馏失败"。
-    #[serde(default)]
-    pub thesis_distill_skipped: Vec<String>,
+    #[serde(default, alias = "thesis_distill_skipped")]
+    pub mainline_distill_skipped: Vec<String>,
     /// 勿扰时段 —— 用户希望"晚 X 点后别推、早 Y 点合并发我"。`None` = 不启用。
     /// 区间内：所有 immediate sink 推送被 hold 写 `delivery_log.status='quiet_held'`，
     /// digest fire 也跳过；`to` 时刻触发 `quiet_flush` 把 hold 住的事件 + buffer 里
@@ -113,8 +111,8 @@ pub struct NotificationPrefs {
 }
 
 /// 勿扰时段配置。本地时刻按 `NotificationPrefs.timezone` 解释（缺省走全局 digest tz）。
-/// 实际定义在 `hone_core::quiet::QuietHours`，这里 re-export 让 hone-channels 等
-/// 不依赖 event-engine 的 crate 也能使用。
+/// 实际定义在 `hone_core::quiet::QuietHours`；这里 re-export 是为了保留
+/// `hone_event_engine::prefs::QuietHours` 的既有导入路径。
 pub use hone_core::quiet::QuietHours;
 
 impl Default for NotificationPrefs {
@@ -127,7 +125,7 @@ impl Default for NotificationPrefs {
             blocked_kinds: Vec::new(),
             news_importance_prompt: None,
             timezone: None,
-            digest_windows: None,
+            digest_slots: None,
             price_high_pct_override: None,
             immediate_kinds: None,
             quiet_mode: false,
@@ -136,19 +134,13 @@ impl Default for NotificationPrefs {
             price_high_pct_up_override: None,
             price_high_pct_down_override: None,
             large_position_weight_pct: None,
-            global_digest_enabled: true,
-            investment_global_style: None,
-            investment_theses: None,
-            global_digest_floor_macro_picks: default_floor_macro_picks(),
-            last_thesis_distilled_at: None,
-            thesis_distill_skipped: Vec::new(),
+            mainline_style: None,
+            mainline_by_ticker: None,
+            last_mainline_distilled_at: None,
+            mainline_distill_skipped: Vec::new(),
             quiet_hours: None,
         }
     }
-}
-
-fn default_floor_macro_picks() -> u32 {
-    1
 }
 
 impl NotificationPrefs {
@@ -166,21 +158,27 @@ impl NotificationPrefs {
         if self.source_blocked(&event.source) {
             return false;
         }
-        if let Some(allow) = &self.allow_sources {
-            if !allow.iter().any(|pat| source_matches(&event.source, pat)) {
-                return false;
-            }
+        if let Some(allow) = &self.allow_sources
+            && !allow.iter().any(|pat| source_matches(&event.source, pat))
+        {
+            return false;
         }
         let tag = kind_tag(&event.kind);
         if self.blocked_kinds.iter().any(|k| k == tag) {
             return false;
         }
-        if let Some(allow) = &self.allow_kinds {
-            if !allow.iter().any(|k| k == tag) {
-                return false;
-            }
+        if let Some(allow) = &self.allow_kinds
+            && !allow.iter().any(|k| k == tag)
+        {
+            return false;
         }
         true
+    }
+
+    /// 取最终 slot 列表:`Some(slots)` 用 actor 自定义,`None` → 走全局默认。
+    /// `Some(vec![])` = 用户关掉 digest。
+    pub fn effective_digest_slots(&self) -> Option<Vec<DigestSlot>> {
+        self.digest_slots.clone()
     }
 
     pub fn source_blocked(&self, source: &str) -> bool {
@@ -205,19 +203,14 @@ pub fn kind_tag(kind: &EventKind) -> &'static str {
         EventKind::EarningsReleased => "earnings_released",
         EventKind::EarningsCallTranscript => "earnings_call_transcript",
         EventKind::NewsCritical => "news_critical",
-        EventKind::PressRelease => "press_release",
         EventKind::PriceAlert { .. } => "price_alert",
         EventKind::Weekly52High => "weekly52_high",
         EventKind::Weekly52Low => "weekly52_low",
-        EventKind::VolumeSpike => "volume_spike",
         EventKind::Dividend => "dividend",
         EventKind::Split => "split",
-        EventKind::Buyback => "buyback",
         EventKind::SecFiling { .. } => "sec_filing",
         EventKind::AnalystGrade => "analyst_grade",
         EventKind::MacroEvent => "macro_event",
-        EventKind::PortfolioPreMarket => "portfolio_pre_market",
-        EventKind::PortfolioPostMarket => "portfolio_post_market",
         EventKind::SocialPost => "social_post",
     }
 }
@@ -229,19 +222,14 @@ pub const ALL_KIND_TAGS: &[&str] = &[
     "earnings_released",
     "earnings_call_transcript",
     "news_critical",
-    "press_release",
     "price_alert",
     "weekly52_high",
     "weekly52_low",
-    "volume_spike",
     "dividend",
     "split",
-    "buyback",
     "sec_filing",
     "analyst_grade",
     "macro_event",
-    "portfolio_pre_market",
-    "portfolio_post_market",
     "social_post",
 ];
 
@@ -400,18 +388,18 @@ mod tests {
 
     #[test]
     fn default_prefs_allow_everything() {
-        let p = NotificationPrefs::default();
-        assert!(p.should_deliver(&ev(EventKind::NewsCritical, Severity::Low, vec!["AAPL"])));
-        assert!(p.should_deliver(&ev(EventKind::MacroEvent, Severity::Low, vec![])));
+        let prefs = NotificationPrefs::default();
+        assert!(prefs.should_deliver(&ev(EventKind::NewsCritical, Severity::Low, vec!["AAPL"])));
+        assert!(prefs.should_deliver(&ev(EventKind::MacroEvent, Severity::Low, vec![])));
     }
 
     #[test]
     fn disabled_blocks_all() {
-        let p = NotificationPrefs {
+        let prefs = NotificationPrefs {
             enabled: false,
             ..Default::default()
         };
-        assert!(!p.should_deliver(&ev(
+        assert!(!prefs.should_deliver(&ev(
             EventKind::EarningsReleased,
             Severity::High,
             vec!["AAPL"]
@@ -420,64 +408,68 @@ mod tests {
 
     #[test]
     fn portfolio_only_drops_symbol_less_events() {
-        let p = NotificationPrefs {
+        let prefs = NotificationPrefs {
             portfolio_only: true,
             ..Default::default()
         };
-        assert!(p.should_deliver(&ev(EventKind::NewsCritical, Severity::Low, vec!["AAPL"])));
-        assert!(!p.should_deliver(&ev(EventKind::MacroEvent, Severity::Low, vec![])));
+        assert!(prefs.should_deliver(&ev(EventKind::NewsCritical, Severity::Low, vec!["AAPL"])));
+        assert!(!prefs.should_deliver(&ev(EventKind::MacroEvent, Severity::Low, vec![])));
     }
 
     #[test]
     fn min_severity_filters_lower_tiers() {
-        let p = NotificationPrefs {
+        let prefs = NotificationPrefs {
             min_severity: Severity::High,
             ..Default::default()
         };
-        assert!(!p.should_deliver(&ev(EventKind::NewsCritical, Severity::Low, vec!["AAPL"])));
-        assert!(!p.should_deliver(&ev(EventKind::NewsCritical, Severity::Medium, vec!["AAPL"])));
-        assert!(p.should_deliver(&ev(EventKind::NewsCritical, Severity::High, vec!["AAPL"])));
+        assert!(!prefs.should_deliver(&ev(EventKind::NewsCritical, Severity::Low, vec!["AAPL"])));
+        assert!(!prefs.should_deliver(&ev(
+            EventKind::NewsCritical,
+            Severity::Medium,
+            vec!["AAPL"]
+        )));
+        assert!(prefs.should_deliver(&ev(EventKind::NewsCritical, Severity::High, vec!["AAPL"])));
     }
 
     #[test]
     fn allow_list_is_whitelist() {
-        let p = NotificationPrefs {
+        let prefs = NotificationPrefs {
             allow_kinds: Some(vec!["earnings_released".into()]),
             ..Default::default()
         };
-        assert!(p.should_deliver(&ev(
+        assert!(prefs.should_deliver(&ev(
             EventKind::EarningsReleased,
             Severity::High,
             vec!["AAPL"]
         )));
-        assert!(!p.should_deliver(&ev(EventKind::NewsCritical, Severity::High, vec!["AAPL"])));
+        assert!(!prefs.should_deliver(&ev(EventKind::NewsCritical, Severity::High, vec!["AAPL"])));
     }
 
     #[test]
     fn block_list_overrides_allow_list() {
-        let p = NotificationPrefs {
+        let prefs = NotificationPrefs {
             allow_kinds: Some(vec!["earnings_released".into(), "news_critical".into()]),
             blocked_kinds: vec!["news_critical".into()],
             ..Default::default()
         };
-        assert!(p.should_deliver(&ev(
+        assert!(prefs.should_deliver(&ev(
             EventKind::EarningsReleased,
             Severity::High,
             vec!["AAPL"]
         )));
-        assert!(!p.should_deliver(&ev(EventKind::NewsCritical, Severity::High, vec!["AAPL"])));
+        assert!(!prefs.should_deliver(&ev(EventKind::NewsCritical, Severity::High, vec!["AAPL"])));
     }
 
     #[test]
     fn file_storage_roundtrip() {
         let dir = tempdir().unwrap();
         let store = FilePrefsStorage::new(dir.path()).unwrap();
-        let a = actor();
+        let actor_id = actor();
         // 缺失文件 → 默认
-        let loaded = store.load(&a);
+        let loaded = store.load(&actor_id);
         assert!(loaded.enabled);
         // 写入 → 读回
-        let p = NotificationPrefs {
+        let prefs = NotificationPrefs {
             enabled: false,
             portfolio_only: true,
             min_severity: Severity::High,
@@ -485,7 +477,7 @@ mod tests {
             blocked_kinds: vec!["news_critical".into()],
             news_importance_prompt: None,
             timezone: Some("America/New_York".into()),
-            digest_windows: Some(vec!["07:00".into(), "18:00".into()]),
+            digest_slots: Some(vec![DigestSlot::from_legacy_window("07:00")]),
             price_high_pct_override: Some(3.5),
             immediate_kinds: Some(vec!["weekly52_high".into(), "analyst_grade".into()]),
             quiet_mode: true,
@@ -494,32 +486,33 @@ mod tests {
             price_high_pct_up_override: Some(6.0),
             price_high_pct_down_override: Some(5.0),
             large_position_weight_pct: Some(20.0),
-            global_digest_enabled: false,
-            investment_global_style: Some("长期叙事派".into()),
-            investment_theses: Some({
-                let mut m = HashMap::new();
-                m.insert("AAPL".into(), "看现金流 + 回购".into());
-                m
+            mainline_style: Some("长期叙事派".into()),
+            mainline_by_ticker: Some({
+                let mut mainlines_by_ticker = HashMap::new();
+                mainlines_by_ticker.insert("AAPL".into(), "看现金流 + 回购".into());
+                mainlines_by_ticker
             }),
-            global_digest_floor_macro_picks: 2,
-            last_thesis_distilled_at: Some("2026-04-26T09:00:00Z".into()),
-            thesis_distill_skipped: vec!["XYZ".into()],
+            last_mainline_distilled_at: Some("2026-04-26T09:00:00Z".into()),
+            mainline_distill_skipped: vec!["XYZ".into()],
             quiet_hours: Some(QuietHours {
                 from: "23:00".into(),
                 to: "07:00".into(),
                 exempt_kinds: vec!["earnings_released".into()],
             }),
         };
-        store.save(&a, &p).unwrap();
-        let loaded = store.load(&a);
+        store.save(&actor_id, &prefs).unwrap();
+        let loaded = store.load(&actor_id);
         assert!(!loaded.enabled);
         assert!(loaded.portfolio_only);
         assert_eq!(loaded.min_severity, Severity::High);
         assert_eq!(loaded.allow_kinds.as_deref(), Some(&["split".into()][..]));
         assert_eq!(loaded.timezone.as_deref(), Some("America/New_York"));
         assert_eq!(
-            loaded.digest_windows.as_deref(),
-            Some(&["07:00".to_string(), "18:00".to_string()][..])
+            loaded
+                .digest_slots
+                .as_deref()
+                .map(|s| s.iter().map(|x| x.time.clone()).collect::<Vec<_>>()),
+            Some(vec!["07:00".to_string()])
         );
         assert_eq!(loaded.price_high_pct_override, Some(3.5));
         assert_eq!(
@@ -535,43 +528,66 @@ mod tests {
         assert_eq!(loaded.price_high_pct_up_override, Some(6.0));
         assert_eq!(loaded.price_high_pct_down_override, Some(5.0));
         assert_eq!(loaded.large_position_weight_pct, Some(20.0));
-        assert!(!loaded.global_digest_enabled);
-        assert_eq!(
-            loaded.investment_global_style.as_deref(),
-            Some("长期叙事派")
-        );
+        assert_eq!(loaded.mainline_style.as_deref(), Some("长期叙事派"));
         assert_eq!(
             loaded
-                .investment_theses
+                .mainline_by_ticker
                 .as_ref()
                 .and_then(|m| m.get("AAPL"))
                 .map(String::as_str),
             Some("看现金流 + 回购")
         );
-        assert_eq!(loaded.global_digest_floor_macro_picks, 2);
         assert_eq!(
-            loaded.last_thesis_distilled_at.as_deref(),
+            loaded.last_mainline_distilled_at.as_deref(),
             Some("2026-04-26T09:00:00Z")
         );
-        assert_eq!(loaded.thesis_distill_skipped, vec!["XYZ".to_string()]);
+        assert_eq!(loaded.mainline_distill_skipped, vec!["XYZ".to_string()]);
     }
 
     #[test]
     fn new_per_actor_fields_default_to_none() {
-        let p = NotificationPrefs::default();
-        assert!(p.timezone.is_none());
-        assert!(p.digest_windows.is_none());
-        assert!(p.price_high_pct_override.is_none());
-        assert!(p.immediate_kinds.is_none());
-        assert!(!p.quiet_mode);
-        assert!(p.allow_sources.is_none());
-        assert!(p.blocked_sources.is_empty());
-        assert!(p.price_high_pct_up_override.is_none());
-        assert!(p.price_high_pct_down_override.is_none());
-        assert!(p.large_position_weight_pct.is_none());
-        assert!(p.investment_global_style.is_none());
-        assert!(p.investment_theses.is_none());
-        assert_eq!(p.global_digest_floor_macro_picks, 1);
+        let prefs = NotificationPrefs::default();
+        assert!(prefs.timezone.is_none());
+        assert!(prefs.digest_slots.is_none());
+        assert!(prefs.price_high_pct_override.is_none());
+        assert!(prefs.immediate_kinds.is_none());
+        assert!(!prefs.quiet_mode);
+        assert!(prefs.allow_sources.is_none());
+        assert!(prefs.blocked_sources.is_empty());
+        assert!(prefs.price_high_pct_up_override.is_none());
+        assert!(prefs.price_high_pct_down_override.is_none());
+        assert!(prefs.large_position_weight_pct.is_none());
+        assert!(prefs.mainline_style.is_none());
+        assert!(prefs.mainline_by_ticker.is_none());
+    }
+
+    #[test]
+    fn legacy_thesis_field_names_load_via_serde_alias() {
+        // 老 prefs JSON 用 thesis 字段名,新 schema 必须经 #[serde(alias)] 兼容,
+        // 否则线上已部署的 prefs 文件升级后读不出投资主线。
+        let json = r#"{
+            "enabled": true,
+            "investment_global_style": "长期叙事派",
+            "investment_theses": {"AAPL": "看现金流 + 回购"},
+            "last_thesis_distilled_at": "2026-04-26T09:00:00Z",
+            "thesis_distill_skipped": ["XYZ"]
+        }"#;
+        let prefs: NotificationPrefs =
+            serde_json::from_str(json).expect("legacy prefs JSON should load");
+        assert_eq!(prefs.mainline_style.as_deref(), Some("长期叙事派"));
+        assert_eq!(
+            prefs
+                .mainline_by_ticker
+                .as_ref()
+                .and_then(|m| m.get("AAPL"))
+                .map(String::as_str),
+            Some("看现金流 + 回购")
+        );
+        assert_eq!(
+            prefs.last_mainline_distilled_at.as_deref(),
+            Some("2026-04-26T09:00:00Z")
+        );
+        assert_eq!(prefs.mainline_distill_skipped, vec!["XYZ".to_string()]);
     }
 
     #[test]
@@ -579,43 +595,43 @@ mod tests {
         // 老 prefs 文件没有这 4 个字段;serde(default) 应让加载继续走默认。
         let dir = tempdir().unwrap();
         let store = FilePrefsStorage::new(dir.path()).unwrap();
-        let a = actor();
+        let actor_id = actor();
         std::fs::write(
-            store.path_for(&a),
+            store.path_for(&actor_id),
             r#"{"enabled":true,"portfolio_only":false,"min_severity":"low","blocked_kinds":[]}"#,
         )
         .unwrap();
-        let p = store.load(&a);
-        assert!(p.timezone.is_none());
-        assert!(p.digest_windows.is_none());
-        assert!(p.price_high_pct_override.is_none());
-        assert!(p.immediate_kinds.is_none());
-        assert!(!p.quiet_mode);
-        assert!(p.allow_sources.is_none());
-        assert!(p.blocked_sources.is_empty());
-        assert!(p.price_high_pct_up_override.is_none());
-        assert!(p.price_high_pct_down_override.is_none());
-        assert!(p.large_position_weight_pct.is_none());
+        let loaded = store.load(&actor_id);
+        assert!(loaded.timezone.is_none());
+        assert!(loaded.digest_slots.is_none());
+        assert!(loaded.price_high_pct_override.is_none());
+        assert!(loaded.immediate_kinds.is_none());
+        assert!(!loaded.quiet_mode);
+        assert!(loaded.allow_sources.is_none());
+        assert!(loaded.blocked_sources.is_empty());
+        assert!(loaded.price_high_pct_up_override.is_none());
+        assert!(loaded.price_high_pct_down_override.is_none());
+        assert!(loaded.large_position_weight_pct.is_none());
     }
 
     #[test]
     fn source_allow_and_block_lists_filter_events() {
         let mut event = ev(EventKind::NewsCritical, Severity::High, vec!["AAPL"]);
         event.source = "fmp.stock_news:reuters.com".into();
-        let p = NotificationPrefs {
+        let prefs = NotificationPrefs {
             allow_sources: Some(vec!["reuters.com".into()]),
             ..Default::default()
         };
-        assert!(p.should_deliver(&event));
+        assert!(prefs.should_deliver(&event));
 
         event.source = "telegram.channel:watcherguru".into();
-        assert!(!p.should_deliver(&event));
+        assert!(!prefs.should_deliver(&event));
 
-        let p = NotificationPrefs {
+        let prefs = NotificationPrefs {
             blocked_sources: vec!["watcherguru".into()],
             ..Default::default()
         };
-        assert!(!p.should_deliver(&event));
+        assert!(!prefs.should_deliver(&event));
     }
 
     #[test]
@@ -623,12 +639,12 @@ mod tests {
         // 用户只写了 enabled=false，其他字段缺失；serde(default) 保证兼容。
         let dir = tempdir().unwrap();
         let store = FilePrefsStorage::new(dir.path()).unwrap();
-        let a = actor();
-        std::fs::write(store.path_for(&a), r#"{"enabled": false}"#).unwrap();
-        let p = store.load(&a);
-        assert!(!p.enabled);
-        assert_eq!(p.min_severity, Severity::Low);
-        assert!(!p.portfolio_only);
+        let actor_id = actor();
+        std::fs::write(store.path_for(&actor_id), r#"{"enabled": false}"#).unwrap();
+        let loaded = store.load(&actor_id);
+        assert!(!loaded.enabled);
+        assert_eq!(loaded.min_severity, Severity::Low);
+        assert!(!loaded.portfolio_only);
     }
 
     #[test]
@@ -640,24 +656,19 @@ mod tests {
             EarningsReleased,
             EarningsCallTranscript,
             NewsCritical,
-            PressRelease,
             PriceAlert {
                 pct_change_bps: 100,
                 window: "5m".into(),
             },
             Weekly52High,
             Weekly52Low,
-            VolumeSpike,
             Dividend,
             Split,
-            Buyback,
             SecFiling {
                 form: String::new(),
             },
             AnalystGrade,
             MacroEvent,
-            PortfolioPreMarket,
-            PortfolioPostMarket,
             SocialPost,
         ];
         for k in &sample {
@@ -679,12 +690,57 @@ mod tests {
     }
 
     #[test]
+    fn effective_digest_slots_returns_user_slots_when_set() {
+        let prefs = NotificationPrefs {
+            digest_slots: Some(vec![DigestSlot {
+                id: "premarket".into(),
+                time: "08:30".into(),
+                label: Some("盘前".into()),
+                floor_macro: Some(2),
+            }]),
+            ..Default::default()
+        };
+        let slots = prefs.effective_digest_slots().unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].id, "premarket");
+        assert_eq!(slots[0].time, "08:30");
+    }
+
+    #[test]
+    fn effective_digest_slots_returns_none_when_unset() {
+        let prefs = NotificationPrefs::default();
+        assert!(prefs.effective_digest_slots().is_none());
+    }
+
+    #[test]
+    fn effective_digest_slots_preserves_empty_disable_semantics() {
+        let prefs = NotificationPrefs {
+            digest_slots: Some(vec![]),
+            ..Default::default()
+        };
+        // Some([]) 必须保留 —— 用户主动关 digest 的语义。
+        assert_eq!(prefs.effective_digest_slots(), Some(vec![]));
+    }
+
+    #[test]
+    fn legacy_digest_windows_field_is_silently_ignored() {
+        // 删字段后老 JSON 里残留的 digest_windows 应被 serde 默默忽略,不报错。
+        let json = r#"{"enabled":true,"digest_windows":["07:00","19:00"]}"#;
+        let loaded: NotificationPrefs = serde_json::from_str(json).expect("deserialize");
+        assert!(loaded.digest_slots.is_none());
+        assert!(loaded.enabled);
+    }
+
+    #[test]
     fn malformed_json_falls_back_without_panic() {
         let dir = tempdir().unwrap();
         let store = FilePrefsStorage::new(dir.path()).unwrap();
-        let a = actor();
-        std::fs::write(store.path_for(&a), "not json").unwrap();
-        let p = store.load(&a);
-        assert!(p.enabled, "解析失败时应回到默认（放行），不影响推送链路");
+        let actor_id = actor();
+        std::fs::write(store.path_for(&actor_id), "not json").unwrap();
+        let loaded = store.load(&actor_id);
+        assert!(
+            loaded.enabled,
+            "解析失败时应回到默认（放行），不影响推送链路"
+        );
     }
 }

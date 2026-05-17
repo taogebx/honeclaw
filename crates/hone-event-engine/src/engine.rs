@@ -14,14 +14,16 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::daily_report::DailyReport;
-use crate::digest::{self, DigestBuffer, DigestScheduler};
+use crate::digest::{self, DigestBuffer};
 use crate::fmp::FmpClient;
 use crate::news_classifier;
 use crate::pipeline;
 use crate::polisher::{BodyPolisher, NoopPolisher};
+use crate::pollers::earnings_quality::LlmEarningsQualityReviewer;
 use crate::pollers::{
     AnalystGradePoller, CorpActionCalendarPoller, EarningsPoller, EarningsSurprisePoller,
-    MacroPoller, NewsPoller, PricePoller, RssNewsPoller, SecFilingsPoller, TelegramChannelPoller,
+    ExtendedHoursPoller, MacroPoller, NewsPoller, PricePoller, RssNewsPoller, SecFilingsPoller,
+    TelegramChannelPoller,
 };
 use crate::prefs::{FilePrefsStorage, PrefsProvider};
 use crate::router::{LogSink, NotificationRouter, OutboundSink};
@@ -29,6 +31,7 @@ use crate::source::SourceSchedule;
 use crate::spawner::spawn_event_source;
 use crate::store::EventStore;
 use crate::subscription::SharedRegistry;
+use crate::unified_digest::{DigestSlot, UnifiedDigestScheduler};
 use hone_core::config::{EventEngineConfig, FmpConfig};
 
 /// 事件引擎句柄。`start()` 只 `spawn` 各 poller 任务并立即返回——
@@ -53,6 +56,15 @@ pub struct EventEngine {
     /// 缺省 None → global_digest 调度器不会启动,即使 config.global_digest.enabled=true
     /// 也只 warn 不报错。
     global_digest_provider: Option<Arc<dyn hone_llm::LlmProvider>>,
+    global_digest_pass1_provider: Option<Arc<dyn hone_llm::LlmProvider>>,
+    global_digest_pass2_provider: Option<Arc<dyn hone_llm::LlmProvider>>,
+    global_digest_event_dedupe_provider: Option<Arc<dyn hone_llm::LlmProvider>>,
+    /// SEC filing enrichment 的独立 LLM provider。允许调用方用更小的
+    /// completion budget 装配该短摘要路径,避免复用 global_digest 的长输出预算。
+    sec_filings_enrichment_provider: Option<Arc<dyn hone_llm::LlmProvider>>,
+    /// EarningsReleased 综合质量 review 的独立 LLM provider。该路径输出 JSON
+    /// judgement,completion budget 介于短摘要和 global_digest 之间。
+    earnings_quality_review_provider: Option<Arc<dyn hone_llm::LlmProvider>>,
     retention_days: i64,
 }
 
@@ -72,6 +84,11 @@ impl EventEngine {
             polisher: Arc::new(NoopPolisher),
             news_classifier: None,
             global_digest_provider: None,
+            global_digest_pass1_provider: None,
+            global_digest_pass2_provider: None,
+            global_digest_event_dedupe_provider: None,
+            sec_filings_enrichment_provider: None,
+            earnings_quality_review_provider: None,
             retention_days: 30,
         }
     }
@@ -152,6 +169,42 @@ impl EventEngine {
         self
     }
 
+    pub fn with_global_digest_providers(
+        mut self,
+        pass1: Arc<dyn hone_llm::LlmProvider>,
+        pass2: Arc<dyn hone_llm::LlmProvider>,
+        event_dedupe: Arc<dyn hone_llm::LlmProvider>,
+    ) -> Self {
+        self.global_digest_pass1_provider = Some(pass1);
+        self.global_digest_pass2_provider = Some(pass2);
+        self.global_digest_event_dedupe_provider = Some(event_dedupe);
+        self
+    }
+
+    /// 注入 SEC filing enrichment 专用 LLM provider。
+    ///
+    /// 该路径只生成短摘要,调用方应按 `sec_filings.enrichment.max_summary_tokens`
+    /// 构建 provider,不要复用全局长输出预算。
+    pub fn with_sec_filings_enrichment_provider(
+        mut self,
+        provider: Arc<dyn hone_llm::LlmProvider>,
+    ) -> Self {
+        self.sec_filings_enrichment_provider = Some(provider);
+        self
+    }
+
+    /// 注入 EarningsReleased 综合质量 review 专用 LLM provider。
+    ///
+    /// 该路径只在 earnings surprise 事件有近期 8-K 上下文时 best-effort 调用。
+    /// provider 不可用或 review 解析失败时,跳过 EPS-only candidate。
+    pub fn with_earnings_quality_review_provider(
+        mut self,
+        provider: Arc<dyn hone_llm::LlmProvider>,
+    ) -> Self {
+        self.earnings_quality_review_provider = Some(provider);
+        self
+    }
+
     /// 启动事件引擎。非阻塞：内部 spawn 后立即返回 Ok。
     pub async fn start(&self) -> anyhow::Result<()> {
         if !self.engine_cfg.enabled {
@@ -218,14 +271,16 @@ impl EventEngine {
                     match store_cleanup.purge_events_older_than(days) {
                         Ok(n) if n > 0 => info!(removed = n, days, "events retention sweep"),
                         Ok(_) => {}
-                        Err(e) => warn!("events purge failed: {e:#}"),
+                        Err(e) => warn!(retention_days = days, "events purge failed: {e:#}"),
                     }
                     match store_cleanup.purge_delivery_log_older_than(days) {
                         Ok(n) if n > 0 => {
                             info!(removed = n, days, "delivery_log retention sweep")
                         }
                         Ok(_) => {}
-                        Err(e) => warn!("delivery_log purge failed: {e:#}"),
+                        Err(e) => {
+                            warn!(retention_days = days, "delivery_log purge failed: {e:#}")
+                        }
                     }
                 }
             });
@@ -248,25 +303,32 @@ impl EventEngine {
                 let mut last_size = registry_bg.load().len();
                 loop {
                     ticker.tick().await;
-                    if let Some(new_size) = registry_bg.refresh() {
-                        if new_size != last_size {
-                            info!(
-                                subscribers = new_size,
-                                previous = last_size,
-                                "subscription registry refreshed"
-                            );
-                            last_size = new_size;
-                        }
+                    if let Some(new_size) = registry_bg.refresh()
+                        && new_size != last_size
+                    {
+                        info!(
+                            subscribers = new_size,
+                            previous = last_size,
+                            "subscription registry refreshed"
+                        );
+                        last_size = new_size;
                     }
                 }
             });
         }
 
         let digest_buffer = Arc::new(DigestBuffer::new(&self.digest_dir)?);
+        let default_slot_summary = self
+            .engine_cfg
+            .digest
+            .default_slots
+            .iter()
+            .map(|s| s.time.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         info!(
             digest = %self.digest_dir.display(),
-            pre_market = %self.engine_cfg.digest.pre_market,
-            post_market = %self.engine_cfg.digest.post_market,
+            default_slots = %default_slot_summary,
             "digest buffer ready"
         );
 
@@ -291,12 +353,7 @@ impl EventEngine {
         .with_high_daily_cap(self.engine_cfg.thresholds.high_severity_daily_cap)
         .with_same_symbol_cooldown_minutes(self.engine_cfg.thresholds.same_symbol_cooldown_minutes)
         .with_price_min_direct_pct(self.engine_cfg.thresholds.price_min_direct_pct)
-        .with_price_intraday_min_gap_minutes(
-            self.engine_cfg.thresholds.price_intraday_min_gap_minutes,
-        )
-        .with_price_symbol_direction_daily_cap(
-            self.engine_cfg.thresholds.price_symbol_direction_daily_cap,
-        )
+        .with_price_band_min_advance_pct(self.engine_cfg.thresholds.price_band_min_advance_pct)
         .with_price_close_direct_enabled(self.engine_cfg.thresholds.price_close_direct_enabled)
         .with_large_position_weight_pct(self.engine_cfg.thresholds.large_position_weight_pct)
         .with_macro_immediate_window(
@@ -321,38 +378,109 @@ impl EventEngine {
             );
         }
 
-        // DigestScheduler：每 60s 检查一次本地时间，命中 pre/post-market 触发 flush。
-        // 分钟级分辨率已由 in_window 保障；`already_fired_today` 防止同分钟重触发。
+        // UnifiedDigestScheduler：取代旧 DigestScheduler + GlobalDigestScheduler 双 spawn,
+        // 每 60s tick 一次,以 actor × digest_slots 触发,每个 slot 跨 actor 共享一份
+        // `audience+pass1+fetch+baseline`,personalize fan-out 走 per-actor。
         let tz_offset = hone_core::config::tz_offset_hours(&self.engine_cfg.digest.timezone);
         info!(
             timezone = %self.engine_cfg.digest.timezone,
             offset_hours = tz_offset,
-            "digest scheduler timezone resolved"
+            "unified digest scheduler timezone resolved"
         );
-        let scheduler = Arc::new(
-            DigestScheduler::new(
-                digest_buffer.clone(),
-                self.sink.clone(),
-                self.engine_cfg.digest.pre_market.clone(),
-                self.engine_cfg.digest.post_market.clone(),
-            )
-            .with_tz_offset_hours(tz_offset)
-            .with_store(store.clone())
-            .with_registry(registry.clone())
-            .with_prefs(prefs_storage.clone())
-            .with_max_items_per_batch(self.engine_cfg.digest.max_items_per_batch as usize)
-            .with_min_gap_minutes(self.engine_cfg.digest.min_gap_minutes),
-        );
+        let portfolio_storage = Arc::new(hone_memory::PortfolioStorage::new(&self.portfolio_dir));
+        let fmp_arc = Arc::new(client.clone());
+        let audience_cache_dir = self
+            .store_path
+            .parent()
+            .map(|p| p.join("company_profiles"))
+            .unwrap_or_else(|| PathBuf::from("./data/company_profiles"));
+        let fetcher = Arc::new(crate::global_digest::ArticleFetcher::with_jina_api_key(
+            self.engine_cfg.global_digest.jina_api_key.clone(),
+        ));
+        let mut unified = UnifiedDigestScheduler::new(
+            digest_buffer.clone(),
+            self.sink.clone(),
+            store.clone(),
+            fmp_arc.clone(),
+            portfolio_storage.clone(),
+            prefs_storage.clone(),
+            registry.clone(),
+            fetcher.clone(),
+            audience_cache_dir.clone(),
+            self.daily_report_dir.clone(),
+            self.engine_cfg
+                .digest
+                .default_slots
+                .iter()
+                .enumerate()
+                .map(|(idx, s)| DigestSlot {
+                    id: format!("default_{idx}"),
+                    time: s.time.clone(),
+                    label: s.label.clone(),
+                    floor_macro: None,
+                })
+                .collect(),
+        )
+        .with_tz_offset_hours(tz_offset)
+        .with_max_items_per_batch(self.engine_cfg.digest.max_items_per_batch as usize)
+        .with_min_gap_minutes(self.engine_cfg.digest.min_gap_minutes)
+        .with_lookback_hours(self.engine_cfg.global_digest.lookback_hours)
+        .with_pass2_top_n(self.engine_cfg.global_digest.pass2_top_n)
+        .with_final_pick_n(self.engine_cfg.global_digest.final_pick_n)
+        .with_fetch_full_text(self.engine_cfg.global_digest.fetch_full_text)
+        .with_event_dedupe_enabled(self.engine_cfg.global_digest.event_dedupe_enabled);
+        if self.engine_cfg.global_digest.enabled {
+            let pass1_provider = self
+                .global_digest_pass1_provider
+                .clone()
+                .or_else(|| self.global_digest_provider.clone());
+            let pass2_provider = self
+                .global_digest_pass2_provider
+                .clone()
+                .or_else(|| self.global_digest_provider.clone());
+            if let (Some(pass1_provider), Some(pass2_provider)) = (pass1_provider, pass2_provider) {
+                let curator = Arc::new(crate::global_digest::Curator::new_with_providers(
+                    pass1_provider,
+                    self.engine_cfg.global_digest.pass1_model.clone(),
+                    pass2_provider.clone(),
+                    self.engine_cfg.global_digest.pass2_model.clone(),
+                ));
+                unified = unified.with_curator(curator);
+                if self.engine_cfg.global_digest.event_dedupe_enabled {
+                    let event_dedupe_provider = self
+                        .global_digest_event_dedupe_provider
+                        .clone()
+                        .unwrap_or_else(|| pass2_provider.clone());
+                    let event_deduper: Arc<dyn crate::global_digest::EventDeduper> =
+                        Arc::new(crate::global_digest::LlmEventDeduper::new(
+                            event_dedupe_provider,
+                            self.engine_cfg.global_digest.event_dedupe_model.clone(),
+                        ));
+                    unified = unified.with_event_deduper(event_deduper);
+                }
+                info!(
+                    pass1_model = %self.engine_cfg.global_digest.pass1_model,
+                    pass2_model = %self.engine_cfg.global_digest.pass2_model,
+                    event_dedupe = self.engine_cfg.global_digest.event_dedupe_enabled,
+                    event_dedupe_model = %self.engine_cfg.global_digest.event_dedupe_model,
+                    "unified digest curator wired (global news enabled)"
+                );
+            } else {
+                warn!(
+                    "global_digest enabled but no LLM provider injected — global news section will be empty until .with_global_digest_provider() is called"
+                );
+            }
+        } else {
+            info!("global_digest disabled — unified digest will only ship buffered + synth items");
+        }
+        let scheduler = Arc::new(unified);
         tokio::spawn(pipeline::cron_minute_tick(
-            "internal.digest_scheduler",
+            "internal.unified_digest_scheduler",
             tz_offset,
             task_runs_dir.clone(),
             move |now, fired| {
                 let scheduler = scheduler.clone();
-                Box::pin(async move {
-                    // tick_once 返回本轮触发的 actor 数,本骨架不消费,只关心成败
-                    scheduler.tick_once(now, fired).await.map(|_| ())
-                })
+                Box::pin(async move { scheduler.tick_once(now, fired).await.map(|_| ()) })
             },
         ));
 
@@ -393,26 +521,24 @@ impl EventEngine {
         // 事件既不入库也不分发。需要"poller 仍跑、只是 router 丢弃某 kind"
         // 这种兜底关法,改用 EventEngineConfig.disabled_kinds。
         //
-        // v0.1.46 开始:earnings / corp_action / macro / analyst_grade / earnings_surprise
-        // 这 5 个日频 poller 改为 **cron-aligned**:在 `pre_market - offset` /
-        // `post_market - offset` 各跑一次,保证 digest flush 时用到的数据永远是刚拉的。
-        // 同时冷启动时每个 poller 立即跑一次,避免用户重启后等到下一个 flush 窗口。
-        // news / price 节奏本来就快(分钟级),继续用固定 interval。
+        // v0.1.46 开始:日频 / 低频 FMP poller 改为 **cron-aligned**:在每个
+        // default slot 前 prefetch_offset_mins 跑一次,保证 digest flush 时用到的数据
+        // 永远是刚拉的。冷启动时每个 poller 立即跑一次,避免用户重启后等到下一个
+        // flush 窗口。news / price 节奏本来就快(分钟级),继续用固定 interval。
         let sources = &self.engine_cfg.sources;
-        let pre_prefetch = digest::shift_hhmm_earlier(
-            &self.engine_cfg.digest.pre_market,
-            self.engine_cfg.digest.prefetch_offset_mins,
-        );
-        let post_prefetch = digest::shift_hhmm_earlier(
-            &self.engine_cfg.digest.post_market,
-            self.engine_cfg.digest.prefetch_offset_mins,
-        );
+        let prefetch_at: Vec<String> = self
+            .engine_cfg
+            .digest
+            .default_slots
+            .iter()
+            .map(|s| {
+                digest::shift_hhmm_earlier(&s.time, self.engine_cfg.digest.prefetch_offset_mins)
+            })
+            .collect();
         info!(
-            pre_market = %self.engine_cfg.digest.pre_market,
-            post_market = %self.engine_cfg.digest.post_market,
+            default_slots = %default_slot_summary,
             prefetch_offset_mins = self.engine_cfg.digest.prefetch_offset_mins,
-            pre_prefetch = %pre_prefetch,
-            post_prefetch = %post_prefetch,
+            prefetch_at = %prefetch_at.join(", "),
             "cron-aligned poller prefetch windows resolved"
         );
 
@@ -420,8 +546,7 @@ impl EventEngine {
             let poller = EarningsPoller::new(
                 client.clone(),
                 SourceSchedule::CronAligned {
-                    pre_prefetch: pre_prefetch.clone(),
-                    post_prefetch: post_prefetch.clone(),
+                    prefetch_at: prefetch_at.clone(),
                     tz_offset,
                 },
             )
@@ -458,8 +583,7 @@ impl EventEngine {
             let poller = CorpActionCalendarPoller::new(
                 client.clone(),
                 SourceSchedule::CronAligned {
-                    pre_prefetch: pre_prefetch.clone(),
-                    post_prefetch: post_prefetch.clone(),
+                    prefetch_at: prefetch_at.clone(),
                     tz_offset,
                 },
             );
@@ -473,18 +597,49 @@ impl EventEngine {
             info!("corp_action calendar poller disabled by config.sources.corp_action=false");
         }
         if fmp_available && sources.sec_filings {
-            // sec_recent_hours=48:每次 tick 只把"过去 48h 新出现的"8-K 送入 store;
+            // sec_recent_hours=48:每次 tick 只把"过去 48h 新出现的"filing 送入 store;
             // store.insert_event 幂等 IGNORE 保证同一 filing 不会触发两次 dispatch。
-            let poller = SecFilingsPoller::new(
+            // forms 默认覆盖 8-K / 10-Q / 10-K / S-1 / DEF 14A,severity 由 form 决定。
+            let mut poller = SecFilingsPoller::new(
                 client.clone(),
                 registry.clone(),
                 SourceSchedule::CronAligned {
-                    pre_prefetch: pre_prefetch.clone(),
-                    post_prefetch: post_prefetch.clone(),
+                    prefetch_at: prefetch_at.clone(),
                     tz_offset,
                 },
             )
-            .with_sec_recent_hours(48);
+            .with_sec_recent_hours(48)
+            .with_forms(self.engine_cfg.sec_filings.forms.clone());
+            // enrichment:enabled=true + 注入了 LlmProvider(复用 global_digest 那个) →
+            // 给每条 SecFiling 挂一段 ~200 字长期主线投资者视角摘要(payload.llm_summary)。
+            // 任一条件不满足都只是降级到原 form/link body,不影响 filing 推送本身。
+            let enr = &self.engine_cfg.sec_filings.enrichment;
+            if enr.enabled {
+                let provider = self
+                    .sec_filings_enrichment_provider
+                    .clone()
+                    .or_else(|| self.global_digest_provider.clone());
+                if let Some(provider) = provider {
+                    let summarizer: Arc<dyn crate::pollers::sec_enrichment::SecFilingSummarizer> =
+                        Arc::new(crate::pollers::sec_enrichment::LlmSecFilingSummarizer::new(
+                            provider,
+                            enr.model.clone(),
+                            enr.max_summary_tokens,
+                            enr.user_agent.clone(),
+                        ));
+                    poller = poller.with_summarizer(summarizer);
+                    info!(
+                        model = %enr.model,
+                        max_summary_tokens = enr.max_summary_tokens,
+                        ua = %enr.user_agent,
+                        "sec_filings enrichment enabled (LLM 摘要)"
+                    );
+                } else {
+                    warn!(
+                        "sec_filings.enrichment.enabled=true 但未注入 LlmProvider —— filing 摘要降级到 form/link body"
+                    );
+                }
+            }
             spawn_event_source(
                 Arc::new(poller),
                 store.clone(),
@@ -498,8 +653,7 @@ impl EventEngine {
             let poller = MacroPoller::new(
                 client.clone(),
                 SourceSchedule::CronAligned {
-                    pre_prefetch: pre_prefetch.clone(),
-                    post_prefetch: post_prefetch.clone(),
+                    prefetch_at: prefetch_at.clone(),
                     tz_offset,
                 },
             );
@@ -536,6 +690,26 @@ impl EventEngine {
         } else if fmp_available {
             info!("price poller disabled by config.sources.price=false");
         }
+        // ExtendedHoursPoller 每 30min 拉一次 1min K(extended=true),只在 ET pre/post
+        // 窗口工作 —— 窗口外 poll() 直接 no-op,几乎零 FMP 开销。补 PricePoller 在
+        // pre/post timestamp 不更新被 stale-skip 的盲区(GOOGL 2026-04-29 财报夜整夜
+        // 无推送的根因)。低/高阈值复用全局 thresholds.price_alert_{low,high}_pct;
+        // per-actor `price_high_pct_override` 经 router 同样路径升级 Low→High。
+        if fmp_available && sources.extended_hours {
+            let poller = ExtendedHoursPoller::new(client.clone(), registry.clone())
+                .with_thresholds(
+                    self.engine_cfg.thresholds.price_alert_low_pct,
+                    self.engine_cfg.thresholds.price_alert_high_pct,
+                );
+            spawn_event_source(
+                Arc::new(poller),
+                store.clone(),
+                router.clone(),
+                task_runs_dir.clone(),
+            );
+        } else if fmp_available {
+            info!("extended_hours poller disabled by config.sources.extended_hours=false");
+        }
         // 分析师评级、财报 surprise：两个都按 watch pool 逐 ticker 拉。
         // 初次 tick 之前 watch pool 为空就跳过——用户新增持仓后下一个 tick 生效。
         // poller 自身持 Arc<SharedRegistry>,每次 poll 内部取最新 watch_pool,
@@ -545,8 +719,7 @@ impl EventEngine {
                 client.clone(),
                 registry.clone(),
                 SourceSchedule::CronAligned {
-                    pre_prefetch: pre_prefetch.clone(),
-                    post_prefetch: post_prefetch.clone(),
+                    prefetch_at: prefetch_at.clone(),
                     tz_offset,
                 },
             );
@@ -560,21 +733,49 @@ impl EventEngine {
             info!("analyst_grade poller disabled by config.sources.analyst_grade=false");
         }
         if fmp_available && sources.earnings_surprise {
-            let poller = EarningsSurprisePoller::new(
-                client.clone(),
-                registry.clone(),
-                SourceSchedule::CronAligned {
-                    pre_prefetch: pre_prefetch.clone(),
-                    post_prefetch: post_prefetch.clone(),
-                    tz_offset,
-                },
-            );
-            spawn_event_source(
-                Arc::new(poller),
-                store.clone(),
-                router.clone(),
-                task_runs_dir.clone(),
-            );
+            let review_cfg = &self.engine_cfg.earnings.quality_review;
+            let poller = if review_cfg.enabled {
+                if let Some(provider) = self.earnings_quality_review_provider.clone() {
+                    let reviewer = Arc::new(LlmEarningsQualityReviewer::new(
+                        provider,
+                        review_cfg.model.clone(),
+                    ));
+                    Some(
+                        EarningsSurprisePoller::new(
+                            client.clone(),
+                            registry.clone(),
+                            SourceSchedule::CronAligned {
+                                prefetch_at: prefetch_at.clone(),
+                                tz_offset,
+                            },
+                        )
+                        .with_quality_reviewer(
+                            reviewer,
+                            review_cfg.sec_recent_hours,
+                            review_cfg.context_max_chars,
+                            review_cfg.min_review_confidence,
+                            review_cfg.min_immediate_confidence,
+                            self.engine_cfg.sec_filings.enrichment.user_agent.clone(),
+                        ),
+                    )
+                } else {
+                    warn!(
+                        "earnings quality_review.enabled=true 但未注入 LlmProvider —— earnings_surprise poller 不启动"
+                    );
+                    None
+                }
+            } else {
+                warn!("earnings quality_review.enabled=false —— earnings_surprise poller 不启动");
+                None
+            };
+            if let Some(poller) = poller {
+                spawn_event_source(
+                    Arc::new(poller),
+                    store.clone(),
+                    router.clone(),
+                    task_runs_dir.clone(),
+                );
+            }
         } else if fmp_available {
             info!("earnings_surprise poller disabled by config.sources.earnings_surprise=false");
         }
@@ -627,79 +828,113 @@ impl EventEngine {
             );
         }
 
-        // ── 全局 digest scheduler ─────────────────────────────────────
-        // LLM 精读后每天 N 次的"今日全球要闻"。每分钟 tick 检查 schedule 命中。
-        if self.engine_cfg.global_digest.enabled {
-            if self.engine_cfg.global_digest.schedules.is_empty() {
-                warn!(
-                    "global_digest enabled 但 schedules 为空 —— 不会触发。在 config 里加 schedules: [\"HH:MM\", ...]"
-                );
-            } else if let Some(provider) = self.global_digest_provider.clone() {
-                let portfolio_storage =
-                    Arc::new(hone_memory::PortfolioStorage::new(&self.portfolio_dir));
-                let fmp_arc = Arc::new(client.clone());
-                let curator = Arc::new(crate::global_digest::Curator::new(
-                    provider.clone(),
-                    self.engine_cfg.global_digest.pass1_model.clone(),
-                    self.engine_cfg.global_digest.pass2_model.clone(),
-                ));
-                let fetcher = Arc::new(crate::global_digest::ArticleFetcher::new());
-                let event_deduper: Arc<dyn crate::global_digest::EventDeduper> =
-                    if self.engine_cfg.global_digest.event_dedupe_enabled {
-                        Arc::new(crate::global_digest::LlmEventDeduper::new(
-                            provider.clone(),
-                            self.engine_cfg.global_digest.event_dedupe_model.clone(),
-                        ))
-                    } else {
-                        Arc::new(crate::global_digest::PassThroughDeduper)
-                    };
-                let audience_cache_dir = self
-                    .store_path
-                    .parent()
-                    .map(|p| p.join("company_profiles"))
-                    .unwrap_or_else(|| PathBuf::from("./data/company_profiles"));
-                let scheduler = Arc::new(
-                    crate::global_digest::GlobalDigestScheduler::new(
-                        self.engine_cfg.global_digest.clone(),
-                        store.clone(),
-                        fmp_arc,
-                        portfolio_storage,
-                        prefs_storage.clone(),
-                        self.sink.clone(),
-                        curator,
-                        fetcher,
-                        audience_cache_dir,
-                        self.daily_report_dir.clone(),
-                    )
-                    .with_event_deduper(event_deduper),
-                );
-                info!(
-                    schedules = ?self.engine_cfg.global_digest.schedules,
-                    timezone = %self.engine_cfg.global_digest.timezone,
-                    pass1_model = %self.engine_cfg.global_digest.pass1_model,
-                    pass2_model = %self.engine_cfg.global_digest.pass2_model,
-                    event_dedupe = self.engine_cfg.global_digest.event_dedupe_enabled,
-                    event_dedupe_model = %self.engine_cfg.global_digest.event_dedupe_model,
-                    "global_digest scheduler starting"
-                );
-                tokio::spawn(async move {
-                    let mut ticker = tokio::time::interval(Duration::from_secs(60));
-                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    loop {
-                        ticker.tick().await;
-                        let now = chrono::Utc::now();
-                        let _ = scheduler.tick(now).await;
-                    }
-                });
-                // 注:thesis 蒸馏 cron 在 hone-web-api 启动时单独 spawn,
-                // 这里不能 spawn 是因为 hone-event-engine 不依赖 hone-channels(避免循环)。
-            } else {
-                warn!(
-                    "global_digest enabled 但未注入 LLM provider —— 调度器跳过。在 EventEngine builder 里调 .with_global_digest_provider()"
-                );
-            }
-        }
+        // 注:投资主线蒸馏 cron 在 hone-web-api 启动时单独 spawn,
+        // 这里不能 spawn 是因为 hone-event-engine 不依赖 hone-channels(避免循环)。
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use futures::stream;
+    use hone_llm::provider::ChatResult;
+    use hone_llm::{ChatResponse, LlmProvider, Message};
+    use serde_json::Value;
+
+    struct StubProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for StubProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _model: Option<&str>,
+        ) -> hone_core::HoneResult<ChatResult> {
+            Ok(ChatResult {
+                content: String::new(),
+                usage: None,
+            })
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[Message],
+            _tools: &[Value],
+            _model: Option<&str>,
+        ) -> hone_core::HoneResult<ChatResponse> {
+            Ok(ChatResponse {
+                content: String::new(),
+                reasoning_content: None,
+                tool_calls: None,
+                usage: None,
+            })
+        }
+
+        fn chat_stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _model: Option<&'a str>,
+        ) -> futures::stream::BoxStream<'a, hone_core::HoneResult<String>> {
+            stream::empty().boxed()
+        }
+    }
+
+    #[test]
+    fn short_budget_llm_providers_are_wired_separately_from_global_digest() {
+        let global: Arc<dyn LlmProvider> = Arc::new(StubProvider);
+        let sec: Arc<dyn LlmProvider> = Arc::new(StubProvider);
+        let earnings: Arc<dyn LlmProvider> = Arc::new(StubProvider);
+
+        let engine = EventEngine::new(EventEngineConfig::default(), FmpConfig::default())
+            .with_global_digest_provider(global.clone())
+            .with_sec_filings_enrichment_provider(sec.clone())
+            .with_earnings_quality_review_provider(earnings.clone());
+
+        assert!(Arc::ptr_eq(
+            engine.global_digest_provider.as_ref().unwrap(),
+            &global
+        ));
+        assert!(Arc::ptr_eq(
+            engine.sec_filings_enrichment_provider.as_ref().unwrap(),
+            &sec
+        ));
+        assert!(!Arc::ptr_eq(
+            engine.global_digest_provider.as_ref().unwrap(),
+            engine.sec_filings_enrichment_provider.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            engine.earnings_quality_review_provider.as_ref().unwrap(),
+            &earnings
+        ));
+        assert!(!Arc::ptr_eq(
+            engine.global_digest_provider.as_ref().unwrap(),
+            engine.earnings_quality_review_provider.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn global_digest_llm_providers_can_be_wired_per_stage() {
+        let pass1: Arc<dyn LlmProvider> = Arc::new(StubProvider);
+        let pass2: Arc<dyn LlmProvider> = Arc::new(StubProvider);
+        let dedupe: Arc<dyn LlmProvider> = Arc::new(StubProvider);
+
+        let engine = EventEngine::new(EventEngineConfig::default(), FmpConfig::default())
+            .with_global_digest_providers(pass1.clone(), pass2.clone(), dedupe.clone());
+
+        assert!(Arc::ptr_eq(
+            engine.global_digest_pass1_provider.as_ref().unwrap(),
+            &pass1
+        ));
+        assert!(Arc::ptr_eq(
+            engine.global_digest_pass2_provider.as_ref().unwrap(),
+            &pass2
+        ));
+        assert!(Arc::ptr_eq(
+            engine.global_digest_event_dedupe_provider.as_ref().unwrap(),
+            &dedupe
+        ));
     }
 }

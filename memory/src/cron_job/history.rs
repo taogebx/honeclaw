@@ -31,6 +31,55 @@ pub struct ExecutionFilter {
 }
 
 impl CronJobStorage {
+    pub fn recover_stale_started_executions(
+        &self,
+        channel: &str,
+        stale_before_rfc3339: &str,
+        recovered_by: &str,
+        reason: &str,
+    ) -> HoneResult<usize> {
+        let Some(conn) = self.open_execution_conn()? else {
+            return Ok(0);
+        };
+        let interrupted_at = hone_core::beijing_now_rfc3339();
+        let error_message = truncate_chars_append(reason, 500, "...");
+        let updated = conn
+            .execute(
+                "
+                UPDATE cron_job_runs
+                SET
+                    executed_at = ?1,
+                    execution_status = 'execution_failed',
+                    message_send_status = 'send_failed',
+                    should_deliver = 0,
+                    delivered = 0,
+                    response_preview = NULL,
+                    error_message = ?2,
+                    detail_json = json_object(
+                        'phase', 'recovered_stale_pending',
+                        'recovered_at', ?1,
+                        'recovered_by', ?3,
+                        'delivery_key', json_extract(detail_json, '$.delivery_key'),
+                        'previous_phase', json_extract(detail_json, '$.phase')
+                    )
+                WHERE actor_channel = ?4
+                  AND execution_status = 'running'
+                  AND message_send_status = 'pending'
+                  AND json_extract(detail_json, '$.phase') = 'started'
+                  AND executed_at < ?5
+                ",
+                params![
+                    interrupted_at,
+                    error_message,
+                    recovered_by,
+                    channel,
+                    stale_before_rfc3339,
+                ],
+            )
+            .map_err(sqlite_err)?;
+        Ok(updated)
+    }
+
     pub fn record_execution_event(
         &self,
         actor: &ActorIdentity,
@@ -54,11 +103,63 @@ impl CronJobStorage {
             .map(|text| truncate_chars_append(text, 500, "..."));
         let detail_json = serde_json::to_string(&input.detail)
             .map_err(|err| HoneError::Serialization(err.to_string()))?;
-        if input.execution_status != "running"
-            && input.message_send_status != "pending"
-            && let Some(delivery_key) = input.detail.get("delivery_key").and_then(|v| v.as_str())
-            && !delivery_key.is_empty()
-        {
+        if input.execution_status != "running" && input.message_send_status != "pending" {
+            if let Some(delivery_key) = input.detail.get("delivery_key").and_then(|v| v.as_str())
+                && !delivery_key.trim().is_empty()
+            {
+                let updated = conn
+                    .execute(
+                        "
+                        UPDATE cron_job_runs
+                        SET
+                            executed_at = ?1,
+                            execution_status = ?2,
+                            message_send_status = ?3,
+                            should_deliver = ?4,
+                            delivered = ?5,
+                            response_preview = ?6,
+                            error_message = ?7,
+                            detail_json = ?8
+                        WHERE run_id = (
+                            SELECT run_id
+                            FROM cron_job_runs
+                            WHERE job_id = ?9
+                              AND actor_channel = ?10
+                              AND actor_user_id = ?11
+                              AND COALESCE(actor_channel_scope, '') = COALESCE(?12, '')
+                              AND channel_target = ?13
+                              AND heartbeat = ?14
+                              AND execution_status = 'running'
+                              AND message_send_status = 'pending'
+                              AND json_extract(detail_json, '$.delivery_key') = ?15
+                            ORDER BY executed_at DESC, run_id DESC
+                            LIMIT 1
+                        )
+                        ",
+                        params![
+                            executed_at,
+                            input.execution_status,
+                            input.message_send_status,
+                            if input.should_deliver { 1 } else { 0 },
+                            if input.delivered { 1 } else { 0 },
+                            response_preview.as_deref(),
+                            error_message.as_deref(),
+                            detail_json.as_str(),
+                            job_id,
+                            actor.channel,
+                            actor.user_id,
+                            actor.channel_scope,
+                            channel_target,
+                            if heartbeat { 1 } else { 0 },
+                            delivery_key.trim(),
+                        ],
+                    )
+                    .map_err(sqlite_err)?;
+                if updated > 0 {
+                    return Ok(());
+                }
+            }
+
             let updated = conn
                 .execute(
                     "
@@ -83,7 +184,8 @@ impl CronJobStorage {
                           AND heartbeat = ?14
                           AND execution_status = 'running'
                           AND message_send_status = 'pending'
-                          AND json_extract(detail_json, '$.delivery_key') = ?15
+                          AND json_extract(detail_json, '$.phase') = 'started'
+                          AND datetime(executed_at) >= datetime(?15, '-2 hours')
                         ORDER BY executed_at DESC, run_id DESC
                         LIMIT 1
                     )
@@ -103,7 +205,7 @@ impl CronJobStorage {
                         actor.channel_scope,
                         channel_target,
                         if heartbeat { 1 } else { 0 },
-                        delivery_key,
+                        executed_at,
                     ],
                 )
                 .map_err(sqlite_err)?;

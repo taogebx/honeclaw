@@ -9,12 +9,14 @@
 //!   - 显式声明数据矛盾 / 时间错位 / 不同口径；
 //!   - 或者标注每个数字的合约/时间/口径；
 //!   - 或者放弃给出精确数字。
+//!
 //! 反之，如果把 `日内低点 ≤ 最新价 ≤ 日内高点` 破坏的数值当成连续叙述直接输出，
 //! 就是本 bug (`oil_price_scheduler_geopolitical_hallucination.md`) 的坏态。
 //!
 //! 模型覆盖：
-//!   - MiniMax `llm.auxiliary`（heartbeat 生产路径同款）
+//!   - direct `llm.auxiliary`（legacy auxiliary fallback path）
 //!   - OpenRouter `deepseek/deepseek-v4-pro` 对照（用户要求）
+//!
 //! 任一失败即整体退出非零。
 
 use std::sync::Arc;
@@ -126,6 +128,7 @@ async fn run_case(spec: &ModelSpec, case: &CaseSpec) -> Result<CaseResult> {
         Message {
             role: "system".into(),
             content: Some(system_prompt),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -133,6 +136,7 @@ async fn run_case(spec: &ModelSpec, case: &CaseSpec) -> Result<CaseResult> {
         Message {
             role: "user".into(),
             content: Some(case.user_prompt.to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -166,16 +170,16 @@ async fn run_case(spec: &ModelSpec, case: &CaseSpec) -> Result<CaseResult> {
 async fn main() -> Result<()> {
     let cfg = HoneConfig::from_file(CONFIG_PATH).with_context(|| format!("加载 {CONFIG_PATH}"))?;
 
-    // MiniMax 辅助通道（生产 heartbeat 路径）
+    // Direct auxiliary channel (legacy fallback path, not profile resolver).
     let mut specs: Vec<ModelSpec> = Vec::new();
     {
         let aux = &cfg.llm.auxiliary;
         if aux.is_configured() {
-            let api_key = aux.resolved_api_key();
+            let api_key = aux.api_key.trim();
             if !api_key.is_empty() {
                 let max_tokens = aux.max_tokens.min(u16::MAX as u32) as u16;
                 let provider = OpenAiCompatibleProvider::new(
-                    &api_key,
+                    api_key,
                     &aux.base_url,
                     &aux.model,
                     aux.timeout,

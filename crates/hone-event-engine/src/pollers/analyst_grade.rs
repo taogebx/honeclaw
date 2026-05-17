@@ -12,6 +12,7 @@
 //! id 稳定：`grade:{SYMBOL}:{publishedDate}:{gradingCompany}`。FMP 同一条评级
 //! 记录在后续拉取中 `publishedDate`+`gradingCompany` 基本不变，去重安全。
 
+use std::cmp::Reverse;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -81,11 +82,12 @@ impl EventSource for AnalystGradePoller {
 }
 
 fn events_from_grades(raw: &Value, ticker: &str, cutoff: DateTime<Utc>) -> Vec<MarketEvent> {
-    let arr = match raw.as_array() {
-        Some(a) => a,
+    let grade_items = match raw.as_array() {
+        Some(items) => items,
         None => return vec![],
     };
-    arr.iter()
+    let events: Vec<MarketEvent> = grade_items
+        .iter()
         .filter_map(|item| {
             let published = item.get("publishedDate").and_then(|v| v.as_str())?;
             let occurred_at = parse_fmp_datetime(published)?;
@@ -112,11 +114,15 @@ fn events_from_grades(raw: &Value, ticker: &str, cutoff: DateTime<Utc>) -> Vec<M
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let severity = severity_from_action(&action);
+            let target_change = target_change_from_news_title(
+                item.get("newsTitle").and_then(|v| v.as_str()).unwrap_or(""),
+            );
+            let severity = severity_from_action(&action, target_change.as_ref());
             let title = format!(
                 "{ticker} · {grading_company} {}",
-                summarize_action(&action, &new_grade, &prev_grade)
+                summarize_action(&action, &new_grade, &prev_grade, target_change.as_ref())
             );
+            let summary = summarize_payload(&new_grade, &prev_grade, target_change.as_ref());
             let url = item
                 .get("newsURL")
                 .and_then(|v| v.as_str())
@@ -128,16 +134,118 @@ fn events_from_grades(raw: &Value, ticker: &str, cutoff: DateTime<Utc>) -> Vec<M
                 symbols: vec![ticker.to_string()],
                 occurred_at,
                 title,
-                summary: format!("{prev_grade} → {new_grade}"),
+                summary,
                 url,
                 source: "fmp.upgrades_downgrades".into(),
                 payload: item.clone(),
             })
         })
-        .collect()
+        .collect();
+    order_analyst_fanout_groups(events)
 }
 
-fn severity_from_action(action: &str) -> Severity {
+fn order_analyst_fanout_groups(events: Vec<MarketEvent>) -> Vec<MarketEvent> {
+    let mut ordered = Vec::with_capacity(events.len());
+    let mut used = vec![false; events.len()];
+
+    for i in 0..events.len() {
+        if used[i] {
+            continue;
+        }
+        let Some(key) = analyst_fanout_key(&events[i]) else {
+            used[i] = true;
+            ordered.push(events[i].clone());
+            continue;
+        };
+        let mut group = Vec::new();
+        for j in i..events.len() {
+            if !used[j] && analyst_fanout_key(&events[j]).as_deref() == Some(key.as_str()) {
+                group.push(j);
+            }
+        }
+        group.sort_by_key(|idx| Reverse(analyst_signal_rank(&events[*idx])));
+        for idx in group {
+            used[idx] = true;
+            ordered.push(events[idx].clone());
+        }
+    }
+
+    ordered
+}
+
+fn analyst_fanout_key(event: &MarketEvent) -> Option<String> {
+    let symbol = event.symbols.first()?.trim().to_ascii_uppercase();
+    let url = event
+        .payload
+        .get("newsURL")
+        .and_then(|v| v.as_str())
+        .or(event.url.as_deref())?
+        .trim();
+    if symbol.is_empty() || url.is_empty() {
+        return None;
+    }
+    Some(format!("{symbol}\n{url}"))
+}
+
+fn analyst_signal_rank(event: &MarketEvent) -> i32 {
+    let action = event
+        .payload
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let previous = event
+        .payload
+        .get("previousGrade")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let new = event
+        .payload
+        .get("newGrade")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let changed_rating =
+        !previous.is_empty() && !new.is_empty() && !previous.eq_ignore_ascii_case(new);
+    let has_target_change = target_change_from_news_title(
+        event
+            .payload
+            .get("newsTitle")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    )
+    .is_some();
+
+    match action.as_str() {
+        "downgrade" if changed_rating => 500,
+        "upgrade" if changed_rating => 450,
+        _ if has_target_change => 400,
+        "downgrade" | "upgrade" if previous.is_empty() && !new.is_empty() => 300,
+        "initiated" | "initialise" if !new.is_empty() => 250,
+        _ if changed_rating => 200,
+        _ => 0,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetChange {
+    direction: TargetDirection,
+    new_target: Option<String>,
+    old_target: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetDirection {
+    Raised,
+    Lowered,
+}
+
+fn severity_from_action(action: &str, target_change: Option<&TargetChange>) -> Severity {
+    if target_change.is_some() && matches!(action, "hold" | "maintained" | "reiterated" | "") {
+        return Severity::Medium;
+    }
     match action {
         "downgrade" => Severity::High,
         "upgrade" | "initiated" | "target-raised" | "target-lowered" => Severity::Medium,
@@ -145,7 +253,29 @@ fn severity_from_action(action: &str) -> Severity {
     }
 }
 
-fn summarize_action(action: &str, new_grade: &str, prev_grade: &str) -> String {
+fn summarize_action(
+    action: &str,
+    new_grade: &str,
+    prev_grade: &str,
+    target_change: Option<&TargetChange>,
+) -> String {
+    if let Some(target_change) = target_change {
+        let direction = match target_change.direction {
+            TargetDirection::Raised => "上调目标价",
+            TargetDirection::Lowered => "下调目标价",
+        };
+        let target = format_target_transition(target_change);
+        let rating = if new_grade.is_empty() {
+            String::new()
+        } else {
+            format!(" · 评级 {new_grade}")
+        };
+        return if target.is_empty() {
+            format!("{direction}{rating}")
+        } else {
+            format!("{direction} {target}{rating}")
+        };
+    }
     match action {
         "downgrade" => format!("下调至 {new_grade}（原 {prev_grade}）"),
         "upgrade" => format!("上调至 {new_grade}（原 {prev_grade}）"),
@@ -156,6 +286,83 @@ fn summarize_action(action: &str, new_grade: &str, prev_grade: &str) -> String {
         other if !other.is_empty() => format!("{other} · {new_grade}"),
         _ => new_grade.to_string(),
     }
+}
+
+fn summarize_payload(
+    new_grade: &str,
+    prev_grade: &str,
+    target_change: Option<&TargetChange>,
+) -> String {
+    if let Some(target_change) = target_change {
+        let target = format_target_transition(target_change);
+        let rating = if prev_grade.is_empty() && new_grade.is_empty() {
+            String::new()
+        } else if prev_grade.trim().eq_ignore_ascii_case(new_grade.trim()) {
+            format!("评级 {new_grade}")
+        } else {
+            format!("评级 {prev_grade} → {new_grade}")
+        };
+        return match (target.is_empty(), rating.is_empty()) {
+            (false, false) => format!("目标价 {target} · {rating}"),
+            (false, true) => format!("目标价 {target}"),
+            (true, false) => rating,
+            (true, true) => String::new(),
+        };
+    }
+    format!("{prev_grade} → {new_grade}")
+}
+
+fn format_target_transition(target_change: &TargetChange) -> String {
+    match (&target_change.old_target, &target_change.new_target) {
+        (Some(old), Some(new)) => format!("{old} → {new}"),
+        (None, Some(new)) => format!("至 {new}"),
+        (Some(old), None) => format!("原 {old}"),
+        (None, None) => String::new(),
+    }
+}
+
+fn target_change_from_news_title(title: &str) -> Option<TargetChange> {
+    let lower = title.to_ascii_lowercase();
+    let direction = if lower.contains("price target raised")
+        || lower.contains("target raised")
+        || lower.contains("raises price target")
+    {
+        TargetDirection::Raised
+    } else if lower.contains("price target lowered")
+        || lower.contains("target lowered")
+        || lower.contains("lowers price target")
+    {
+        TargetDirection::Lowered
+    } else {
+        return None;
+    };
+    let amounts = dollar_amounts(title);
+    Some(TargetChange {
+        direction,
+        new_target: amounts.first().cloned(),
+        old_target: amounts.get(1).cloned(),
+    })
+}
+
+fn dollar_amounts(title: &str) -> Vec<String> {
+    let chars: Vec<char> = title.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '$' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < chars.len() && (chars[i].is_ascii_digit() || matches!(chars[i], '.' | ',')) {
+            i += 1;
+        }
+        if i > start + 1 {
+            out.push(chars[start..i].iter().collect());
+        }
+    }
+    out
 }
 
 fn parse_fmp_datetime(s: &str) -> Option<DateTime<Utc>> {
@@ -214,6 +421,67 @@ mod tests {
         let raw = serde_json::json!([sample_grade("maintained", 0)]);
         let events = events_from_grades(&raw, "AAPL", Utc::now() - chrono::Duration::days(7));
         assert_eq!(events[0].severity, Severity::Low);
+    }
+
+    #[test]
+    fn hold_with_price_target_change_is_medium_and_readable() {
+        let mut row = sample_grade("hold", 0);
+        row["newGrade"] = Value::String("Overweight".into());
+        row["previousGrade"] = Value::String("Overweight".into());
+        row["newsTitle"] =
+            Value::String("Alphabet price target raised to $405 from $360 at Barclays".into());
+        row["gradingCompany"] = Value::String("Barclays".into());
+        let raw = serde_json::json!([row]);
+
+        let events = events_from_grades(&raw, "GOOGL", Utc::now() - chrono::Duration::days(7));
+
+        assert_eq!(events[0].severity, Severity::Medium);
+        assert!(
+            events[0]
+                .title
+                .contains("GOOGL · Barclays 上调目标价 $360 → $405 · 评级 Overweight"),
+            "title = {}",
+            events[0].title
+        );
+        assert_eq!(events[0].summary, "目标价 $360 → $405 · 评级 Overweight");
+    }
+
+    #[test]
+    fn same_news_url_fanout_is_ordered_by_signal_strength() {
+        let published = Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
+        let row = |firm: &str, action: &str, previous: Option<&str>, new: &str| {
+            serde_json::json!({
+                "symbol": "AMD",
+                "publishedDate": published,
+                "newsURL": "https://thefly.com/ajax/news_get.php?id=4346982",
+                "newsTitle": "AMD upgraded, Reddit downgraded: Wall Street's top analyst calls",
+                "newGrade": new,
+                "previousGrade": previous,
+                "gradingCompany": firm,
+                "action": action,
+            })
+        };
+        let raw = serde_json::json!([
+            row("Needham", "upgrade", None, "Buy"),
+            row("Citigroup", "initialise", Some("Neutral"), "Neutral"),
+            row("Jefferies", "downgrade", Some("Buy"), "Hold"),
+            row("Oppenheimer", "downgrade", Some("Perform"), "Perform"),
+            row("BTIG", "upgrade", None, "Buy")
+        ]);
+
+        let events = events_from_grades(&raw, "AMD", Utc::now() - chrono::Duration::days(7));
+
+        assert_eq!(events.len(), 5);
+        assert!(
+            events[0].id.ends_with(":Jefferies"),
+            "changed downgrade should be the representative sent first, got {}",
+            events[0].id
+        );
+        assert!(
+            events.last().unwrap().id.ends_with(":Citigroup")
+                || events.last().unwrap().id.ends_with(":Oppenheimer"),
+            "same-grade rows should sort to the end"
+        );
     }
 
     #[test]

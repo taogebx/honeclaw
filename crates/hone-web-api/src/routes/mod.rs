@@ -1,4 +1,5 @@
 pub(crate) mod auth;
+pub(crate) mod channel_settings;
 pub(crate) mod chat;
 pub(crate) mod company_profiles;
 pub(crate) mod cron;
@@ -44,6 +45,10 @@ async fn handle_not_found() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
 
+async fn handle_api_not_found() -> Response {
+    common::json_error(StatusCode::NOT_FOUND, "api route not found")
+}
+
 pub fn build_admin_app(state: Arc<AppState>) -> Router {
     let web_dist = web_dist_dir();
     let index_path = web_dist.join("index.html");
@@ -54,9 +59,15 @@ pub fn build_admin_app(state: Arc<AppState>) -> Router {
 
     let api = Router::new()
         .route("/meta", get(meta::handle_meta))
+        .route("/language", put(meta::handle_put_language))
         .route("/auth/sse-ticket", post(auth::handle_sse_ticket))
         .route("/runtime/heartbeat", post(meta::handle_runtime_heartbeat))
         .route("/channels", get(meta::handle_channels))
+        .route(
+            "/channel-settings",
+            get(channel_settings::handle_get_channel_settings)
+                .put(channel_settings::handle_put_channel_settings),
+        )
         .route("/history", get(history::handle_history))
         .route("/events", get(events::handle_events))
         .route("/image", get(files::handle_image))
@@ -77,6 +88,14 @@ pub fn build_admin_app(state: Arc<AppState>) -> Router {
         .route(
             "/web-users/invites/{user_id}/reset",
             post(web_users::handle_reset_invite),
+        )
+        .route(
+            "/web-users/invites/{user_id}/api-key",
+            post(web_users::handle_get_api_key),
+        )
+        .route(
+            "/web-users/invites/{user_id}/api-key/reset",
+            post(web_users::handle_reset_api_key),
         )
         .route("/skills", get(skills::handle_skills))
         .route("/skills/reset", post(skills::handle_skill_registry_reset))
@@ -119,12 +138,12 @@ pub fn build_admin_app(state: Arc<AppState>) -> Router {
                 .delete(event_engine_admin::handle_delete_rss_feed),
         )
         .route(
-            "/event-engine/thesis-distill",
-            post(event_engine_admin::handle_distill_thesis_now),
+            "/event-engine/mainline-distill",
+            post(event_engine_admin::handle_distill_mainline_now),
         )
         .route(
-            "/event-engine/thesis-context",
-            get(event_engine_admin::handle_get_thesis_context),
+            "/event-engine/mainline-context",
+            get(event_engine_admin::handle_get_mainline_context),
         )
         .route(
             "/event-engine/company-profile",
@@ -191,6 +210,7 @@ pub fn build_admin_app(state: Arc<AppState>) -> Router {
             state.clone(),
             auth::require_api_auth,
         ))
+        .fallback(handle_api_not_found)
         .layer(cors.clone())
         .with_state(state.clone());
 
@@ -217,17 +237,17 @@ pub fn build_public_app(state: Arc<AppState>) -> Router {
         .allow_credentials(true);
 
     let public_api = Router::new()
-        .route("/auth/invite-login", post(public::handle_invite_login))
-        .route("/auth/password-login", post(public::handle_password_login))
-        .route("/auth/set-password", post(public::handle_set_password))
-        .route(
-            "/auth/change-password",
-            post(public::handle_change_password),
-        )
+        .route("/auth/captcha/config", get(public::handle_captcha_config))
+        .route("/auth/sms/send", post(public::handle_sms_send_code))
+        .route("/auth/sms/login", post(public::handle_sms_login))
         .route("/auth/logout", post(public::handle_logout))
         .route("/auth/me", get(public::handle_me))
         .route("/history", get(public::handle_history))
         .route("/chat", post(public::handle_chat))
+        .route(
+            "/v1/chat/completions",
+            post(public::handle_openai_chat_completions),
+        )
         .route("/upload", post(public::handle_upload))
         .route("/image", get(public::handle_public_image))
         .route("/file", get(public::handle_public_file))

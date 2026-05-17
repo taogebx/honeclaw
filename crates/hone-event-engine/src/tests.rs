@@ -34,10 +34,10 @@ async fn live_engine_e2e() {
     // earnings poller 在 v0.1.46 起改为 cron-aligned,冷启动会立即跑一次然后
     // 等到下一个 prefetch 窗口。8 秒 sleep 只会命中冷启动那一次 poll,足够做 e2e 校验。
 
-    let tmp = tempfile::tempdir().unwrap();
-    let store_path = tmp.path().join("events.db");
-    let jsonl_path = tmp.path().join("events.jsonl");
-    let portfolio_dir = tmp.path().join("portfolio");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let store_path = temp_dir.path().join("events.db");
+    let jsonl_path = temp_dir.path().join("events.jsonl");
+    let portfolio_dir = temp_dir.path().join("portfolio");
     let engine = EventEngine::new(engine_cfg, fmp_cfg)
         .with_store_path(store_path.clone())
         .with_events_jsonl_path(Some(jsonl_path.clone()))
@@ -48,15 +48,15 @@ async fn live_engine_e2e() {
     tokio::time::sleep(std::time::Duration::from_secs(8)).await;
 
     let store = EventStore::open(&store_path).unwrap();
-    let n = store.count_events().unwrap();
+    let stored_event_count = store.count_events().unwrap();
     let jsonl_lines = std::fs::read_to_string(&jsonl_path)
         .map(|s| s.lines().filter(|l| !l.is_empty()).count() as i64)
         .unwrap_or(-1);
-    println!("e2e count_events = {n} jsonl_lines = {jsonl_lines}");
-    assert!(n > 0, "SQLite 应写入事件");
+    println!("e2e count_events = {stored_event_count} jsonl_lines = {jsonl_lines}");
+    assert!(stored_event_count > 0, "SQLite 应写入事件");
     assert!(jsonl_lines > 0, "JSONL 镜像应同步写入事件");
     assert_eq!(
-        jsonl_lines, n,
+        jsonl_lines, stored_event_count,
         "JSONL 行数应与 SQLite events 行数一致（单次冷启，无去重丢失）"
     );
 }
@@ -594,6 +594,7 @@ async fn live_portfolio_backtest_push() {
                      5) 不做投资建议，不加前缀。直接输出正文。"
                         .into(),
                 ),
+                reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -601,6 +602,7 @@ async fn live_portfolio_backtest_push() {
             Message {
                 role: "user".into(),
                 content: Some(payload.to_string()),
+                reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -931,12 +933,12 @@ async fn daily_report_roundtrip() {
     use crate::store::EventStore;
     use chrono::TimeZone;
 
-    let tmp = tempfile::tempdir().unwrap();
-    let store = Arc::new(EventStore::open(tmp.path().join("events.db")).unwrap());
-    let report_dir = tmp.path().join("reports");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(EventStore::open(temp_dir.path().join("events.db")).unwrap());
+    let report_dir = temp_dir.path().join("reports");
 
     let now_utc = chrono::Utc::now();
-    let fake = vec![
+    let seeded_events = vec![
         ("fmp.stock_news", EventKind::NewsCritical, 5),
         ("fmp.earning_calendar", EventKind::EarningsUpcoming, 2),
         (
@@ -947,11 +949,11 @@ async fn daily_report_roundtrip() {
         ("fmp.stock_split_calendar", EventKind::Split, 1),
         ("fmp.upgrades_downgrades", EventKind::AnalystGrade, 1),
     ];
-    let mut idx = 0;
-    for (src, kind, n) in fake {
-        for _ in 0..n {
+    let mut event_idx = 0;
+    for (src, kind, event_count) in seeded_events {
+        for _ in 0..event_count {
             let ev = MarketEvent {
-                id: format!("fake-{idx}"),
+                id: format!("fake-{event_idx}"),
                 kind: kind.clone(),
                 severity: Severity::Medium,
                 symbols: vec!["AAPL".into()],
@@ -963,23 +965,44 @@ async fn daily_report_roundtrip() {
                 payload: serde_json::Value::Null,
             };
             store.insert_event(&ev).unwrap();
-            idx += 1;
+            event_idx += 1;
         }
     }
-    let ak_main = "telegram::::8039067465";
+    let primary_actor_key = "telegram::::8039067465";
     for _ in 0..3 {
         store
-            .log_delivery("f-s", ak_main, "sink", Severity::High, "sent", None)
+            .log_delivery(
+                "f-s",
+                primary_actor_key,
+                "sink",
+                Severity::High,
+                "sent",
+                None,
+            )
             .unwrap();
     }
     for _ in 0..8 {
         store
-            .log_delivery("f-q", ak_main, "digest", Severity::Medium, "queued", None)
+            .log_delivery(
+                "f-q",
+                primary_actor_key,
+                "digest",
+                Severity::Medium,
+                "queued",
+                None,
+            )
             .unwrap();
     }
     for _ in 0..2 {
         store
-            .log_delivery("f-f", ak_main, "prefs", Severity::Low, "filtered", None)
+            .log_delivery(
+                "f-f",
+                primary_actor_key,
+                "prefs",
+                Severity::Low,
+                "filtered",
+                None,
+            )
             .unwrap();
     }
     store
@@ -1009,17 +1032,17 @@ async fn daily_report_roundtrip() {
         .with_tz_offset_hours(tz_offset)
         .with_trigger_time("22:00");
     let mut fired = std::collections::HashSet::new();
-    let n = report.tick_once(trigger_utc, &mut fired).await.unwrap();
-    assert_eq!(n, 1);
+    let generated_report_count = report.tick_once(trigger_utc, &mut fired).await.unwrap();
+    assert_eq!(generated_report_count, 1);
 
     let date_str = local_today.format("%Y-%m-%d").to_string();
-    let file = report_dir.join(format!("{date_str}.md"));
-    let body = std::fs::read_to_string(&file).expect("日报文件未生成");
+    let report_path = report_dir.join(format!("{date_str}.md"));
+    let body = std::fs::read_to_string(&report_path).expect("日报文件未生成");
     println!("\n=== daily_report {date_str}.md ===\n{body}");
     assert!(body.contains("# Hone 日报 · "));
     assert!(body.contains("合计 **10** 条"));
     // 两个 actor 行都在
-    assert!(body.contains(&format!("| `{ak_main}` |")));
+    assert!(body.contains(&format!("| `{primary_actor_key}` |")));
     assert!(body.contains("| `feishu::::ghost` |"));
 }
 
@@ -1039,13 +1062,13 @@ async fn live_social_engine_e2e() {
     use hone_memory::PortfolioStorage;
     use hone_memory::portfolio::{Holding, Portfolio};
 
-    let tmp = tempfile::tempdir().unwrap();
-    let store_path = tmp.path().join("events.db");
-    let jsonl_path = tmp.path().join("events.jsonl");
-    let portfolio_dir = tmp.path().join("portfolio");
-    let digest_dir = tmp.path().join("digest");
-    let prefs_dir = tmp.path().join("prefs");
-    let daily_report_dir = tmp.path().join("daily_reports");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let store_path = temp_dir.path().join("events.db");
+    let jsonl_path = temp_dir.path().join("events.jsonl");
+    let portfolio_dir = temp_dir.path().join("portfolio");
+    let digest_dir = temp_dir.path().join("digest");
+    let prefs_dir = temp_dir.path().join("prefs");
+    let daily_report_dir = temp_dir.path().join("daily_reports");
     std::fs::create_dir_all(&portfolio_dir).unwrap();
 
     // seed 一个 direct-actor 持仓,让 social_global GlobalSub 有 fanout 目标
@@ -1079,6 +1102,7 @@ async fn live_social_engine_e2e() {
     engine_cfg.sources = Sources {
         news: false,
         price: false,
+        extended_hours: false,
         earnings_calendar: false,
         corp_action: false,
         sec_filings: false,
@@ -1108,7 +1132,7 @@ async fn live_social_engine_e2e() {
     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
 
     let store = EventStore::open(&store_path).unwrap();
-    let n = store.count_events().unwrap();
+    let stored_event_count = store.count_events().unwrap();
     let jsonl = std::fs::read_to_string(&jsonl_path).unwrap_or_default();
     let tg_lines: Vec<&str> = jsonl
         .lines()
@@ -1116,13 +1140,13 @@ async fn live_social_engine_e2e() {
         .collect();
 
     println!("=== live_social_engine_e2e ===");
-    println!("count_events = {n}");
+    println!("count_events = {stored_event_count}");
     println!("telegram.watcherguru 事件数 = {}", tg_lines.len());
     if let Some(first) = tg_lines.first() {
         println!("第一条:{first}");
     }
 
-    assert!(n > 0, "events SQLite 应有至少 1 条事件");
+    assert!(stored_event_count > 0, "events SQLite 应有至少 1 条事件");
     assert!(
         !tg_lines.is_empty(),
         "应至少有 1 条 source=telegram.watcherguru 事件(若 Telegram 改版或网络问题请另查)"
@@ -1139,178 +1163,4 @@ async fn live_social_engine_e2e() {
             .any(|l| l.contains("\"source_class\":\"uncertain\"")),
         "payload 应带 source_class=uncertain(LLM 仲裁开关)"
     );
-}
-
-/// 把 `data/events.jsonl` 里某天的全量事件按时间顺序灌进 router,走真实
-/// LlmNewsClassifier(deepseek-v4-pro) + 真实 TelegramSink,推到 chat 8039067465。
-/// 用作 event-engine 三阶段重构后的端到端冒烟。
-///
-/// 触发：
-/// ```sh
-/// HONE_TG_BOT_TOKEN=8573… \
-/// HONE_TG_CHAT_ID=8039067465 \
-/// HONE_OPENROUTER_KEY=sk-or-v1-… \
-/// HONE_OPENROUTER_MODEL=deepseek/deepseek-v4-pro \
-/// HONE_REPLAY_DATE=2026-04-24 \
-/// cargo test -p hone-event-engine --lib tests::replay_yesterday_to_telegram_via_real_router \
-///   -- --ignored --nocapture
-/// ```
-///
-/// 行为:
-/// - 拷贝 `data/events.sqlite3` 到 tempdir(避免污染生产 delivery_log);
-/// - 用 `data/portfolio` 持仓做 SharedRegistry,所以只 fan-out 到该用户匹配的事件;
-/// - prod 一致的 router 配置:high_daily_cap=8 / 同 ticker cooldown 60min /
-///   news upgrade per-symbol=2 / per-tick=8;
-/// - 按 `occurred_at` 升序 dispatch;期间 LlmNewsClassifier 会对 Low + uncertain
-///   触发真实 LLM 调用(预估 <80 次,deepseek 成本几分钱);
-/// - 全量 dispatch 完后调一次 `DigestScheduler::tick_once`,把当天 Medium/Low
-///   合并发出;
-/// - 不写产线 delivery_log,test 结束后 tempdir 自动清。
-#[tokio::test]
-#[ignore]
-async fn replay_yesterday_to_telegram_via_real_router() {
-    use crate::digest::{DigestBuffer, DigestScheduler};
-    use crate::news_classifier::{LlmNewsClassifier, NewsClassifier};
-    use crate::prefs::{FilePrefsStorage, PrefsProvider};
-    use crate::router::{NotificationRouter, OutboundSink};
-    use crate::sinks::TelegramSink;
-    use crate::store::EventStore;
-    use crate::subscription::SharedRegistry;
-    use chrono::TimeZone;
-    use hone_llm::OpenRouterProvider;
-    use std::collections::HashSet;
-    use std::io::BufRead;
-
-    let bot_token = std::env::var("HONE_TG_BOT_TOKEN").expect("需要 HONE_TG_BOT_TOKEN");
-    // 默认推到管理员个人 chat
-    let _chat_id = std::env::var("HONE_TG_CHAT_ID").unwrap_or_else(|_| "8039067465".to_string());
-    let or_key = std::env::var("HONE_OPENROUTER_KEY").expect("需要 HONE_OPENROUTER_KEY");
-    let or_model = std::env::var("HONE_OPENROUTER_MODEL")
-        .unwrap_or_else(|_| "deepseek/deepseek-v4-pro".to_string());
-    let replay_date =
-        std::env::var("HONE_REPLAY_DATE").unwrap_or_else(|_| "2026-04-24".to_string());
-
-    // ── 1. store 拷贝到 temp,避免污染产线 delivery_log ───────────────────
-    // CARGO_MANIFEST_DIR 是 hone-event-engine crate 目录,workspace root 在它的 ../..
-    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .map(std::path::Path::to_path_buf)
-        .expect("workspace root");
-    let prod_store_path = workspace_root.join("data/events.sqlite3");
-    assert!(
-        prod_store_path.exists(),
-        "{} 不存在,无法 replay 真实历史 store",
-        prod_store_path.display()
-    );
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let store_path = tmp.path().join("events.sqlite3");
-    std::fs::copy(&prod_store_path, &store_path).expect("copy events.sqlite3 to tempdir");
-    let store = Arc::new(EventStore::open(&store_path).expect("open temp store"));
-    println!(
-        "[replay] store copied to {} ({} events)",
-        store_path.display(),
-        store.count_events().unwrap_or(-1)
-    );
-
-    // ── 2. 持仓注册 ──────────────────────────────────────────────────────
-    let registry = Arc::new(SharedRegistry::from_portfolio_dir(
-        workspace_root.join("data/portfolio"),
-    ));
-    println!(
-        "[replay] portfolio registry loaded ({} subscribers)",
-        registry.load().len()
-    );
-
-    // ── 3. digest buffer + prefs (temp) ─────────────────────────────────
-    let digest_buf = Arc::new(DigestBuffer::new(tmp.path().join("digest")).expect("digest buffer"));
-    let prefs_storage: Arc<dyn PrefsProvider> =
-        Arc::new(FilePrefsStorage::new(tmp.path().join("prefs")).expect("prefs"));
-
-    // ── 4. 真实 sink + classifier ───────────────────────────────────────
-    let tg_sink: Arc<dyn OutboundSink> = Arc::new(TelegramSink::new(bot_token));
-    let llm = Arc::new(OpenRouterProvider::new(&or_key, &or_model, 4096));
-    let classifier: Arc<dyn NewsClassifier> = Arc::new(LlmNewsClassifier::new(llm, &or_model));
-
-    // ── 5. router with prod-like config ─────────────────────────────────
-    let router = Arc::new(
-        NotificationRouter::new(
-            registry.clone(),
-            tg_sink.clone(),
-            store.clone(),
-            digest_buf.clone(),
-        )
-        .with_prefs(prefs_storage.clone())
-        .with_high_daily_cap(8)
-        .with_same_symbol_cooldown_minutes(60)
-        .with_tz_offset_hours(8)
-        .with_news_upgrade_per_symbol_per_tick_cap(2)
-        .with_news_upgrade_per_tick_cap(8)
-        .with_news_classifier(classifier),
-    );
-
-    // ── 6. 读 events.jsonl,过滤当日,按时间升序 ───────────────────────
-    let f =
-        std::fs::File::open(workspace_root.join("data/events.jsonl")).expect("data/events.jsonl");
-    let needle = format!("\"occurred_at\":\"{replay_date}");
-    let mut events: Vec<MarketEvent> = std::io::BufReader::new(f)
-        .lines()
-        .map_while(Result::ok)
-        .filter(|line| line.contains(&needle))
-        .filter_map(|line| serde_json::from_str::<MarketEvent>(&line).ok())
-        .collect();
-    events.sort_by_key(|e| e.occurred_at);
-    println!("[replay] loaded {} events for {replay_date}", events.len());
-
-    // ── 7. dispatch loop ────────────────────────────────────────────────
-    router.reset_tick_counters();
-    let started = std::time::Instant::now();
-    let (mut sent, mut pending) = (0u32, 0u32);
-    for (idx, ev) in events.iter().enumerate() {
-        match router.dispatch(ev).await {
-            Ok((s, p)) => {
-                sent += s;
-                pending += p;
-            }
-            Err(e) => eprintln!("[replay] dispatch err {idx} id={}: {e:#}", ev.id),
-        }
-        // Telegram sendMessage 限流:个人 chat 每秒 30 条。每条留 200ms 间隔。
-        if sent > 0 && sent % 5 == 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-    }
-    println!(
-        "[replay] dispatch done in {:?}: sent_immediately={sent} digest_pending={pending}",
-        started.elapsed()
-    );
-    let news_stats = router.news_upgrade_tick_stats_snapshot();
-    println!(
-        "[replay] news upgrade stats: upgraded={} skipped_per_tick={} skipped_per_symbol={} top_symbols={:?}",
-        news_stats.upgraded,
-        news_stats.skipped_per_tick_cap,
-        news_stats.skipped_per_symbol_cap,
-        news_stats.top_symbols(5)
-    );
-
-    // ── 8. 强制 flush digest:制造一个落在 pre_market 08:30 (tz=+8) 的 now ─
-    let scheduler = DigestScheduler::new(digest_buf, tg_sink, "08:30", "17:00")
-        .with_tz_offset_hours(8)
-        .with_store(store.clone())
-        .with_registry(registry)
-        .with_prefs(prefs_storage)
-        .with_max_items_per_batch(20)
-        .with_min_gap_minutes(0);
-    // 08:30 tz=+8 == 00:30 UTC
-    let flush_now = chrono::Utc.with_ymd_and_hms(2026, 4, 26, 0, 30, 0).unwrap();
-    let mut fired = HashSet::new();
-    let n_pre = scheduler
-        .tick_once(flush_now, &mut fired)
-        .await
-        .expect("digest tick");
-    let post_now = chrono::Utc.with_ymd_and_hms(2026, 4, 26, 9, 0, 0).unwrap();
-    let n_post = scheduler
-        .tick_once(post_now, &mut fired)
-        .await
-        .expect("digest tick post");
-    println!("[replay] digest flushed: pre_market={n_pre} post_market={n_post}");
 }

@@ -1,6 +1,6 @@
 # Repo Map
 
-Last updated: 2026-04-19
+Last updated: 2026-05-15
 
 ## Purpose
 
@@ -34,16 +34,17 @@ Last updated: 2026-04-19
 - `agents/`
   - `function_calling`: function-calling agent core
   - `gemini_cli`, `codex_cli`: CLI agent adapters
-  - `gemini_acp`, `codex_acp`, `opencode_acp`: agent runner adapters based on ACP stdio / JSON-RPC
+  - `codex_acp`, `opencode_acp`: active agent runner adapters based on ACP stdio / JSON-RPC; `gemini_acp` config remains only for migration/reference, while `gemini_acp.rs` only keeps legacy argument/version test helpers because runtime creation is disabled by the factory
   - `multi-agent`: two-stage runner wiring that combines a direct function-calling search pass with an ACP answer pass
 - `memory/`
   - Local storage abstractions for sessions, identity quotas, portfolios, cron jobs, and LLM audit logs
   - `memory/src/company_profile/{mod,types,markdown,storage,transfer,tests}.rs` now splits company portraits into stable public types, Markdown/template parsing, actor-scoped storage CRUD, zip transfer helpers, and colocated regression tests; portraits still live under `company_profiles/<profile_id>/profile.md` plus append-only `events/*.md`, and both storage reads and transfer/import paths tolerate legacy plain Markdown files without frontmatter by synthesizing minimal metadata from titles, filenames, file mtimes, and bundle manifest timestamps
-  - `memory/src/web_auth.rs` keeps web invite users and public-login cookie sessions in the shared SQLite DB; one invite code maps to one stable `channel=web` actor
-  - `memory/src/session.rs` currently stores versioned session JSON (v3) and explicitly persists `summary`, legacy `runtime.prompt.frozen_time_beijing`, recoverable `tool` result messages, and the session ownership field `session_identity`; current prompt assembly no longer uses that legacy frozen timestamp as the displayed "当前时间"
+  - `memory/src/web_auth.rs` keeps web invite/whitelist users, hashed per-user Hone Cloud API keys, and public-login cookie sessions in the shared SQLite DB; one active phone number maps to one stable `channel=web` actor, with legacy invite codes retained for admin compatibility
+  - `memory/src/session.rs` currently stores versioned session JSON (v3) and explicitly persists `summary`, legacy `runtime.prompt.frozen_time_beijing`, recoverable `tool` result messages, and the session ownership field `session_identity`; current prompt assembly no longer uses that legacy frozen timestamp as the displayed "当前时间". When a SQLite index is configured, including `storage.session_runtime_backend=sqlite` even with shadow writes disabled, `SessionStorage` performs a best-effort startup JSON -> SQLite backfill so old disabled-shadow windows do not leave `sessions.sqlite3` permanently stale.
   - `memory/src/session_sqlite.rs` hosts the SQLite-backed session persistence used by both shadow backfill and runtime reads/writes when `storage.session_runtime_backend=sqlite`
-  - `memory/src/cron_job.rs` keeps cron definitions in per-actor JSON files and mirrors cron execution history into the shared SQLite DB so task detail can query per-run records
+  - `memory/src/cron_job/mod.rs` keeps cron definitions in per-actor JSON files, mirrors cron execution history into the shared SQLite DB so task detail can query per-run records, and exposes a typed channel-target directory aggregated from cron definitions plus recent execution history
   - `memory/src/quota.rs` stores `success_count` / `in_flight` in JSON files by `ActorIdentity` and by Beijing date
+- Event-engine Feishu direct delivery is assembled by `crates/hone-web-api/src/lib.rs` plus `crates/hone-event-engine/src/sinks/feishu.rs`: when building the event-engine sink, Web API reads the cron-backed channel-target directory and passes unambiguous per-actor email/mobile targets into the Feishu sink so digest/card sends can resolve current-app `open_id` instead of reusing stale portfolio actor IDs. Ambiguous or non-contact targets are intentionally ignored to avoid cross-user delivery.
 - `bins/`
   - `hone-console-page`: Web console backend, static asset hosting, and API
   - `hone-cli`: local REPL
@@ -52,18 +53,19 @@ Last updated: 2026-04-19
 - `hone-desktop`: Tauri desktop host with a thin `main.rs` façade, command handlers in `commands.rs`, backend / sidecar lifecycle in `sidecar.rs`, sidecar concern modules in `sidecar/{processes,runtime_env,settings}.rs`, tray extension points in `tray.rs`, and the desktop window packaging flow
 - `config.yaml` / `data/runtime/`
   - `config.yaml` is the canonical user-writable config; dev uses the repo root copy, and packaged installs seed one under the user config dir
+  - LLM provider credentials are config-owned: prefer `llm.providers.<symbol>.api_key/api_keys`, with legacy `llm.openrouter.*` readable only as config fallback; runtime LLM paths do not read parent process API-key env vars
   - `data/runtime/effective-config.yaml` is the generated runtime snapshot for processes that want a materialized runtime config file
   - legacy `data/runtime/config_runtime.yaml` and sibling `.overrides.yaml` should not be recreated
-- Actor sandbox research docs live under `agent-sandboxes/<channel>/<scope__user>/company_profiles/<profile_id>/profile.md` plus `events/*.md`; this actor-local directory is the source of truth for company portraits and long-term fundamental tracking
+- Actor sandbox research docs live under a repo-external `agent-sandboxes/<channel>/<scope__user>/company_profiles/<profile_id>/profile.md` plus `events/*.md`; this actor-local directory is the source of truth for company portraits and long-term fundamental tracking. Portfolio JSON must stay in `storage.portfolio_dir`, never inside actor sandboxes.
 - `packages/`
   - `app`: SolidJS web console
-  - `ui`: shared UI components and context
+  - `ui`: shared UI components and context; Markdown rendering is centered on `src/lib/markdown.ts` (`parseMarkdown`) plus the `Markdown` component / `MarkedProvider`, with base prose styles in `src/styles/index.css`
 - `skills/`
   - In-repo skill definitions; runtime also supports `data/custom_skills/<id>/SKILL.md` and nested `.hone/skills/<id>/SKILL.md` with nearer dynamic directories taking precedence
   - `SKILL.md` frontmatter now also supports an opt-in `script` entrypoint that `skill_tool(..., execute_script=true)` can run from the skill directory
   - `skills/stock_research/` is now the canonical equity-research skill surface: it covers single-company research, valuation framing, and criteria-based screening through one prompt plus compatibility aliases such as `valuation`, `OWGZ`, `stock screener`, and `OWXG`
   - `skills/scheduled_task/` now also owns portfolio event reminder linkage; the former standalone `major_alert` prompt has been folded into this skill
-  - `skills/chart_visualization/` 是内置图表 skill：`SKILL.md` 定义 chart spec 与 `file:///abs/path.png` 输出契约，`scripts/render_chart.py` 用 Python `matplotlib` 把 PNG 写进 Hone runtime 的 `gen_images` 目录
+  - `skills/chart_visualization/` 是内置图表 skill：`SKILL.md` 定义 chart spec 与 `file:///abs/path.png` 输出契约，`skills/chart_visualization/scripts/render_chart.py` 用 Python `matplotlib` 把 PNG 写进 Hone runtime 的 `gen_images` 目录
   - `skills/company_portrait/` now follows a lighter Codex-style pattern: keep the trigger/workflow contract in `SKILL.md`, and move the detailed portrait framework / event template / research-trail guidance into `references/`
 - `data/runtime/skill_registry.json`
   - Global skill enabled/disabled override layer for registered skills
@@ -78,10 +80,10 @@ Last updated: 2026-04-19
   - 管理端与用户端现在按端口和构建产物分离：管理端默认走 `HONE_WEB_PORT` + `packages/app/dist`，用户端默认走 `HONE_PUBLIC_WEB_PORT` + `packages/app/dist-public`
   - 用户可见的长期研究记忆入口现只保留 `/memory` 下的公司画像视图；KB 页面与知识记忆 tab 已移除
 - CLI: `bins/hone-cli/src/main.rs`
-  - `hone-cli` now has explicit subcommands for `chat`, `config`, `configure`, `models`, `channels`, `status`, `doctor`, and `start`; no-subcommand mode still drops into the local chat REPL
+  - `hone-cli` now has explicit subcommands for `chat`, `config`, `configure`, `models`, `channels`, `status`, `doctor`, `start`, and `web`; `web admin-ui` / `web user-ui` start or locate the admin and user Web surfaces; `channels targets [--json]` inspects the typed cron-backed channel-target directory; no-subcommand mode still drops into the local chat REPL
 - Channel runtime export: `crates/hone-channels/src/lib.rs`
 - Shared channel bootstrap: `crates/hone-channels/src/bootstrap.rs`
-- `AgentSession` abstraction: `crates/hone-channels/src/agent_session.rs`
+- `AgentSession` abstraction: `crates/hone-channels/src/agent_session/mod.rs`
 - Prompt/skill turn construction: `crates/hone-channels/src/turn_builder.rs`
   - Owns turn-0 skill listing disclosure, related-skill hints, slash-skill expansion, and invoked-skill runtime input composition
 - Assistant response finalization: `crates/hone-channels/src/response_finalizer.rs`
@@ -92,29 +94,29 @@ Last updated: 2026-04-19
 - Shared ingress model: `crates/hone-channels/src/ingress.rs`
 - Shared outbound model: `crates/hone-channels/src/outbound.rs`
   - 同时也是 canonical 本地图片 marker 解析入口；Web 历史提取与外部通道图片投递都复用这里的 `file:///abs/path.png` 分段规则
-- Runtime config override source of truth: `crates/hone-core/src/{config.rs,config/server.rs}`
+- Runtime config mutation/materialization source of truth: `crates/hone-core/src/config/{mutation.rs,materialize.rs,yaml.rs}`; `mod.rs` re-exports the public helpers
 - ACP MCP bridge: `crates/hone-channels/src/mcp_bridge.rs`
 - Actor sandbox: `crates/hone-channels/src/sandbox.rs`
 - Attachment ingest / preview helpers: `crates/hone-channels/src/attachments.rs` and `crates/hone-channels/src/attachments/{ingest,vision,vector_store}.rs`
   - Enforces shared attachment gates across channels: 5 MB for generic attachments, 3 MB for images, plus rejection of extreme aspect ratio, resolution, or pixel-count cases. Rejected attachments never enter the prompt.
 - Runner contract and ACP / Gemini execution layer: `crates/hone-channels/src/runners/`
-  - `mod.rs`: runner exports
+  - `crates/hone-channels/src/runners.rs`: runner module wiring and exports
   - `types.rs`: shared runner trait / request / event / result types
-  - `acp_common.rs`: shared helpers for ACP stdio / JSON-RPC
-  - `gemini_cli.rs`, `gemini_acp.rs`, `codex_acp.rs`, `opencode_acp.rs`, `multi_agent.rs`: runner implementations
+  - `acp_common/`: shared helpers for ACP stdio / JSON-RPC
+  - `gemini_cli.rs`, `codex_acp.rs`, `opencode_acp.rs`, `multi_agent.rs`, `hone_cloud.rs`: active runner implementations; `gemini_acp.rs` only keeps legacy argument/version test helpers and runtime creation rejects `agent.runner=gemini_acp`; `hone_cloud` calls the public user service through the OpenAI-compatible `/api/public/v1/chat/completions` shape
 - Prompt layering: `crates/hone-channels/src/prompt.rs`
   - Injects the global finance-domain constraints in one place: no stock-picking recommendations, reject non-finance questions, warn users not to blindly follow buy or sell advice, and keep greetings short
 - Session compaction service: `crates/hone-channels/src/session_compactor.rs`
 - Prompt audit writer: `crates/hone-channels/src/prompt_audit.rs`
 - Tool registry entry point: `crates/hone-tools/src/lib.rs`
 - Skill runtime source of truth: `crates/hone-tools/src/skill_runtime.rs`
-- Desktop sidecar helpers: `bins/hone-desktop/src/sidecar/{processes,runtime_env,settings}.rs`
+- Channel settings surfaces: `bins/hone-desktop/src/sidecar/settings.rs` for Tauri/Desktop commands and `crates/hone-web-api/src/routes/channel_settings.rs` for normal Web mode. Both read and write the canonical config for enable flags, credentials, `chat_scope`, allowlists, and iMessage `target_handle`, then regenerate the effective runtime config.
 - Feishu channel split: `bins/hone-feishu/src/{handler.rs,scheduler.rs,outbound.rs}`
 - Feishu image upload client: `bins/hone-feishu/src/client.rs`
 - Telegram scheduler split: `bins/hone-telegram/src/scheduler.rs`
 - Telegram outbound text/image interleave handling: `bins/hone-telegram/src/listener.rs`
 - Discord outbound text/image interleave handling: `bins/hone-discord/src/utils.rs`
-- Settings page pure state helpers: `packages/app/src/pages/settings-model.ts`
+- Page-level pure state/data helpers: `packages/app/src/pages/{settings,users,notifications,task-health}-model.ts`
 - Config sample: `config.example.yaml`
 - GitHub install script: `scripts/install_hone_cli.sh`
 
@@ -138,7 +140,7 @@ Last updated: 2026-04-19
     - `memory/src/llm_audit.rs` uses SQLite to record LLM call audit logs archived by `ActorIdentity`
     - Session persistence is controlled by `storage.session_runtime_backend`; `json` reads from local files, `sqlite` reads from `storage.session_sqlite_db_path`, and JSON can still be dual-written as a rollback mirror through `storage.session_sqlite_shadow_write_enabled`
     - Session compaction is now boundary-based: compacted sessions write a `Conversation compacted` marker plus a compact summary message, and the active context window is restored from the most recent boundary forward
-    - `codex_acp` and `opencode_acp` session turns now persist restorable assistant/tool transcript structure locally as `assistant(tool_calls)` + `tool` messages; `codex_acp` uses it to reseed recreated ACP sessions, while `opencode_acp` injects the restored transcript into each fresh ACP session prompt because OpenCode does not safely replay prior sessions
+    - `codex_acp` and `opencode_acp` session turns now persist restorable assistant/tool transcript structure locally as `assistant(tool_calls)` + `tool` messages; both runners inject the restored transcript into each fresh ACP session prompt instead of relying on remote `session/load` replay, because replay can mix historical prompt/tool updates into the current stream
     - `AgentSession::run()` now also supports explicit `/compact` requests, reusing the same compaction pipeline without charging user conversation quota or persisting the slash command as a normal transcript message
     - Heartbeat-style cron jobs are still stored in the same cron store; they are identified by `repeat=heartbeat` and a `heartbeat` tag, then polled every 30 minutes instead of a fixed clock time
 9. Responses are sent back to the originating channel; the Web console streams `run_started / assistant_delta / tool_call / run_error / run_finished` via v2 SSE events
@@ -154,25 +156,25 @@ Last updated: 2026-04-19
 - Tag release workflow emits installable CLI bundles (`honeclaw-darwin-aarch64.tar.gz`, `honeclaw-darwin-x86_64.tar.gz`, `honeclaw-linux-x86_64.tar.gz`) containing `hone-cli`, runtime binaries, built Web assets, `skills/`, `config.example.yaml`, and `soul.md`; it also requires a checked-in user-facing release note at `docs/releases/vX.Y.Z.md` instead of relying on GitHub auto-generated notes. `scripts/install_hone_cli.sh` consumes those assets for the `curl | bash` path, prefers installing the wrapper into an already-on-PATH writable user bin directory, and falls back to `~/.local/bin` with an explicit export hint. The same workflow also uploads `SHASUMS256.txt` and pushes the generated `honeclaw.rb` into the dedicated tap repo `B-M-Capital-Research/homebrew-honeclaw` so `brew install B-M-Capital-Research/honeclaw/honeclaw` resolves without a custom remote
 - Release-oriented Rust builds are warmed in two layers: `.github/workflows/release-cache-warm.yml` prebuilds the three shipped targets on `main`, `Swatinem/rust-cache` stores dependency/`target` state per release target, and `sccache` stores compiler outputs so tag releases mostly reuse warmed caches instead of compiling cold
 - Windows desktop packaging intentionally excludes `hone-imessage`; macOS packaging keeps it, and runtime support still uses `cfg!(target_os = "macos")` as the source of truth
-- `./launch.sh --desktop` is intentionally single-runtime: it starts Vite + Tauri dev only, and the desktop sidecar is responsible for starting the bundled `hone-console-page` plus enabled channel listeners. Do not start the external backend/channel set in parallel for desktop dev, or logs and incoming updates will split across duplicate processes
-- `./launch.sh --desktop --remote` is the dev mode to use when desktop/UI hot reload should not interrupt long-running backend or channel listeners: the launcher starts the normal external `hone-console-page` + channel set first, writes the desktop backend config to `remote`, and then starts Vite + Tauri dev against that remote base URL
-- `./launch.sh --release` starts a release desktop binary without `tauri dev` hot reload. It is intended for long-running desktop verification when source edits should not automatically restart the desktop host. By default the launcher pins `HONE_DESKTOP_DATA_DIR` to the repo `data/` directory and `HONE_DESKTOP_CONFIG_DIR` to `data/runtime/desktop-config/` so the release desktop instance can reuse project-local runtime data instead of silently drifting to an app-specific config/data root
-- `hone-cli onboard` is the first-install guided setup path for bundled CLI installs and repo-local use: it can detect local `codex` / `codex-acp` / `opencode`, switch to `opencode_acp` without forcing Hone-side provider config, guide channel enablement with mandatory local fields plus prerequisite notes, let the user back out of a mistaken channel enablement by disabling that channel mid-flow, and require an explicit configure-or-skip decision for `FMP` / `Tavily` API keys
-- `hone-cli start` is the runtime-only local launch entry for bundled CLI installs and repo-local use: it loads canonical `config.yaml`, generates `data/runtime/effective-config.yaml`, starts `hone-console-page`, waits for `/api/meta`, then starts enabled channel listeners without going through `launch.sh`
+- Source-checkout runtime startup goes through `cargo run -p hone-cli -- start --build`; this builds the local CLI/runtime binaries, generates `data/runtime/effective-config.yaml`, starts `hone-console-page` plus enabled channels, and writes `data/runtime/current.pid`
+- Desktop dev starts explicitly through Tauri tooling: `bun run tauri:prep:dev -- --skip-dev-command` plus `bunx tauri dev --config bins/hone-desktop/tauri.generated.conf.json`; use `--shell-only` prep when connecting the desktop shell to an already running CLI backend
+- `launch.sh` is only a compatibility shim that points users to the CLI source or installed startup path
+- `hone-cli onboard` is the first-install guided setup path for bundled CLI installs and repo-local use: it preserves the seeded `hone_cloud` runner and can collect `agent.hone_cloud.api_key`, detect local `codex` / `codex-acp` / `opencode`, switch to `opencode_acp` without forcing Hone-side provider config, document `multi-agent` as search-key plus local-`opencode` answer setup, guide channel enablement with mandatory local fields plus prerequisite notes, let the user back out of a mistaken channel enablement by disabling that channel mid-flow, and require an explicit configure-or-skip decision for `FMP` / `Tavily` API keys
+- `hone-cli start` is the local launch entry for bundled CLI installs and repo-local use: it loads canonical `config.yaml`, generates `data/runtime/effective-config.yaml`, starts `hone-console-page`, waits for `/api/meta`, then starts enabled channel listeners; `--build` adds source-checkout runtime binary builds before startup
 - `hone-cli cleanup` is the explicit installed-layout teardown helper: it can interactively remove `~/.honeclaw` config, runtime data, and downloaded release bundles before the user runs `brew uninstall honeclaw` or removes the wrapper manually
 - Desktop startup now uses per-process runtime lock files under `data/runtime/locks/` (or the app runtime dir in packaged mode). `hone-desktop` must hold its own lock, each standalone channel/backend binary must hold its own lock, and bundled desktop mode preflights the full `hone-console-page` + enabled-channel set before startup. When the conflict still points at a live matching Hone process, desktop startup now attempts one lock-targeted cleanup by pid and then retries before surfacing the blocking error.
 - The desktop app supports two backend modes:
   - `bundled`: Tauri starts the built-in `hone-console-page` sidecar and points the frontend API at a local loopback address
   - `remote`: Tauri does not start a local backend; the frontend connects directly to a remote HTTP base URL
-- Persistent user config now lives in canonical `config.yaml`; CLI/start flows and desktop-managed sidecars export the generated `data/runtime/effective-config.yaml`, while settings surfaces mutate the canonical file through shared config services. Desktop dev/runtime uses the desktop config dir as the canonical location and may only promote missing values one-way from legacy `data/runtime/config_runtime.yaml`, including runner, multi-agent, enabled channels, Tavily search keys, and FMP keys
+- Persistent user config now lives in canonical `config.yaml`; CLI/start flows and desktop-managed sidecars export the generated `data/runtime/effective-config.yaml`, while settings surfaces mutate the canonical file through shared config services. Browser Web mode uses `/api/channel-settings` for channel config; Desktop/Tauri uses sidecar commands. Desktop dev/runtime uses the desktop config dir as the canonical location and may only promote missing values one-way from legacy `data/runtime/config_runtime.yaml`, including runner, multi-agent, enabled channels, Tavily search keys, and FMP keys
 - In packaged desktop mode, runtime data, locks, logs, and actor sandboxes live under the app sandbox data directory by default; the desktop host also hydrates key login-shell environment variables and exports bundled binary paths (`HONE_MCP_BIN`, bundled `opencode`, `HONE_AGENT_SANDBOX_DIR`) before starting the embedded backend or channel sidecars
-- Desktop agent settings now expose the primary opencode/OpenRouter model, a dedicated `llm.auxiliary` OpenAI-compatible background route for heartbeat/session compression, and the nested `multi-agent` search/answer config. `llm.openrouter.sub_model` remains only as the legacy fallback model name for the auxiliary path; it is not reused as the `multi-agent` search model
+- Desktop agent settings now expose Hone Cloud (`agent.hone_cloud.base_url/api_key/model`), the primary opencode/OpenRouter model, `llm.profiles` bindings for background/event-engine routes, the direct `llm.auxiliary` OpenAI-compatible fallback for heartbeat/session compression, and the nested legacy `multi-agent` search/answer config. `llm.openrouter.sub_model` remains only as the final legacy fallback model name for the auxiliary path; it is not reused as the `multi-agent` search model
 - In `bundled` mode, Tauri also starts or stops `hone-imessage` / `hone-discord` / `hone-feishu` / `hone-telegram` according to the layered runtime config in the application data directory; each channel process now posts heartbeat snapshots carrying `channel + pid` back to the console backend via `HONE_CONSOLE_URL`, and `/api/channels` aggregates those live registrations into per-channel multi-process status. Desktop channel status also merges OS process scanning so duplicate listener processes are visible even when an older instance is not bound to the current backend heartbeat registry, and the desktop shell exposes a cleanup command that keeps only one process per channel. The legacy `runtime/*.heartbeat.json` files still exist as a compatibility fallback for non-desktop paths
 - Desktop log pages read from `/api/logs`; the backend route now merges the in-memory log ring with recent `data/runtime/logs/*.log` tails so bundled desktop mode can display channel/runtime logs even when they were written by sibling processes instead of the current web process
 - Frontend backend runtime lives in `packages/app/src/context/backend.tsx` and `packages/app/src/lib/backend.ts`
 - Assistant message parser for inline local images: `packages/app/src/lib/messages.ts`
 - `hone-console-page` `/api/meta` handles version and capability negotiation
-- `hone-console-page` admin app only serves `/api/*` and console SPA on the admin port; the public app only serves `/api/public/*` plus `/chat` on the public port for invite-based web users
+- `hone-console-page` admin app only serves `/api/*` and console SPA on the admin port; the public app serves the public SPA routes (`/`, `/roadmap`, `/chat`, `/me`, `/portfolio`, `/terms`, `/privacy`) plus `/api/public/*` on the public port. `/chat` uses SMS-verified whitelist web users. `/api/public/auth/sms/send` and `/api/public/auth/sms/login` use Aliyun SMS verification while the admin invite table remains the whitelist source. `/api/public/v1/chat/completions` is the API-key-authenticated OpenAI-compatible public chat endpoint used by Hone Cloud clients.
 - `hone-console-page` `/api/skills*` serves the skill management surface: registered listing, detail view, enable/disable mutation, and reset
 - `hone-console-page` `/api/company-profiles*` now serves actor-space listing, portrait detail, full deletion, and actor-scoped portrait bundle transfer (`export`, `import/preview`, `import/apply`) for actor-local portrait docs; portrait creation and section/event updates still rely on runner-native file operations inside the actor sandbox rather than dedicated mutation APIs
 - `packages/app/src/context/company-profiles.tsx` now acts as the memory-page transfer orchestrator: it merges portrait actor spaces with recent session users into one target-selector model, supports manual target entry for first-time imports, runs bundle preview/apply, keeps post-import highlights plus optional pre-import backup blobs, and auto-selects the first company in the current target space so the right panel does not fall back to a false empty state
@@ -182,8 +184,8 @@ Last updated: 2026-04-19
 - Route entrypoint: `packages/app/src/app.tsx`
 - Pages: `packages/app/src/pages/`
   - admin surface keeps `/start` and the management console routes
-  - public surface only exposes `/` and `/chat`, both pointing at the invite-login chat experience
-- Settings page state helpers: `packages/app/src/pages/settings-model.ts`
+  - public surface exposes `/`, `/roadmap`, `/chat`, `/me`, `/portfolio`, `/terms`, and `/privacy`; `/chat` and account views use the phone + SMS-code whitelist login experience
+- Page-level pure state/data helpers: `packages/app/src/pages/{settings,users,notifications,task-health}-model.ts`
 - Domain state: `packages/app/src/context/`
 - Composite components: `packages/app/src/components/`
 - API access and data transformation: `packages/app/src/lib/`
@@ -196,13 +198,13 @@ Last updated: 2026-04-19
   - If the Web UI needs to show it, also update `bins/hone-console-page/src/main.rs` and the frontend pages
 - Adjusting the skill runtime:
   - Start with `crates/hone-tools/src/skill_runtime.rs`, `crates/hone-tools/src/{skill_registry.rs,skill_tool.rs}`
-  - Then check `crates/hone-channels/src/{agent_session.rs,core.rs,prompt.rs,mcp_bridge.rs,runtime.rs}`
+  - Then check `crates/hone-channels/src/agent_session/mod.rs`, `crates/hone-channels/src/core/mod.rs`, `crates/hone-channels/src/prompt.rs`, `crates/hone-channels/src/mcp_bridge.rs`, and `crates/hone-channels/src/runtime.rs`
   - If the Web UI is affected, also check `crates/hone-web-api/src/routes/skills.rs` and `packages/app/src/{context/skills.tsx,components/skill-*.tsx,lib/skill-command.ts}`
 - Adding a Web page or dashboard:
   - Change `packages/app/src/pages/*`
   - Change `packages/app/src/context/*` and / or `packages/app/src/lib/*`
   - If the backend API is insufficient, add the Web bin API
-  - Invite-based public user flows also require checking `memory/src/web_auth.rs` and `crates/hone-web-api/src/routes/public.rs` instead of wiring directly into the console-only `/api/chat` / `/api/history` / `/api/users` routes
+  - SMS-based public user flows also require checking `memory/src/web_auth.rs`, `crates/hone-web-api/src/aliyun_sms.rs`, and `crates/hone-web-api/src/routes/public.rs` instead of wiring directly into the console-only `/api/chat` / `/api/history` / `/api/users` routes; API-key based Hone Cloud access additionally touches `crates/hone-web-api/src/routes/web_users.rs` and `packages/app/src/pages/settings.tsx`
 - Adjusting desktop backend switching or sidecar lifecycle:
   - Change `bins/hone-desktop/src/{main.rs,commands.rs,sidecar.rs,tray.rs}`
   - If the change is process supervision, runtime env, or persisted overlay wiring, start with `bins/hone-desktop/src/sidecar/{processes,runtime_env,settings}.rs`
@@ -219,19 +221,19 @@ Last updated: 2026-04-19
   - Then check the Web API, channel entrypoints, and frontend pages that depend on it
 - Adjusting company portraits:
   - Start with `memory/src/company_profile/{mod,types,markdown,storage,transfer}.rs`
-  - Then check `crates/hone-channels/src/{sandbox.rs,prompt.rs,core.rs}` and `crates/hone-web-api/src/routes/company_profiles.rs`
+  - Then check `crates/hone-channels/src/sandbox.rs`, `crates/hone-channels/src/prompt.rs`, `crates/hone-channels/src/core/mod.rs`, and `crates/hone-web-api/src/routes/company_profiles.rs`
   - If the Web UI is affected, also check `packages/app/src/{context/company-profiles.tsx,components/company-profile-*.tsx,pages/memory.tsx}`
 - Adjusting identity quotas or limits:
-  - Start with `memory/src/quota.rs` and `memory/src/cron_job.rs`
-  - Then check `crates/hone-channels/src/agent_session.rs` and `crates/hone-channels/src/scheduler.rs`
+  - Start with `memory/src/quota.rs` and `memory/src/cron_job/mod.rs`
+  - Then check `crates/hone-channels/src/agent_session/mod.rs` and `crates/hone-channels/src/scheduler.rs`
   - If the Web UI is affected, also check `crates/hone-web-api/src/routes/chat.rs`, `crates/hone-web-api/src/routes/cron.rs`, and `packages/app/src/lib/api.ts`
 - Adjusting the agent execution path:
-  - Start with `crates/hone-channels/src/agent_session.rs`
-  - Then check `crates/hone-channels/src/prompt.rs`, `crates/hone-channels/src/core.rs`, and `crates/hone-channels/src/sandbox.rs`
+  - Start with `crates/hone-channels/src/agent_session/mod.rs`
+  - Then check `crates/hone-channels/src/prompt.rs`, `crates/hone-channels/src/core/mod.rs`, and `crates/hone-channels/src/sandbox.rs`
   - If the Web UI is affected, also check `crates/hone-web-api/src/routes/chat.rs` and `packages/app/src/context/sessions.tsx`
 - Adjusting LLM audit:
   - Start with `memory/src/llm_audit.rs`
-  - Then check `crates/hone-channels/src/core.rs` and `agents/*`
+  - Then check `crates/hone-channels/src/core/mod.rs`, `crates/hone-channels/src/runners/*`, and legacy `agents/*` if that path is still in use
 
 ## Fragile Areas / Notes
 

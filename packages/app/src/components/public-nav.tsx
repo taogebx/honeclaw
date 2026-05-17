@@ -1,14 +1,17 @@
 // public-nav.tsx — Navigation + Footer for Hone Public Site
 
-import { createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { useNavigate, useLocation } from "@solidjs/router"
+import { displayGithubStars, fetchGithubStars } from "@/lib/github-stars"
 import { CONTENT } from "@/lib/public-content"
 import { setLocale, useLocale } from "@/lib/i18n"
+import { PublicContactCards, PublicContactMenu } from "@/components/public-contact-menu"
 import "../pages/public-site.css"
 
 export function PublicNav() {
   const [scrolled, setScrolled] = createSignal(false)
   const [menuOpen, setMenuOpen] = createSignal(false)
+  const [stars] = createResource(fetchGithubStars)
   const navigate = useNavigate()
   const location = useLocation()
   const C = CONTENT.nav
@@ -41,8 +44,6 @@ export function PublicNav() {
     if (page() !== path) return "transparent"
     return transparent() ? "rgba(255,255,255,0.08)" : "rgba(245,158,11,0.08)"
   }
-  const contactHref = () => `mailto:${C.contact_email}`
-
   // NOTE: store `labelKey` (not pre-resolved strings) so each render re-reads
   // the CONTENT proxy inside JSX and tracks the locale signal.
   const links = [
@@ -54,14 +55,17 @@ export function PublicNav() {
   ] as const
 
   const go = (path: string) => {
+    const current = page()
     navigate(path)
-    window.scrollTo(0, 0)
+    if (current !== path) window.scrollTo({ top: 0, left: 0, behavior: "auto" })
     setMenuOpen(false)
   }
 
   return (
     <>
       <nav
+        class="pub-nav"
+        data-transparent={transparent() ? "true" : undefined}
         style={{
           position: "fixed",
           top: "0",
@@ -102,22 +106,14 @@ export function PublicNav() {
         </div>
 
         {/* Desktop links */}
-        <div class="pub-nav-links" style={{ "align-items": "center", gap: "2px" }}>
+        <div class="pub-nav-links">
           <For each={links}>
             {(l) => (
               <button
                 onClick={() => go(l.path)}
+                class={`pub-nav-link${page() === l.path ? " is-active" : ""}`}
                 style={{
-                  "font-family": "var(--font-sans, 'Plus Jakarta Sans', sans-serif)",
-                  "font-size": "14px",
-                  "font-weight": "500",
                   background: getLinkBg(l.path),
-                  border: "none",
-                  cursor: "pointer",
-                  padding: "6px 12px",
-                  "border-radius": "6px",
-                  transition: "color 0.2s, background 0.2s",
-                  "letter-spacing": "0.01em",
                   color: getLinkColor(l.path),
                 }}
               >
@@ -128,83 +124,25 @@ export function PublicNav() {
 
           <button
             onClick={() => go("/chat")}
-            style={{
-              "margin-left": "8px",
-              padding: "7px 18px",
-              "border-radius": "6px",
-              background: "#f59e0b",
-              border: "none",
-              cursor: "pointer",
-              "font-family": "var(--font-sans, 'Plus Jakarta Sans', sans-serif)",
-              "font-size": "13px",
-              "font-weight": "600",
-              color: "#fff",
-              "letter-spacing": "0.02em",
-              "box-shadow": "0 2px 8px rgba(245,158,11,0.30)",
-              transition: "background 0.2s",
-            }}
-            onMouseEnter={(e) => { e.currentTarget.style.background = "#d97706" }}
-            onMouseLeave={(e) => { e.currentTarget.style.background = "#f59e0b" }}
+            class="pub-nav-cta"
           >
             {C.chat}
           </button>
 
-          <a
-            href={contactHref()}
-            class="pub-contact-link"
-            title={`${C.contact_wechat_label}: ${C.contact_wechat}`}
-            aria-label={`${C.contact_email_label}: ${C.contact_email}`}
-            style={{
-              "margin-left": "10px",
-              "font-family": "var(--font-sans, 'Plus Jakarta Sans', sans-serif)",
-              "font-size": "12px",
-              "font-weight": "600",
-              color: transparent() ? "rgba(255,255,255,0.78)" : "#334155",
-              "text-decoration": "none",
-              padding: "6px 10px",
-              "border-radius": "6px",
-              border: transparent() ? "1px solid rgba(255,255,255,0.18)" : "1px solid rgba(0,0,0,0.10)",
-              background: transparent() ? "rgba(255,255,255,0.08)" : "rgba(255,255,255,0.84)",
-              transition: "all 0.2s",
-              "letter-spacing": "0",
-              "white-space": "nowrap",
-            }}
-          >
-            <span class="pub-contact-label">{C.contact_label}</span>
-            <span class="pub-contact-email">{C.contact_email}</span>
-          </a>
+          <PublicContactMenu />
 
           <a
             href={C.github_url}
             target="_blank"
             rel="noopener noreferrer"
-            style={{
-              "margin-left": "10px",
-              "font-family": "var(--font-sans, 'Plus Jakarta Sans', sans-serif)",
-              "font-size": "12px",
-              "font-weight": "500",
-              color: transparent() ? "rgba(255,255,255,0.5)" : "#94a3b8",
-              "text-decoration": "none",
-              padding: "6px 10px",
-              "border-radius": "6px",
-              border: transparent() ? "1px solid rgba(255,255,255,0.15)" : "1px solid rgba(0,0,0,0.10)",
-              transition: "all 0.2s",
-              "letter-spacing": "0.02em",
-            }}
+            class="pub-github-star-link"
           >
-            GitHub ↗
+            <span>GitHub</span>
+            <span class="pub-github-star-count">{displayGithubStars(stars())}</span>
           </a>
 
           <div
-            style={{
-              "margin-left": "8px",
-              display: "inline-flex",
-              "align-items": "center",
-              gap: "2px",
-              padding: "2px",
-              "border-radius": "6px",
-              border: transparent() ? "1px solid rgba(255,255,255,0.15)" : "1px solid rgba(0,0,0,0.10)",
-            }}
+            class="pub-nav-lang"
           >
             <For each={[{ code: "zh" as const, labelKey: "locale_zh" as const }, { code: "en" as const, labelKey: "locale_en" as const }]}>
               {(opt) => {
@@ -212,29 +150,7 @@ export function PublicNav() {
                 return (
                   <button
                     onClick={() => setLocale(opt.code)}
-                    style={{
-                      "font-family": "var(--font-sans, 'Plus Jakarta Sans', sans-serif)",
-                      "font-size": "11px",
-                      "font-weight": active() ? "600" : "500",
-                      "letter-spacing": "0.05em",
-                      padding: "4px 8px",
-                      "border-radius": "4px",
-                      border: "none",
-                      cursor: "pointer",
-                      background: active()
-                        ? transparent()
-                          ? "rgba(255,255,255,0.14)"
-                          : "rgba(245,158,11,0.10)"
-                        : "transparent",
-                      color: active()
-                        ? transparent()
-                          ? "#fff"
-                          : "#f59e0b"
-                        : transparent()
-                        ? "rgba(255,255,255,0.55)"
-                        : "#64748b",
-                      transition: "color 0.2s, background 0.2s",
-                    }}
+                    class={active() ? "is-active" : ""}
                   >
                     {C[opt.labelKey]}
                   </button>
@@ -295,12 +211,16 @@ export function PublicNav() {
       {/* Mobile dropdown menu */}
       <Show when={menuOpen()}>
         <div
+          class="pub-mobile-menu"
           style={{
             position: "fixed",
             top: "56px",
             left: "0",
             right: "0",
             "z-index": "199",
+            "max-height": "calc(100dvh - 56px)",
+            overflow: "auto",
+            "-webkit-overflow-scrolling": "touch",
             background: "#fff",
             "border-bottom": "1px solid rgba(0,0,0,0.08)",
             padding: "16px 24px 24px",
@@ -353,6 +273,7 @@ export function PublicNav() {
               href={C.github_url}
               target="_blank"
               rel="noopener noreferrer"
+              class="pub-github-star-link"
               style={{
                 padding: "11px 16px",
                 "border-radius": "8px",
@@ -362,9 +283,14 @@ export function PublicNav() {
                 "font-weight": "500",
                 color: "#64748b",
                 "text-decoration": "none",
+                display: "inline-flex",
+                "align-items": "center",
+                "justify-content": "center",
+                gap: "7px",
               }}
             >
-              GitHub ↗
+              <span>GitHub</span>
+              <span class="pub-github-star-count">{displayGithubStars(stars())}</span>
             </a>
           </div>
           <div
@@ -379,18 +305,9 @@ export function PublicNav() {
             }}
           >
             <div style={{ "font-size": "12px", "font-weight": "700", color: "#64748b", "margin-bottom": "8px" }}>
-              {C.contact_label}
+              {C.contact_title}
             </div>
-            <div style={{ display: "grid", gap: "6px", "font-size": "13px", color: "#0f172a" }}>
-              <div>
-                <span style={{ color: "#64748b" }}>{C.contact_wechat_label}: </span>
-                <span style={{ "font-weight": "700" }}>{C.contact_wechat}</span>
-              </div>
-              <a href={contactHref()} style={{ color: "#0f172a", "font-weight": "700", "text-decoration": "none", "word-break": "break-word" }}>
-                <span style={{ color: "#64748b", "font-weight": "500" }}>{C.contact_email_label}: </span>
-                {C.contact_email}
-              </a>
-            </div>
+            <PublicContactCards />
           </div>
         </div>
       </Show>
@@ -405,7 +322,7 @@ export function PublicFooter() {
 
   const go = (href: string) => {
     navigate(href)
-    window.scrollTo(0, 0)
+    window.scrollTo({ top: 0, left: 0, behavior: "auto" })
   }
 
   const chipStyle = (active: boolean) => ({

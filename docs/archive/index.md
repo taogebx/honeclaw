@@ -1,6 +1,164 @@
 # Archive Index
 
-Last updated: 2026-04-26
+Last updated: 2026-05-12
+
+## 2026-05-12
+
+### Public SMS Verification Login
+
+- Status: done
+- Date: 2026-05-12
+- Plan: `docs/archive/plans/public-sms-login.md`
+- Handoff: `docs/handoffs/2026-05-12-public-sms-login.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-memory web_auth::tests::active_invite_user_by_phone_is_sms_login_whitelist`, `cargo test -p hone-memory web_auth::tests::record_tos_acceptance_updates_public_login_terms`, `cargo test -p hone-web-api aliyun_sms::tests`, `cargo check -p hone-web-api`, `bun run --cwd packages/app typecheck`, `bun run --cwd packages/app test:e2e -- --project=public public-sms-login.spec.ts`, optional live SMS smoke `HONE_ALIYUN_SMS_LIVE_PHONE=13871396421 cargo test -p hone-web-api aliyun_sms::tests::live_send_verify_code_smoke -- --ignored --nocapture`
+- Current conclusion: 用户端登录已切换为手机号 + 阿里云短信验证码；管理端现有 Web invite 用户手机号作为白名单来源，旧邀请码仅保留为兼容管理字段。
+- Next entry point: `crates/hone-web-api/src/aliyun_sms.rs`, `crates/hone-web-api/src/routes/public.rs`, and `packages/app/src/components/public-login-form.tsx`
+
+## 2026-05-11
+
+### LLM Profile Registry POC
+
+- Status: done
+- Date: 2026-05-11
+- Plan: N/A, single-session POC did not need active plan tracking
+- Handoff: `docs/handoffs/2026-05-11-llm-profile-poc.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `tests/regression/manual/test_llm_profile_poc.sh`, `cargo test -p hone-core config::tests`, `RUN_LLM_PROFILE_POC=1 cargo run -p hone-llm --example llm_profile_poc`
+- Current conclusion: The proposed `llm.providers` + `llm.profiles` shape can parse model profiles with `reasoning`, `response_format`, and other generation params, and OpenRouter accepted a live profile-derived request with `reasoning_present=true`.
+- Next entry point: Runtime migration is tracked in `docs/archive/plans/llm-profile-runtime-migration.md`.
+
+### LLM Profile Runtime Migration
+
+- Status: done
+- Date: 2026-05-11
+- Plan: `docs/archive/plans/llm-profile-runtime-migration.md`
+- Handoff: `docs/handoffs/2026-05-11-llm-profile-poc.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-core config::tests`, `cargo check -p hone-channels --tests`, `cargo check -p hone-web-api --tests`, `cargo test -p hone-llm resolver`, `cargo test -p hone-event-engine global_digest_llm_providers_can_be_wired_per_stage`, `cargo test -p hone-web-api validate_global_digest`, `HONE_SKIP_BUNDLED_RESOURCE_CHECK=1 cargo test -p hone-desktop --bin hone-desktop sidecar`, `bun run typecheck:web`, `bun run test:web`, `RUN_LLM_PROFILE_POC=1 cargo run -p hone-llm --example llm_profile_poc`
+- Current conclusion: `llm.providers` + `llm.profiles` is now a runtime-supported profile registry for event-engine and auxiliary LLM paths; Settings UI can edit profile routing and profile params; legacy OpenRouter/Auxiliary fields remain fallback-compatible.
+- Next entry point: `crates/hone-llm/src/resolver.rs`, `crates/hone-web-api/src/lib.rs`, and `packages/app/src/pages/settings.tsx`
+
+### LLM Config Env Removal
+
+- Status: done
+- Date: 2026-05-11
+- Plan: `docs/archive/plans/llm-config-env-removal.md`
+- Handoff: `docs/handoffs/2026-05-11-llm-profile-poc.md`
+- Decision / ADR: `docs/decisions.md#d-2026-05-11-01-make-llm-credentials-config-only`
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-core config::tests`, `cargo test -p hone-llm resolver`, `cargo test -p hone-cli mutations`, `HONE_SKIP_BUNDLED_RESOURCE_CHECK=1 cargo test -p hone-desktop --bin hone-desktop sidecar`, `bun run test:web`, `bun run typecheck:web`, `cargo run -p hone-cli -- config validate --json`, `cargo run -p hone-cli -- status --json`, `cargo run -p hone-cli -- probe --channel cli --user-id cli_smoke --query '只输出 HONE_CLI_LLM_OK' --show-events false`, `RUN_LLM_PROFILE_POC=1 cargo run -p hone-llm --example llm_profile_poc`
+- Current conclusion: LLM credentials are now config-only. Runtime no longer consumes `api_key_env` or parent-process `*_API_KEY` fallback for LLM provider/profile/auxiliary paths; CLI/Desktop OpenRouter writes now target `llm.providers.openrouter.api_keys`, while legacy `llm.openrouter.*` remains a config-only fallback/migration path.
+- Next entry point: `crates/hone-core/src/config/agent.rs`, `crates/hone-llm/src/resolver.rs`, and `config.example.yaml`
+
+## 2026-05-10
+
+### Source CLI Start And Launch Retirement
+
+- Status: done
+- Date: 2026-05-10
+- Plan: `docs/archive/plans/source-cli-start-retire-launch.md`
+- Handoff: `docs/handoffs/source-cli-start-retire-launch-2026-05-10.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `docs/runbooks/hone-cli-install-and-start.md`, `docs/runbooks/source-web-startup.md`, `docs/runbooks/desktop-dev-runtime.md`, `cargo test -p hone-cli start`, `bash tests/regression/ci/test_source_cli_start_contract.sh`, `bash tests/regression/ci/test_install_hone_cli_path_resolution.sh`, CLI channel configuration smoke, source startup smoke with `/api/meta` on port `19077`, `cargo test -p hone-cli`, `cargo check --workspace --all-targets --exclude hone-desktop`, `bun run typecheck:web`, `bun run test:web`, `bash tests/regression/run_ci.sh`
+- Current conclusion: Source checkout startup now uses `cargo run -p hone-cli -- start --build`, installed users continue with packaged `hone-cli start`, active docs no longer recommend source launcher flows, and the previous channel configuration changes were verified through real CLI commands against a temporary config.
+- Next entry point: `docs/runbooks/hone-cli-install-and-start.md` for install/source startup and `docs/runbooks/desktop-dev-runtime.md` for desktop dev lanes.
+
+### Channel Delivery Config Borrowing
+
+- Status: done
+- Date: 2026-05-10
+- Plan: `docs/archive/plans/channel-delivery-config-borrowing.md`
+- Handoff: `docs/handoffs/channel-delivery-config-borrowing-2026-05-10.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-tools cron_job_tool_add_preserves_origin_channel_target`, `cargo test -p hone-cli build_channel_mutations_supports_allowlists`, `HONE_SKIP_BUNDLED_RESOURCE_CHECK=1 cargo test -p hone-desktop desktop_channel_settings`, `cargo test -p hone-cli`, `bun run test:web`, `cargo test -p hone-memory channel_target`, `cargo test -p hone-scheduler scheduler_records_missing_channel_target_without_dispatching`, `cargo test -p hone-cli cli_parses_channels_targets_command`, `cargo test -p hone-memory`, `cargo test -p hone-scheduler`, `cargo test -p hone-web-api cron`, `bun run typecheck:web`, `cargo check --workspace --all-targets --exclude hone-desktop`
+- Current conclusion: Hermes-style channel improvements were borrowed without adding platforms or a `home_channel` default. Honeclaw now keeps origin-bound delivery, exposes existing allowlists / `chat_scope` / iMessage `target_handle` through CLI and Desktop/Web settings, rejects or records missing scheduled delivery targets deterministically, and provides a typed cron-backed channel-target directory through `hone-cli channels targets`.
+- Next entry point: Add a Web/Desktop selector backed by `CronJobStorage::list_channel_targets()` if users need clickable target discovery; do not introduce `home_channel` unless a separate no-origin system task flow is designed.
+
+## 2026-05-09
+
+### Event Engine Poller Timeout Boundary
+
+- Status: done
+- Date: 2026-05-09
+- Plan: `docs/archive/plans/event-engine-poller-timeout-boundary.md`
+- Handoff: N/A
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-event-engine spawner::tests --lib -- --nocapture`, `cargo test -p hone-event-engine pollers::earnings_surprise::tests::quality_review_applies_successful_earnings_event --lib -- --nocapture`, `cargo test -p hone-event-engine --lib`, `cargo check -p hone-event-engine --tests`, changed-file `rustfmt --edition 2024 --check`
+- Current conclusion: event-engine unified poller ticks now have a bounded timeout, so a stuck `poll().await` / `run_once().await` records a failed tick and releases the loop for the next scheduled cadence instead of suppressing `poller ok` indefinitely
+- Next entry point: `docs/bugs/archive/event_engine_poller_cadence_stall_without_restart.md`
+
+### Event Engine Mainline Distill Token Cap
+
+- Status: done
+- Date: 2026-05-09
+- Plan: `docs/archive/plans/event-engine-mainline-distill-token-cap.md`
+- Handoff: N/A
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-web-api mainline_distill_uses_short_completion_budget --lib -- --nocapture`, `cargo check -p hone-web-api --tests`, changed-file `rustfmt --edition 2024 --check`
+- Current conclusion: mainline distill cron now uses its own OpenRouter provider capped at 1200 completion tokens instead of inheriting global `llm.openrouter.max_tokens`, closing the HTTP 402 preauthorization failure for short investment-mainline summaries
+- Next entry point: `docs/bugs/event_engine_mainline_distill_openrouter_402.md`
+
+## 2026-05-08
+
+### Event-engine Push Quality Hardening
+
+- Status: done
+- Date: 2026-05-08
+- Plan: `docs/archive/plans/event-engine-push-quality-hardening.md`
+- Handoff: `docs/handoffs/2026-04-23-event-engine-push-quality.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-event-engine --lib`, `cargo test -p hone-event-engine pollers::news::tests::live_news_classifier_baseline_source_policy_is_stable --lib`, `bash tests/regression/manual/test_event_engine_news_classifier_baseline.sh`, changed-file `rustfmt --edition 2024 --check`; full `cargo fmt --all -- --check` currently blocked by unrelated formatting debt
+- Current conclusion: 基于近期 event review 与 POC 结论，event engine 已补 analyst 同源文章 fanout 降噪、RSS 标题级保守实体链接，以及 Zacks 泛化模板回归证明；本轮没有新增 LLM 调用或 summary/body 宽匹配
+- Next entry point: `docs/handoffs/2026-04-23-event-engine-push-quality.md#2026-05-08-poc-后续收口`
+
+### Event Engine Earnings Quality Review
+
+- Status: done
+- Date: 2026-05-08
+- Plan: `docs/archive/plans/event-engine-earnings-quality-review.md`
+- Handoff: `docs/handoffs/2026-05-08-event-engine-earnings-quality-review.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-event-engine pollers::earnings_surprise`, `cargo test -p hone-event-engine pollers::earnings_quality`, `cargo test -p hone-event-engine --lib`, `cargo test -p hone-core --lib`, `cargo check -p hone-web-api`, changed-file `rustfmt --edition 2024 --check`; full `cargo fmt --all -- --check` currently blocked by unrelated formatting debt
+- Current conclusion: `EarningsReleased` 已移除 EPS-only 推送，并新增 best-effort LLM 综合财报 review；AAOI / CAI / CRWV POC 结论落地为 SEC 8-K 上下文 + `x-ai/grok-4.1-fast` 风格 JSON judgement，失败、缺上下文或低置信时跳过 candidate
+- Next entry point: `docs/handoffs/2026-05-08-event-engine-earnings-quality-review.md`
+
+## 2026-04-30
+
+### Feishu P1 直聊与定时任务可靠性修复批次
+
+- Status: done
+- Date: 2026-04-30
+- Plan: `docs/archive/plans/feishu-p1-reliability-batch.md`
+- Handoff: N/A
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-channels runners::multi_agent::tests`, `cargo test -p hone-channels empty_success_with_tool_calls_uses_fallback_after_retries`, `cargo check -p hone-channels`
+- Current conclusion: 活跃 Feishu `P1` 已全部移出活跃队列；multi-agent 对 `cron_job` / `portfolio` 可信本地结果的直返放宽到多行与较长正文，避免“我的定时任务”这类本地状态答案已生成却仍被硬送进容易空回复的 answer 阶段
+- Next entry point: `docs/bugs/README.md#活跃待修复`
+
+## 2026-04-29
+
+### Admin Notification Log and Actor Picker
+
+- Status: done
+- Date: 2026-04-29
+- Plan: `docs/archive/plans/admin-notification-log-actor-picker.md`
+- Handoff: `docs/handoffs/2026-04-29-admin-notification-log-actor-picker.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-web-api routes::notifications`, `cargo test -p hone-event-engine list_recent_delivery_logs`, `cargo test -p hone-event-engine store::tests::delivery_log_is_append_only_across_retries`, `bun --filter @hone-financial/app typecheck`, `git diff --check`
+- Current conclusion: 管理端推送日志已从只读 cron 执行记录改为合并 cron 与 event-engine `delivery_log`；默认排除 no-actor router 与 digest item 内部行，避免真实 Discord / sink 送达记录被淹没；前端现在显示 `events.kind_json.type` 的业务事件类型，推送日志和推送日程均改为 actor 下拉选择
+- Next entry point: `docs/handoffs/2026-04-29-admin-notification-log-actor-picker.md`
 
 ## 2026-04-26
 
@@ -863,3 +1021,75 @@ Use this file as the historical entry point for completed or paused work that sh
 - Related runbooks / regressions: `bun run build:web:public`, `bun run typecheck:web`, Playwright mobile overflow audit
 - Current conclusion: 公开站共享移动端样式已收口，首页、对话页、路线图和基础文档页在 360/390/430/768 宽度下不再横向撑宽，header 保持在视口内
 - Next entry point: `packages/app/src/pages/public-site.css`
+
+### Hone Cloud Runner + Web User API Key
+
+- Status: done
+- Date: 2026-05-04
+- Plan: `docs/archive/plans/hone-cloud-runner-api-key.md`
+- Handoff: `docs/handoffs/2026-05-04-hone-cloud-runner-api-key.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-memory web_auth -- --nocapture`, `cargo check -p hone-web-api`, `cargo check -p hone-desktop`, `tsc -p packages/app/tsconfig.json --noEmit`
+- Current conclusion: 客户端新增可见 `Hone Cloud` runner，并隐藏 legacy multi-agent / standalone codex CLI 入口；Web 邀请码用户现在拥有只存 hash 的 per-user API Key，public app 提供 Bearer 鉴权的 OpenAI-compatible `/api/public/v1/chat/completions`
+- Next entry point: `docs/handoffs/2026-05-04-hone-cloud-runner-api-key.md`
+
+### Public Web Multi-Session Auth
+
+- Status: done
+- Date: 2026-05-05
+- Plan: `docs/archive/plans/public-web-multi-session-auth.md`
+- Handoff: `docs/handoffs/2026-05-05-public-web-multi-session-auth.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-memory web_auth -- --nocapture`, `cargo check -p hone-web-api -p hone-memory`, `cargo test -p hone-web-api public -- --nocapture`
+- Current conclusion: public web 普通登录不再清除同一用户其它活跃 session，避免每小时健康检查自动化、用户浏览器和多设备登录互相踢掉 `hone_web_session`
+- Next entry point: `memory/src/web_auth.rs`
+
+### SEC Enrichment OpenRouter Token Cap
+
+- Status: done
+- Date: 2026-05-07
+- Plan: `docs/archive/plans/sec-enrichment-openrouter-token-cap.md`
+- Handoff: `docs/handoffs/2026-05-07-sec-enrichment-openrouter-token-cap.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-web-api sec_filings_enrichment --lib`, `cargo test -p hone-event-engine sec_filings_enrichment --lib`, `cargo check -p hone-web-api`
+- Current conclusion: SEC filing enrichment now uses a dedicated OpenRouter provider capped by `event_engine.sec_filings.enrichment.max_summary_tokens`, so short summary output no longer inherits the global 30k completion budget that triggered OpenRouter `HTTP 402`.
+- Next entry point: `crates/hone-web-api/src/lib.rs`
+
+### SEC Enrichment Section Excerpts
+
+- Status: done
+- Date: 2026-05-07
+- Plan: `docs/archive/plans/sec-enrichment-section-excerpts.md`
+- Handoff: `docs/handoffs/2026-05-07-sec-enrichment-openrouter-token-cap.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-event-engine sec_enrichment --lib`
+- Current conclusion: SEC filing enrichment now selects filing-aware excerpts before the LLM call. 10-Q/10-K prioritize MD&A, strategic/capital/risk/legal windows and Risk Factors; 8-K prioritizes the front-loaded exhibit/news-release narrative. The default excerpt budget is now `10_000` chars, with `7_000` / `4_500` / `2_800` retries on `Prompt tokens limit exceeded`, covering the follow-up OpenRouter failures where TEM filings still hit `5198 > 3256` and `3956 > 3256` after the first section-aware pass.
+- Next entry point: `crates/hone-event-engine/src/pollers/sec_enrichment.rs`
+
+### Public Login Production Hotfix
+
+- Status: done
+- Date: 2026-05-13
+- Plan: N/A
+- Handoff: `docs/handoffs/2026-05-13-public-login-prod-hotfix.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `docs/runbooks/desktop-release-app-runtime.md`, `bun --filter @hone-financial/app test -- chat.test.ts`, `cargo test -p hone-web-api routes::public::tests::sms_phone_candidates_accept_plus_86_and_local_numbers`, Chrome headless public chat smoke
+- Current conclusion: Public chat now tolerates legacy malformed history rows without crashing on `content.split`; public SMS login accepts `+86...` numbers against local-number whitelist rows and sends Aliyun requests in local-number form; production was switched to rebuilt `0.11.2` release app, with `web`, `discord`, and `feishu` reporting running.
+- Next entry point: `docs/handoffs/2026-05-13-public-login-prod-hotfix.md`
+
+### Web Direct Sandbox Isolation Hotfix
+
+- Status: done
+- Date: 2026-05-14
+- Plan: `docs/current-plans/active-bug-burn-down-2026-04-28.md`
+- Handoff: `docs/handoffs/2026-05-14-web-direct-sandbox-isolation-hotfix.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-channels sandbox --lib -- --nocapture`, `cargo test -p hone-channels prepare_ignores_repo_internal_sandbox_override --lib -- --nocapture`, `HONE_SKIP_BUNDLED_RESOURCE_CHECK=1 cargo test -p hone-desktop runtime_env -- --nocapture`, `cargo check -p hone-channels --tests`, `HONE_SKIP_BUNDLED_RESOURCE_CHECK=1 cargo check -p hone-desktop`
+- Current conclusion: Actor sandboxes no longer default to repo `data/agent-sandboxes`; repo-internal sandbox roots now fall back to a repo-external temp directory, desktop sidecar propagates that explicit sandbox root, and sandbox initialization removes legacy portfolio files before native-file runners can read them.
+- Next entry point: `docs/handoffs/2026-05-14-web-direct-sandbox-isolation-hotfix.md`

@@ -45,8 +45,8 @@ use super::core::AgentSession;
 use super::emitter::SessionEventEmitter;
 use super::helpers::{
     CONTEXT_OVERFLOW_FALLBACK_MESSAGE, DIRECT_SESSION_PRE_COMPACT_RESTORE_LIMIT,
-    persistable_turn_from_response, sanitize_assistant_context_content, should_persist_tool_result,
-    should_return_runner_result,
+    NON_FINANCE_BOUNDARY_REPLY, non_finance_boundary_reply, persistable_turn_from_response,
+    sanitize_assistant_context_content, should_persist_tool_result, should_return_runner_result,
 };
 use super::restore::restore_context;
 use super::types::{
@@ -240,16 +240,32 @@ fn make_test_core_with_config(
 
 #[cfg(unix)]
 fn write_mock_gemini_script(lines: &[&str]) -> (std::path::PathBuf, std::path::PathBuf) {
+    write_mock_gemini_script_with_stderr(lines, "", 0)
+}
+
+#[cfg(unix)]
+fn write_mock_gemini_script_with_stderr(
+    lines: &[&str],
+    stderr: &str,
+    exit_code: i32,
+) -> (std::path::PathBuf, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt;
 
     let root = make_temp_dir("hone_gemini_mock");
     let data_path = root.join("stream.txt");
+    let stderr_path = root.join("stderr.txt");
     let content = lines.join("\n");
     std::fs::create_dir_all(&root).expect("create mock root");
     std::fs::write(&data_path, content).expect("write mock data");
+    std::fs::write(&stderr_path, stderr).expect("write mock stderr");
 
     let script_path = root.join("gemini-mock.sh");
-    let script = format!("#!/bin/sh\ncat \"{}\"\n", data_path.display());
+    let script = format!(
+        "#!/bin/sh\ncat \"{}\"\ncat \"{}\" >&2\nexit {}\n",
+        data_path.display(),
+        stderr_path.display(),
+        exit_code
+    );
     std::fs::write(&script_path, script).expect("write mock script");
     let mut perms = std::fs::metadata(&script_path)
         .expect("stat mock script")
@@ -264,9 +280,9 @@ fn write_mock_gemini_script(lines: &[&str]) -> (std::path::PathBuf, std::path::P
 fn restore_context_missing_session_returns_empty() {
     let root = make_temp_dir("hone_channels_restore_missing");
     let storage = SessionStorage::new(&root);
-    let ctx = restore_context(&storage, "missing", Some(5), None);
-    assert!(ctx.messages.is_empty());
-    assert!(ctx.actor_identity().is_none());
+    let restored_context = restore_context(&storage, "missing", Some(5), None);
+    assert!(restored_context.messages.is_empty());
+    assert!(restored_context.actor_identity().is_none());
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -315,6 +331,30 @@ fn should_return_runner_result_does_not_treat_tool_calls_only_as_success() {
     };
 
     assert!(!should_return_runner_result(&result));
+}
+
+#[test]
+fn non_finance_boundary_rejects_obvious_consumer_topics_without_finance_anchor() {
+    assert_eq!(
+        non_finance_boundary_reply("Hi hone，你了解深圳楼市吗？我现在是否适合买房？"),
+        Some(NON_FINANCE_BOUNDARY_REPLY)
+    );
+    assert_eq!(
+        non_finance_boundary_reply("AMD的电脑CPU是什么名字"),
+        Some(NON_FINANCE_BOUNDARY_REPLY)
+    );
+}
+
+#[test]
+fn non_finance_boundary_allows_finance_framed_adjacent_topics() {
+    assert_eq!(
+        non_finance_boundary_reply("深圳楼市会影响哪些地产股？"),
+        None
+    );
+    assert_eq!(
+        non_finance_boundary_reply("AMD CPU业务对股价和财报有什么影响？"),
+        None
+    );
 }
 
 #[test]
@@ -428,17 +468,23 @@ fn restore_context_filters_and_limits_messages() {
         .add_message(&session_id, "assistant", "a2", None)
         .expect("add a2");
 
-    let ctx = restore_context(&storage, &session_id, Some(4), None);
-    let contents: Vec<_> = ctx
+    let restored_context = restore_context(&storage, &session_id, Some(4), None);
+    let contents: Vec<_> = restored_context
         .messages
         .iter()
         .filter_map(|m| m.content.as_deref())
         .collect();
     assert_eq!(contents, vec!["a1", "t1", "u2", "a2"]);
-    assert_eq!(ctx.messages[1].role, "tool");
-    assert_eq!(ctx.messages[1].name.as_deref(), Some("web_search"));
-    assert_eq!(ctx.messages[1].tool_call_id.as_deref(), Some("call_1"));
-    assert_eq!(ctx.actor_identity(), Some(actor));
+    assert_eq!(restored_context.messages[1].role, "tool");
+    assert_eq!(
+        restored_context.messages[1].name.as_deref(),
+        Some("web_search")
+    );
+    assert_eq!(
+        restored_context.messages[1].tool_call_id.as_deref(),
+        Some("call_1")
+    );
+    assert_eq!(restored_context.actor_identity(), Some(actor));
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -447,7 +493,7 @@ fn restore_context_filters_and_limits_messages() {
 fn restore_context_rehydrates_assistant_tool_calls() {
     let root = make_temp_dir("hone_channels_restore_tool_calls");
     let storage = SessionStorage::new(&root);
-    let actor = ActorIdentity::new("discord", "alice", None::<String>).expect("actor");
+    let actor = ActorIdentity::new("web", "alice", None::<String>).expect("actor");
     let session_id = storage
         .create_session_for_actor(&actor)
         .expect("create session");
@@ -483,18 +529,21 @@ fn restore_context_rehydrates_assistant_tool_calls() {
         )
         .expect("add tool");
 
-    let ctx = restore_context(&storage, &session_id, None, None);
-    assert_eq!(ctx.messages.len(), 3);
-    assert_eq!(ctx.messages[1].role, "assistant");
-    let tool_calls = ctx.messages[1]
+    let restored_context = restore_context(&storage, &session_id, None, None);
+    assert_eq!(restored_context.messages.len(), 3);
+    assert_eq!(restored_context.messages[1].role, "assistant");
+    let tool_calls = restored_context.messages[1]
         .tool_calls
         .as_ref()
         .expect("assistant tool calls");
     assert_eq!(tool_calls.len(), 1);
     assert_eq!(tool_calls[0]["id"], "call_1");
     assert_eq!(tool_calls[0]["function"]["name"], "local_search_files");
-    assert_eq!(ctx.messages[2].role, "tool");
-    assert_eq!(ctx.messages[2].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(restored_context.messages[2].role, "tool");
+    assert_eq!(
+        restored_context.messages[2].tool_call_id.as_deref(),
+        Some("call_1")
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -564,10 +613,10 @@ fn restore_context_preserves_message_metadata() {
         )
         .expect("add tool");
 
-    let ctx = restore_context(&storage, &session_id, None, None);
-    assert_eq!(ctx.messages.len(), 2);
+    let restored_context = restore_context(&storage, &session_id, None, None);
+    assert_eq!(restored_context.messages.len(), 2);
     assert_eq!(
-        ctx.messages[0]
+        restored_context.messages[0]
             .metadata
             .as_ref()
             .and_then(|metadata| metadata.get("codex_acp")),
@@ -579,7 +628,7 @@ fn restore_context_preserves_message_metadata() {
         }))
     );
     assert_eq!(
-        ctx.messages[1]
+        restored_context.messages[1]
             .metadata
             .as_ref()
             .and_then(|metadata| metadata.get("codex_acp")),
@@ -719,6 +768,25 @@ fn resolve_prompt_input_hides_cron_only_skills_when_cron_is_not_allowed() {
 }
 
 #[test]
+fn resolve_prompt_input_warns_web_cron_cannot_send_mobile_system_push() {
+    let root = make_temp_dir("hone_channels_prompt_web_cron_delivery");
+    std::fs::create_dir_all(&root).expect("create root");
+    let llm = MockLlmProvider::with_tool_responses(Vec::new());
+    let core = make_test_core(&root, llm);
+    let actor = ActorIdentity::new("web", "web-user", None::<String>).expect("actor");
+    let session = AgentSession::new(core, actor, "web-user").with_cron_allowed(true);
+
+    let (system_prompt, _) = session.resolve_prompt_input("session-demo", "3 分钟后提醒我");
+
+    assert!(system_prompt.contains("【Web 定时任务送达边界】"));
+    assert!(system_prompt.contains("只保证写入当前 Hone 会话"));
+    assert!(system_prompt.contains("当前没有 Web Push / 手机系统通知能力"));
+    assert!(system_prompt.contains("不要承诺会出现在手机通知中心"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn resolve_prompt_input_places_recv_extra_before_compact_summary() {
     let root = make_temp_dir("hone_channels_prompt_recv_extra_priority");
     let storage = SessionStorage::new(root.join("sessions"));
@@ -825,7 +893,131 @@ fn finalize_agent_response_marks_planning_sentence_as_failure() {
         response.error.as_deref(),
         Some(EMPTY_SUCCESS_FALLBACK_MESSAGE)
     );
-    assert_eq!(outcome.fallback_reason, Some("planning_sentence_suppressed"));
+    assert_eq!(
+        outcome.fallback_reason,
+        Some("planning_sentence_suppressed")
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn finalize_agent_response_recovers_cron_job_confirmation_from_tool_result() {
+    let root = make_temp_dir("hone_channels_finalize_cron_confirmation");
+    std::fs::create_dir_all(&root).expect("create root");
+    let core = make_test_core(&root, MockLlmProvider::with_chat_responses(Vec::new()));
+    let mut response = AgentResponse {
+        content: "我先处理这个监控任务，稍后给你创建结果。".to_string(),
+        tool_calls_made: vec![ToolCallMade {
+            name: "cron_job".to_string(),
+            arguments: serde_json::json!({"action": "add"}),
+            result: serde_json::json!({
+                "success": true,
+                "job": {
+                    "id": "j_market20",
+                    "name": "每日大盘监控",
+                    "schedule": {
+                        "hour": 20,
+                        "minute": 0,
+                        "repeat": "daily"
+                    }
+                }
+            }),
+            tool_call_id: None,
+        }],
+        iterations: 1,
+        success: true,
+        error: None,
+    };
+
+    let outcome = finalize_agent_response(&core, "session", "mock", &mut response);
+
+    assert!(response.success);
+    assert!(response.error.is_none());
+    assert_eq!(
+        response.content,
+        "已创建定时任务：每日大盘监控（每天 20:00）。任务 ID：j_market20。"
+    );
+    assert!(outcome.fallback_reason.is_none());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn finalize_agent_response_recovers_portfolio_confirmation_from_tool_result() {
+    let root = make_temp_dir("hone_channels_finalize_portfolio_confirmation");
+    std::fs::create_dir_all(&root).expect("create root");
+    let core = make_test_core(&root, MockLlmProvider::with_chat_responses(Vec::new()));
+    let mut response = AgentResponse {
+        content: "我先把你的 RDW 持仓记录好，然后继续跟踪。".to_string(),
+        tool_calls_made: vec![ToolCallMade {
+            name: "portfolio".to_string(),
+            arguments: serde_json::json!({
+                "action": "add",
+                "ticker": "rdw",
+                "cost_basis": 12
+            }),
+            result: serde_json::json!({
+                "action": "add",
+                "count": 1,
+                "holdings": [{
+                    "ticker": "RDW",
+                    "asset_type": "stock",
+                    "holding_horizon": null,
+                    "strategy_notes": null,
+                    "promoted_from_watchlist": false
+                }],
+                "success": true,
+                "ticker": "RDW",
+                "asset_type": "stock"
+            }),
+            tool_call_id: None,
+        }],
+        iterations: 1,
+        success: true,
+        error: None,
+    };
+
+    let outcome = finalize_agent_response(&core, "session", "mock", &mut response);
+
+    assert!(response.success);
+    assert!(response.error.is_none());
+    assert_eq!(
+        response.content,
+        "已记录持仓：RDW，成本价 12。后续跟踪会优先参考这条持仓记录。"
+    );
+    assert!(outcome.fallback_reason.is_none());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn transitional_clarification_question_is_not_treated_as_planning_sentence() {
+    assert!(!crate::runtime::is_transitional_planning_sentence(
+        "请先确认具体是哪只股票/资产的 ticker？确认标的后我再校验当前价格、财报、估值倍数和同业，再判断估值是否合理。"
+    ));
+}
+
+#[test]
+fn finalize_agent_response_keeps_user_facing_clarification_question() {
+    let root = make_temp_dir("hone_channels_finalize_clarification_question");
+    std::fs::create_dir_all(&root).expect("create root");
+    let core = make_test_core(&root, MockLlmProvider::with_chat_responses(Vec::new()));
+    let clarification = "请先确认具体是哪只股票/资产的 ticker？确认标的后我再校验当前价格、财报、估值倍数和同业，再判断估值是否合理。";
+    let mut response = AgentResponse {
+        content: clarification.to_string(),
+        tool_calls_made: Vec::new(),
+        iterations: 1,
+        success: true,
+        error: None,
+    };
+
+    let outcome = finalize_agent_response(&core, "session", "mock", &mut response);
+
+    assert!(response.success);
+    assert_eq!(response.content, clarification);
+    assert!(response.error.is_none());
+    assert!(outcome.fallback_reason.is_none());
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -885,8 +1077,8 @@ fn restore_context_sanitizes_polluted_assistant_history() {
         )
         .expect("add polluted");
 
-    let ctx = restore_context(&storage, &session_id, None, None);
-    let contents: Vec<_> = ctx
+    let restored_context = restore_context(&storage, &session_id, None, None);
+    let contents: Vec<_> = restored_context
         .messages
         .iter()
         .filter_map(|message| message.content.as_deref())
@@ -1238,8 +1430,8 @@ fn restore_context_injects_invoked_skills_before_message_window() {
         .update_metadata(&session_id, metadata)
         .expect("metadata");
 
-    let ctx = restore_context(&storage, &session_id, Some(5), None);
-    let contents: Vec<_> = ctx
+    let restored_context = restore_context(&storage, &session_id, Some(5), None);
+    let contents: Vec<_> = restored_context
         .messages
         .iter()
         .filter_map(|m| m.content.as_deref())
@@ -1296,8 +1488,8 @@ fn restore_context_skips_invoked_skill_when_registry_disables_it() {
     let runtime =
         hone_tools::SkillRuntime::new(root.join("system"), root.join("custom"), root.clone())
             .with_registry_path(root.join("runtime").join("skill_registry.json"));
-    let ctx = restore_context(&storage, &session_id, Some(5), Some(&runtime));
-    let contents: Vec<_> = ctx
+    let restored_context = restore_context(&storage, &session_id, Some(5), Some(&runtime));
+    let contents: Vec<_> = restored_context
         .messages
         .iter()
         .filter_map(|m| m.content.as_deref())
@@ -1337,8 +1529,8 @@ fn restore_context_uses_only_messages_after_latest_compact_boundary() {
         .add_message(&session_id, "assistant", "after-compact", None)
         .expect("add assistant");
 
-    let ctx = restore_context(&storage, &session_id, Some(10), None);
-    let contents: Vec<_> = ctx
+    let restored_context = restore_context(&storage, &session_id, Some(10), None);
+    let contents: Vec<_> = restored_context
         .messages
         .iter()
         .filter_map(|m| m.content.as_deref())
@@ -1394,8 +1586,8 @@ fn restore_context_keeps_invoked_skill_context_across_compact_boundary() {
         )
         .expect("add summary");
 
-    let ctx = restore_context(&storage, &session_id, Some(10), None);
-    let contents: Vec<_> = ctx
+    let restored_context = restore_context(&storage, &session_id, Some(10), None);
+    let contents: Vec<_> = restored_context
         .messages
         .iter()
         .filter_map(|m| m.content.as_deref())
@@ -1459,8 +1651,8 @@ fn restore_context_avoids_duplicate_skill_prompt_when_compact_snapshot_exists() 
         )
         .expect("add skill snapshot");
 
-    let ctx = restore_context(&storage, &session_id, Some(10), None);
-    let contents: Vec<_> = ctx
+    let restored_context = restore_context(&storage, &session_id, Some(10), None);
+    let contents: Vec<_> = restored_context
         .messages
         .iter()
         .filter_map(|m| m.content.as_deref())
@@ -1475,6 +1667,7 @@ async fn run_success_commits_daily_conversation_quota() {
     std::fs::create_dir_all(&root).expect("create root");
     let llm = MockLlmProvider::with_tool_responses(vec![ChatResponse {
         content: "ok".to_string(),
+        reasoning_content: None,
         tool_calls: None,
         usage: None,
     }]);
@@ -1503,11 +1696,12 @@ async fn run_success_commits_daily_conversation_quota() {
 }
 
 #[tokio::test]
-async fn run_rejects_over_daily_limit_without_persisting_user_message() {
+async fn run_rejects_over_daily_limit_with_user_turn_and_friendly_error() {
     let root = make_temp_dir("hone_channels_quota_reject");
     std::fs::create_dir_all(&root).expect("create root");
     let llm = MockLlmProvider::with_tool_responses(vec![ChatResponse {
         content: "unused".to_string(),
+        reasoning_content: None,
         tool_calls: None,
         usage: None,
     }]);
@@ -1530,23 +1724,47 @@ async fn run_rejects_over_daily_limit_without_persisting_user_message() {
             .expect("commit");
     }
 
-    let session = AgentSession::new(core.clone(), actor.clone(), actor.user_id.clone());
+    let listener = Arc::new(RecordingListener::default());
+    let mut session = AgentSession::new(core.clone(), actor.clone(), actor.user_id.clone());
+    session.add_listener(listener.clone());
     let result = session.run("hello", AgentRunOptions::default()).await;
 
     assert!(!result.response.success);
+    let error = result.response.error.unwrap_or_default();
+    assert!(error.contains("已达到今日对话上限"));
     assert!(
-        result
-            .response
-            .error
-            .unwrap_or_default()
-            .contains("已达到今日对话上限")
+        !error.contains("工具执行错误"),
+        "quota rejection should stay user-facing, got: {error}"
     );
     assert_eq!(llm.chat_with_tools_calls(), 0);
-    assert!(
-        core.session_storage
-            .get_messages(&actor.session_id(), None)
-            .expect("messages")
-            .is_empty()
+    let messages = core
+        .session_storage
+        .get_messages(&actor.session_id(), None)
+        .expect("messages");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[0].content[0].text.as_deref(), Some("hello"));
+    assert_eq!(messages[1].role, "assistant");
+    assert_eq!(messages[1].content[0].text.as_deref(), Some(error.as_str()));
+    let events = listener.events.lock().await.clone();
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            AgentSessionEvent::Done { response }
+                if !response.success
+                    && response
+                        .error
+                        .as_deref()
+                        .is_some_and(|err| err.contains("已达到今日对话上限"))
+        )
+    }));
+    assert_eq!(
+        messages[1]
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("quota_rejected"))
+            .and_then(|value| value.as_bool()),
+        Some(true)
     );
     let snapshot = core
         .conversation_quota_storage
@@ -1566,6 +1784,7 @@ async fn run_zero_daily_conversation_limit_bypasses_quota() {
         (0..15)
             .map(|_| ChatResponse {
                 content: "ok".to_string(),
+                reasoning_content: None,
                 tool_calls: None,
                 usage: None,
             })
@@ -1594,6 +1813,58 @@ async fn run_zero_daily_conversation_limit_bypasses_quota() {
 }
 
 #[tokio::test]
+async fn run_short_circuits_obvious_non_finance_direct_query_without_llm_or_quota() {
+    let root = make_temp_dir("hone_channels_domain_boundary");
+    std::fs::create_dir_all(&root).expect("create root");
+    let llm = MockLlmProvider::with_tool_responses(vec![ChatResponse {
+        content: "should not be called".to_string(),
+        reasoning_content: None,
+        tool_calls: None,
+        usage: None,
+    }]);
+    let core = make_test_core(&root, llm.clone());
+    let actor = ActorIdentity::new("feishu", "alice", None::<String>).expect("actor");
+    let session = AgentSession::new(core.clone(), actor.clone(), actor.user_id.clone());
+
+    let result = session
+        .run(
+            "Hi hone，你了解深圳楼市吗？我现在是否适合买房？",
+            AgentRunOptions::default(),
+        )
+        .await;
+
+    assert!(result.response.success, "{:?}", result.response.error);
+    assert_eq!(result.response.content, NON_FINANCE_BOUNDARY_REPLY);
+    assert_eq!(llm.chat_calls(), 0);
+    assert_eq!(llm.chat_with_tools_calls(), 0);
+
+    let today = hone_core::beijing_now().format("%F").to_string();
+    let snapshot = core
+        .conversation_quota_storage
+        .snapshot_for_date(&actor, &today)
+        .expect("snapshot");
+    assert!(snapshot.is_none());
+
+    let messages = core
+        .session_storage
+        .get_messages(&actor.session_id(), None)
+        .expect("messages");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[1].role, "assistant");
+    assert_eq!(
+        session_message_text(&messages[0]),
+        "Hi hone，你了解深圳楼市吗？我现在是否适合买房？"
+    );
+    assert_eq!(
+        session_message_text(&messages[1]),
+        NON_FINANCE_BOUNDARY_REPLY
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn context_overflow_auto_compacts_and_retries_successfully() {
     let root = make_temp_dir("hone_channels_context_overflow_retry_success");
     std::fs::create_dir_all(&root).expect("create root");
@@ -1609,6 +1880,7 @@ async fn context_overflow_auto_compacts_and_retries_successfully() {
             )),
             Ok(ChatResponse {
                 content: "恢复后的正常回复".to_string(),
+                reasoning_content: None,
                 tool_calls: None,
                 usage: None,
             }),
@@ -1743,6 +2015,7 @@ async fn auto_compact_uses_low_group_threshold_and_keeps_recent_window() {
         })],
         vec![Ok(ChatResponse {
             content: "after-compact".to_string(),
+            reasoning_content: None,
             tool_calls: None,
             usage: None,
         })],
@@ -1819,6 +2092,7 @@ async fn auto_compact_summary_excludes_latest_user_turn_from_prompt() {
         })],
         vec![Ok(ChatResponse {
             content: "after-compact".to_string(),
+            reasoning_content: None,
             tool_calls: None,
             usage: None,
         })],
@@ -1869,6 +2143,7 @@ async fn scheduled_task_mode_skips_daily_quota() {
     std::fs::create_dir_all(&root).expect("create root");
     let llm = MockLlmProvider::with_tool_responses(vec![ChatResponse {
         content: "scheduled ok".to_string(),
+        reasoning_content: None,
         tool_calls: None,
         usage: None,
     }]);
@@ -1930,7 +2205,7 @@ async fn stream_gemini_prompt_collects_content() {
             per_line_timeout: Duration::from_secs(3),
         };
 
-        let buf = stream_gemini_prompt(
+        let streamed_output = stream_gemini_prompt(
             "hi",
             "tester",
             &root.to_string_lossy(),
@@ -1942,7 +2217,7 @@ async fn stream_gemini_prompt_collects_content() {
         )
         .await
         .expect("stream ok");
-        assert!(buf.contains("第一段"));
+        assert!(streamed_output.contains("第一段"));
         assert!(full.contains("第一段"));
         assert!(full.contains("\n\n第二段开始。"));
     })
@@ -2021,6 +2296,50 @@ async fn stream_gemini_prompt_handles_context_overflow() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn stream_gemini_prompt_bounds_exit_stderr() {
+    let long_tail = "x".repeat(600);
+    let stderr = format!(
+        "request failed https://api.test/path?api_key=secret&token=secret2 auth=Bearer bearer-secret {long_tail}"
+    );
+    let (root, script_path) = write_mock_gemini_script_with_stderr(&[], &stderr, 7);
+    with_temp_env_var("HONE_GEMINI_BIN", script_path.as_os_str(), || async {
+        let mut full = String::new();
+        let mut raw_lines = 0u32;
+        let options = GeminiStreamOptions {
+            max_iterations: 1,
+            overall_timeout: Duration::from_secs(3),
+            per_line_timeout: Duration::from_secs(3),
+        };
+
+        let err = stream_gemini_prompt(
+            "hi",
+            "tester",
+            &root.to_string_lossy(),
+            1,
+            &options,
+            &mut full,
+            &mut raw_lines,
+            Arc::new(NoopEmitter),
+        )
+        .await
+        .expect_err("should fail");
+        assert!(matches!(err.kind, AgentSessionErrorKind::ExitFailure));
+        assert!(err.message.contains("api_key=<redacted>"));
+        assert!(err.message.contains("token=<redacted>"));
+        assert!(err.message.contains("Bearer <redacted>"));
+        assert!(!err.message.contains("secret"));
+        assert!(
+            err.message.chars().count() < 520,
+            "stderr detail should be bounded: {}",
+            err.message
+        );
+    })
+    .await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[derive(Default)]
 struct RecordingListener {
     events: tokio::sync::Mutex<Vec<AgentSessionEvent>>,
@@ -2079,11 +2398,128 @@ async fn session_event_emitter_relativizes_user_visible_paths() {
     assert!(matches!(
         &events[1],
         AgentSessionEvent::Run(RunEvent::ToolStatus {
+            tool,
             message: Some(message),
             reasoning: Some(reasoning),
             ..
-        }) if message == "Edit company_profiles/micron-technology/profile.md"
+        }) if tool == "hone/skill_tool"
+            && message == "Edit company_profiles/micron-technology/profile.md"
             && reasoning == "Edit data/research/notes.md and <absolute-path>/passwd"
+    ));
+}
+
+#[tokio::test]
+async fn session_event_emitter_suppresses_permission_progress_payloads() {
+    let root = "/Users/fengming2/Desktop/honeclaw";
+    let listener = Arc::new(RecordingListener::default());
+    let emitter = SessionEventEmitter {
+        listeners: vec![listener.clone()],
+        channel: "feishu".to_string(),
+        user_id: "ou_redacted".to_string(),
+        session_id: "session".to_string(),
+        message_id: None,
+        working_directory: root.to_string(),
+    };
+
+    emitter
+        .emit(AgentRunnerEvent::Progress {
+            stage: "acp.permission",
+            detail: Some("codex:approved-for-session:Approve MCP tool call".to_string()),
+        })
+        .await;
+
+    let events = listener.events.lock().await.clone();
+    assert!(matches!(
+        &events[0],
+        AgentSessionEvent::Run(RunEvent::Progress { detail: None, .. })
+    ));
+}
+
+#[tokio::test]
+async fn session_event_emitter_suppresses_internal_tool_status_payloads() {
+    let root = "/Users/fengming2/Desktop/honeclaw";
+    let listener = Arc::new(RecordingListener::default());
+    let emitter = SessionEventEmitter {
+        listeners: vec![listener.clone()],
+        channel: "web".to_string(),
+        user_id: "web-user".to_string(),
+        session_id: "session".to_string(),
+        message_id: None,
+        working_directory: root.to_string(),
+    };
+
+    emitter
+        .emit(AgentRunnerEvent::ToolStatus {
+            tool: format!("{root}/skills/scheduled_task"),
+            status: "start".to_string(),
+            message: Some(
+                "【Invoked Skill Context】\nBase directory for this skill: /Users/fengming2/Desktop/honeclaw/skills/scheduled_task".to_string(),
+            ),
+            reasoning: Some(
+                r#"{"job":{"channel_target":"web","task_prompt":"每天提醒我复盘"}} "#.trim().to_string(),
+            ),
+        })
+        .await;
+
+    let events = listener.events.lock().await.clone();
+    assert!(matches!(
+        &events[0],
+        AgentSessionEvent::Run(RunEvent::ToolStatus {
+            tool,
+            status,
+            message: None,
+            reasoning: None,
+        }) if tool == "skills/scheduled_task" && status == "start"
+    ));
+}
+
+#[tokio::test]
+async fn session_event_emitter_suppresses_internal_stream_delta_payloads() {
+    let root = "/Users/fengming2/Desktop/honeclaw";
+    let listener = Arc::new(RecordingListener::default());
+    let emitter = SessionEventEmitter {
+        listeners: vec![listener.clone()],
+        channel: "feishu".to_string(),
+        user_id: "ou_redacted".to_string(),
+        session_id: "session".to_string(),
+        message_id: None,
+        working_directory: root.to_string(),
+    };
+
+    emitter
+        .emit(AgentRunnerEvent::StreamDelta {
+            content: "【Invoked Skill Context】\nBase directory for this skill: /Users/fengming2/Desktop/honeclaw/skills/scheduled_task\nrawOutput={\"job\":\"secret\"}".to_string(),
+        })
+        .await;
+
+    assert!(listener.events.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn session_event_emitter_keeps_visible_stream_delta_prefix_before_internal_payload() {
+    let root = "/Users/fengming2/Desktop/honeclaw";
+    let listener = Arc::new(RecordingListener::default());
+    let emitter = SessionEventEmitter {
+        listeners: vec![listener.clone()],
+        channel: "feishu".to_string(),
+        user_id: "ou_redacted".to_string(),
+        session_id: "session".to_string(),
+        message_id: None,
+        working_directory: root.to_string(),
+    };
+
+    emitter
+        .emit(AgentRunnerEvent::StreamDelta {
+            content:
+                "OK\n【Invoked Skill Context】\nBase directory for this skill: /Users/fengming2/Desktop/honeclaw/skills/scheduled_task"
+                    .to_string(),
+        })
+        .await;
+
+    let events = listener.events.lock().await.clone();
+    assert!(matches!(
+        &events[0],
+        AgentSessionEvent::Run(RunEvent::StreamDelta { content }) if content == "OK"
     ));
 }
 

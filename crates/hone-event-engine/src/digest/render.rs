@@ -3,11 +3,11 @@
 //!
 //! 五件事:
 //! - `build_digest_payload` —— 投影 + dedup,产出结构化 `DigestPayload`,无格式
-//!   依赖。富文本 sink(Discord embed / Feishu card / Telegram MarkdownV2)直接吃
+//!   依赖。富文本 sink(Discord embed / Feishu card / Telegram HTML)直接吃
 //!   这个 payload 自己渲染。
 //! - 主入口 `render_digest` —— 内部 `build_digest_payload` 然后按 `RenderFormat`
-//!   分发,拼 header 行 + `• head · title · 🔗` 条目;对外签名/字节级输出与之前
-//!   保持一致。
+//!   分发,拼 header 行 + `• head · title · link` 条目；Plain 保留紧凑来源,
+//!   HTML/Markdown 输出 host 锚文本。
 //! - `render_digest_feishu_post` —— 特殊路径,因为飞书是 struct 化 post,需要自己
 //!   构造 json;
 //! - `digest_event_title` —— SocialPost 截取 `payload.raw_text` 第一段非空行作为
@@ -18,6 +18,7 @@
 
 use std::collections::HashSet;
 
+use chrono::{FixedOffset, Utc};
 use hone_core::truncate_chars_append;
 
 use crate::event::{EventKind, MarketEvent, Severity};
@@ -189,17 +190,69 @@ fn render_digest_feishu_post(
 }
 
 pub(super) fn digest_event_title(event: &MarketEvent) -> String {
-    if matches!(event.kind, EventKind::SocialPost) {
+    let title = if matches!(event.kind, EventKind::SocialPost) {
         if let Some(first_line) = event
             .payload
             .get("raw_text")
             .and_then(|v| v.as_str())
             .and_then(first_non_empty_line)
         {
-            return truncate_chars(first_line, DIGEST_SOCIAL_TITLE_MAX_CHARS);
+            truncate_chars(first_line, DIGEST_SOCIAL_TITLE_MAX_CHARS)
+        } else {
+            event.title.clone()
         }
+    } else {
+        event.title.clone()
+    };
+    match digest_event_detail(event) {
+        Some(detail) if !detail.is_empty() && !title.contains(&detail) => {
+            format!("{title} · {detail}")
+        }
+        _ => title,
     }
-    event.title.clone()
+}
+
+fn digest_event_detail(event: &MarketEvent) -> Option<String> {
+    match event.kind {
+        EventKind::MacroEvent => {
+            let summary = event.summary.trim();
+            if !summary.is_empty() {
+                Some(summary.to_string())
+            } else {
+                let label = if event.occurred_at > Utc::now() {
+                    "待公布"
+                } else {
+                    "时间"
+                };
+                Some(format!(
+                    "{label} {} UTC+8",
+                    event
+                        .occurred_at
+                        .with_timezone(&FixedOffset::east_opt(8 * 3600)?)
+                        .format("%m-%d %H:%M")
+                ))
+            }
+        }
+        EventKind::EarningsReleased => {
+            let summary = event.summary.trim();
+            (!summary.is_empty()).then(|| summary.to_string())
+        }
+        EventKind::SecFiling { .. } => {
+            // SEC filing 在 digest 里默认只有 form 名 + 日期,信息量近零。
+            // 当 enrichment 写了 llm_summary 时,给 digest 行附上一段 ~120 字
+            // 截断的 LLM 摘要 —— 让 10-Q / 10-K / DEF 14A 这些走 digest 路径
+            // 的 filing 也能看到 长期主线投资者视角的核心要点。原文链接仍在
+            // 事件 url 里,用户点进去可读全文。
+            let summary = event
+                .payload
+                .get("llm_summary")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?;
+            Some(truncate_chars(summary, 120))
+        }
+        _ => None,
+    }
 }
 
 fn first_non_empty_line(text: &str) -> Option<&str> {
@@ -217,7 +270,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 /// 1. **`(EventKind tag, primary_symbol)`** —— 同公司同类事件才有可能算重复,
 ///    跨 ticker 永不合并;
 /// 2. **kind-specific normalized key** —— `EarningsUpcoming` 用 `payload.report_date`
-///    把 "T-3"/"T-2"/"T-1"/"on date" 4 条折成 1 条;`NewsCritical`/`PressRelease`
+///    把 "T-3"/"T-2"/"T-1"/"on date" 4 条折成 1 条;`NewsCritical`
 ///    取 `url` 的 `host+path` 归一化合并多源转载;其它 kind 用 `event.id`。
 ///
 /// 设计选择:不做 LLM 标题相似度去重——成本太高。仅按"明显语义同一"的硬规则压。
@@ -248,7 +301,7 @@ fn dedup_key(ev: &MarketEvent) -> String {
             .and_then(|v| v.as_str())
             .map(String::from)
             .unwrap_or_else(|| ev.id.clone()),
-        EventKind::NewsCritical | EventKind::PressRelease => ev
+        EventKind::NewsCritical => ev
             .url
             .as_deref()
             .filter(|u| !u.is_empty())
@@ -265,19 +318,14 @@ fn kind_tag(kind: &EventKind) -> &'static str {
         EventKind::EarningsReleased => "earnings_released",
         EventKind::EarningsCallTranscript => "earnings_transcript",
         EventKind::NewsCritical => "news",
-        EventKind::PressRelease => "press",
         EventKind::PriceAlert { .. } => "price",
         EventKind::Weekly52High => "week_high",
         EventKind::Weekly52Low => "week_low",
-        EventKind::VolumeSpike => "volume",
         EventKind::Dividend => "dividend",
         EventKind::Split => "split",
-        EventKind::Buyback => "buyback",
         EventKind::SecFiling { .. } => "sec",
         EventKind::AnalystGrade => "grade",
         EventKind::MacroEvent => "macro",
-        EventKind::PortfolioPreMarket => "portfolio_pre",
-        EventKind::PortfolioPostMarket => "portfolio_post",
         EventKind::SocialPost => "social",
     }
 }
@@ -315,6 +363,39 @@ mod tests {
             source: "test".into(),
             payload: serde_json::Value::Null,
         }
+    }
+
+    #[test]
+    fn digest_secfiling_detail_uses_truncated_llm_summary() {
+        let mut e = ev(
+            EventKind::SecFiling {
+                form: "10-Q".into(),
+            },
+            Severity::Medium,
+        );
+        e.title = "TSLA filed 10-Q".into();
+        // 200 字 LLM summary,应被 truncate 到 120 字符 + 省略号
+        let summary = "这份 filing 最值得 长期主线投资者关注的是 GE Vernova 的 backlog 同比增加 25%,其中海上风电订单成为主要驱动,反映客户对长期清洁能源转型的承诺。资本配置方面回购规模放缓,资金转向产能扩张。风险因子新增供应链关键稀土材料的地缘集中度。整体属于建设性季报。";
+        e.payload = serde_json::json!({"llm_summary": summary});
+        let title = digest_event_title(&e);
+        assert!(title.contains("TSLA filed 10-Q · 这份 filing 最值得"));
+        assert!(title.contains("…"), "应被截断,期待省略号; got: {title}");
+    }
+
+    #[test]
+    fn digest_secfiling_without_llm_summary_has_no_detail() {
+        let mut e = ev(
+            EventKind::SecFiling {
+                form: "10-Q".into(),
+            },
+            Severity::Medium,
+        );
+        e.title = "TSLA filed 10-Q".into();
+        e.summary = "2026-04-20".into();
+        e.payload = serde_json::Value::Null;
+        let title = digest_event_title(&e);
+        // 没有 enrichment 时 digest 行就是 title 不带 ·detail
+        assert_eq!(title, "TSLA filed 10-Q");
     }
 
     #[test]

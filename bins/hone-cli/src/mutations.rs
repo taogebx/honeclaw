@@ -93,6 +93,18 @@ pub(crate) struct ChannelSetArgs {
     pub bot_token: Option<String>,
     #[arg(long, value_enum)]
     pub chat_scope: Option<CliChatScope>,
+    /// Comma-separated Telegram/Discord allowlist entries.
+    #[arg(long)]
+    pub allow_from: Option<String>,
+    /// Comma-separated Feishu email allowlist entries.
+    #[arg(long)]
+    pub allow_emails: Option<String>,
+    /// Comma-separated Feishu mobile allowlist entries.
+    #[arg(long)]
+    pub allow_mobiles: Option<String>,
+    /// Comma-separated Feishu open_id allowlist entries.
+    #[arg(long)]
+    pub allow_open_ids: Option<String>,
 }
 
 /// `hone-cli channels enable|disable <channel>` 的参数。
@@ -282,6 +294,39 @@ pub(crate) fn build_channel_mutations(
                     Value::String(value.as_config_value().to_string()),
                 );
             }
+            if let Some(value) = &args.allow_emails {
+                push(
+                    "feishu.allow_emails",
+                    Value::Sequence(
+                        parse_csv_values(value)
+                            .into_iter()
+                            .map(Value::String)
+                            .collect(),
+                    ),
+                );
+            }
+            if let Some(value) = &args.allow_mobiles {
+                push(
+                    "feishu.allow_mobiles",
+                    Value::Sequence(
+                        parse_csv_values(value)
+                            .into_iter()
+                            .map(Value::String)
+                            .collect(),
+                    ),
+                );
+            }
+            if let Some(value) = &args.allow_open_ids {
+                push(
+                    "feishu.allow_open_ids",
+                    Value::Sequence(
+                        parse_csv_values(value)
+                            .into_iter()
+                            .map(Value::String)
+                            .collect(),
+                    ),
+                );
+            }
         }
         ChannelKind::Telegram => {
             if let Some(value) = args.enabled {
@@ -297,6 +342,17 @@ pub(crate) fn build_channel_mutations(
                 push(
                     "telegram.chat_scope",
                     Value::String(value.as_config_value().to_string()),
+                );
+            }
+            if let Some(value) = &args.allow_from {
+                push(
+                    "telegram.allow_from",
+                    Value::Sequence(
+                        parse_csv_values(value)
+                            .into_iter()
+                            .map(Value::String)
+                            .collect(),
+                    ),
                 );
             }
         }
@@ -316,6 +372,17 @@ pub(crate) fn build_channel_mutations(
                     Value::String(value.as_config_value().to_string()),
                 );
             }
+            if let Some(value) = &args.allow_from {
+                push(
+                    "discord.allow_from",
+                    Value::Sequence(
+                        parse_csv_values(value)
+                            .into_iter()
+                            .map(Value::String)
+                            .collect(),
+                    ),
+                );
+            }
         }
     }
 
@@ -333,17 +400,16 @@ pub(crate) fn provider_key_mutation(path: &str, keys: Vec<String>) -> ConfigMuta
     }
 }
 
-/// 同时写 `*.api_keys` 数组,并在有 `legacy_single_key_path` 时清空它,防止
-/// 老字段残留值被运行时当成真 key 使用。
+/// 同时写 `*.api_keys` 数组,并清空指定的单 key 字段,防止老字段残留值被运行时当成真 key 使用。
 pub(crate) fn build_provider_api_key_mutations(
     key_path: &str,
-    legacy_single_key_path: Option<&str>,
+    clear_single_key_paths: &[&str],
     keys: Vec<String>,
 ) -> Vec<ConfigMutation> {
     let mut mutations = vec![provider_key_mutation(key_path, keys)];
-    if let Some(path) = legacy_single_key_path {
+    for path in clear_single_key_paths {
         mutations.push(ConfigMutation::Set {
-            path: path.to_string(),
+            path: (*path).to_string(),
             value: Value::String(String::new()),
         });
     }
@@ -453,6 +519,10 @@ mod tests {
             app_secret: None,
             bot_token: Some("token".to_string()),
             chat_scope: Some(CliChatScope::All),
+            allow_from: None,
+            allow_emails: None,
+            allow_mobiles: None,
+            allow_open_ids: None,
         };
 
         let mutations = build_channel_mutations(&args).unwrap();
@@ -472,6 +542,10 @@ mod tests {
             app_secret: None,
             bot_token: Some("  tg-token  ".to_string()),
             chat_scope: None,
+            allow_from: None,
+            allow_emails: None,
+            allow_mobiles: None,
+            allow_open_ids: None,
         };
         let feishu_args = ChannelSetArgs {
             channel: ChannelKind::Feishu,
@@ -483,6 +557,10 @@ mod tests {
             app_secret: Some("  fs-secret  ".to_string()),
             bot_token: None,
             chat_scope: None,
+            allow_from: None,
+            allow_emails: None,
+            allow_mobiles: None,
+            allow_open_ids: None,
         };
         let discord_args = ChannelSetArgs {
             channel: ChannelKind::Discord,
@@ -494,6 +572,10 @@ mod tests {
             app_secret: None,
             bot_token: Some("  dc-token  ".to_string()),
             chat_scope: None,
+            allow_from: None,
+            allow_emails: None,
+            allow_mobiles: None,
+            allow_open_ids: None,
         };
 
         let telegram_mutations = build_channel_mutations(&telegram_args).unwrap();
@@ -518,10 +600,57 @@ mod tests {
     }
 
     #[test]
+    fn build_channel_mutations_supports_allowlists() {
+        let telegram_args = ChannelSetArgs {
+            channel: ChannelKind::Telegram,
+            enabled: None,
+            target_handle: None,
+            db_path: None,
+            poll_interval: None,
+            app_id: None,
+            app_secret: None,
+            bot_token: None,
+            chat_scope: None,
+            allow_from: Some("123, 456".to_string()),
+            allow_emails: None,
+            allow_mobiles: None,
+            allow_open_ids: None,
+        };
+        let mutations = build_channel_mutations(&telegram_args).unwrap();
+        assert!(mutations.iter().any(|mutation| matches!(
+            mutation,
+            ConfigMutation::Set { path, value: Value::Sequence(values) }
+                if path == "telegram.allow_from" && values.len() == 2
+        )));
+
+        let feishu_args = ChannelSetArgs {
+            channel: ChannelKind::Feishu,
+            enabled: None,
+            target_handle: None,
+            db_path: None,
+            poll_interval: None,
+            app_id: None,
+            app_secret: None,
+            bot_token: None,
+            chat_scope: None,
+            allow_from: None,
+            allow_emails: Some("a@example.com,b@example.com".to_string()),
+            allow_mobiles: Some("+8613800138000".to_string()),
+            allow_open_ids: Some("ou_abc".to_string()),
+        };
+        let mutations = build_channel_mutations(&feishu_args).unwrap();
+        assert!(mutations.iter().any(|mutation| matches!(
+            mutation,
+            ConfigMutation::Set { path, value: Value::Sequence(values) }
+                if path == "feishu.allow_emails" && values.len() == 2
+        )));
+    }
+
+    #[test]
     fn build_provider_api_key_mutations_clears_legacy_fmp_single_key() {
         let mutations = build_provider_api_key_mutations(
             "fmp.api_keys",
-            Some("fmp.api_key"),
+            &["fmp.api_key"],
             vec!["key-a".to_string(), "key-b".to_string()],
         );
 
@@ -549,7 +678,7 @@ mod tests {
     #[test]
     fn build_provider_api_key_mutations_sets_tavily_keys_without_legacy_field() {
         let mutations =
-            build_provider_api_key_mutations("search.api_keys", None, vec!["tvly-1".to_string()]);
+            build_provider_api_key_mutations("search.api_keys", &[], vec!["tvly-1".to_string()]);
 
         assert_eq!(mutations.len(), 1);
         assert!(matches!(

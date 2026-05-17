@@ -10,9 +10,11 @@ use tokio::time::sleep;
 const FEISHU_REQUEST_MAX_ATTEMPTS: usize = 3;
 const FEISHU_RETRY_DELAYS: [Duration; FEISHU_REQUEST_MAX_ATTEMPTS - 1] =
     [Duration::from_millis(500), Duration::from_millis(1500)];
+const FEISHU_INVALID_TOKEN_REFRESH_ATTEMPTS: usize = 2;
+const FEISHU_ERROR_BODY_MAX_CHARS: usize = 500;
 
 #[derive(Clone)]
-pub struct FeishuApiClient {
+pub(crate) struct FeishuApiClient {
     app_id: String,
     app_secret: String,
     http: Client,
@@ -34,21 +36,21 @@ struct TokenRequest<'a> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct FeishuResolvedUser {
+pub(crate) struct FeishuResolvedUser {
     #[serde(default)]
-    pub email: String,
+    pub(crate) email: String,
     #[serde(default)]
-    pub mobile: String,
-    pub open_id: String,
+    pub(crate) mobile: String,
+    pub(crate) open_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct FeishuSendResult {
-    pub message_id: String,
+pub(crate) struct FeishuSendResult {
+    pub(crate) message_id: String,
 }
 
 impl FeishuApiClient {
-    pub fn new(app_id: String, app_secret: String) -> Self {
+    pub(crate) fn new(app_id: String, app_secret: String) -> Self {
         Self {
             app_id,
             app_secret,
@@ -80,7 +82,13 @@ impl FeishuApiClient {
         .map_err(|e| format!("Feishu token request failed: {e}"))?;
 
         if !resp.status().is_success() {
-            return Err(format!("Feishu token auth failed: HTTP {}", resp.status()));
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format_feishu_http_error(
+                "Feishu token auth failed",
+                status,
+                &body,
+            ));
         }
 
         let token_resp: TokenResponse = resp
@@ -105,7 +113,11 @@ impl FeishuApiClient {
         Ok(token)
     }
 
-    pub async fn send_message(
+    async fn clear_token_cache(&self) {
+        *self.token_cache.write().await = None;
+    }
+
+    pub(crate) async fn send_message(
         &self,
         receive_id: &str,
         msg_type: &str,
@@ -116,7 +128,7 @@ impl FeishuApiClient {
             .await
     }
 
-    pub async fn send_chat_message(
+    pub(crate) async fn send_chat_message(
         &self,
         chat_id: &str,
         msg_type: &str,
@@ -135,7 +147,6 @@ impl FeishuApiClient {
         content: &str,
         uuid: Option<&str>,
     ) -> Result<FeishuSendResult, String> {
-        let token = self.get_token().await?;
         let url = format!(
             "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_id_type}"
         );
@@ -153,13 +164,6 @@ impl FeishuApiClient {
             );
         }
 
-        let resp = send_feishu_request_with_retry(
-            self.http.post(&url).bearer_auth(token).json(&body),
-            "Feishu send message request",
-        )
-        .await
-        .map_err(|e| format!("Feishu send message request failed: {e}"))?;
-
         #[derive(Deserialize)]
         struct SendResp {
             code: i64,
@@ -167,32 +171,57 @@ impl FeishuApiClient {
             data: Option<FeishuSendResult>,
         }
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "Feishu send message failed: HTTP {} - {}",
-                status, error_body
-            ));
-        }
-
-        let send_resp: SendResp = resp
-            .json()
+        for attempt in 1..=FEISHU_INVALID_TOKEN_REFRESH_ATTEMPTS {
+            let token = self.get_token().await?;
+            let resp = send_feishu_request_with_retry(
+                self.http.post(&url).bearer_auth(&token).json(&body),
+                "Feishu send message request",
+            )
             .await
-            .map_err(|e| format!("Feishu send message json err: {e}"))?;
-        if send_resp.code != 0 {
-            return Err(format!(
-                "Feishu send message api error {}: {}",
-                send_resp.code, send_resp.msg
-            ));
+            .map_err(|e| format!("Feishu send message request failed: {e}"))?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let error_body = resp.text().await.unwrap_or_default();
+                if should_refresh_feishu_token_for_http_error(status, &error_body)
+                    && should_retry_invalid_token_refresh(attempt)
+                {
+                    self.clear_token_cache().await;
+                    continue;
+                }
+                return Err(format_feishu_http_error(
+                    "Feishu send message failed",
+                    status,
+                    error_body,
+                ));
+            }
+
+            let send_resp: SendResp = resp
+                .json()
+                .await
+                .map_err(|e| format!("Feishu send message json err: {e}"))?;
+            if send_resp.code != 0 {
+                if is_feishu_invalid_access_token_error(send_resp.code, &send_resp.msg)
+                    && should_retry_invalid_token_refresh(attempt)
+                {
+                    self.clear_token_cache().await;
+                    continue;
+                }
+                return Err(format!(
+                    "Feishu send message api error {}: {}",
+                    send_resp.code, send_resp.msg
+                ));
+            }
+
+            return send_resp
+                .data
+                .ok_or_else(|| "No data in send message response".to_string());
         }
 
-        send_resp
-            .data
-            .ok_or_else(|| "No data in send message response".to_string())
+        Err("Feishu send message invalid token refresh exhausted".to_string())
     }
 
-    pub async fn reply_message(
+    pub(crate) async fn reply_message(
         &self,
         message_id: &str,
         msg_type: &str,
@@ -230,9 +259,10 @@ impl FeishuApiClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "Feishu reply message failed: HTTP {} - {}",
-                status, error_body
+            return Err(format_feishu_http_error(
+                "Feishu reply message failed",
+                status,
+                error_body,
             ));
         }
 
@@ -252,7 +282,7 @@ impl FeishuApiClient {
             .ok_or_else(|| "No data in reply message response".to_string())
     }
 
-    pub async fn update_message(
+    pub(crate) async fn update_message(
         &self,
         message_id: &str,
         msg_type: &str,
@@ -282,9 +312,10 @@ impl FeishuApiClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "Feishu update message failed: HTTP {} - {}",
-                status, error_body
+            return Err(format_feishu_http_error(
+                "Feishu update message failed",
+                status,
+                error_body,
             ));
         }
 
@@ -311,7 +342,7 @@ impl FeishuApiClient {
         })
     }
 
-    pub async fn upload_image(&self, path: &str) -> Result<String, String> {
+    pub(crate) async fn upload_image(&self, path: &str) -> Result<String, String> {
         let token = self.get_token().await?;
         let filename = Path::new(path)
             .file_name()
@@ -353,9 +384,10 @@ impl FeishuApiClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "Feishu upload image failed: HTTP {} - {}",
-                status, error_body
+            return Err(format_feishu_http_error(
+                "Feishu upload image failed",
+                status,
+                error_body,
             ));
         }
 
@@ -376,8 +408,7 @@ impl FeishuApiClient {
             .ok_or_else(|| "No image_key in Feishu upload image response".to_string())
     }
 
-    pub async fn resolve_email(&self, email: &str) -> Result<FeishuResolvedUser, String> {
-        let token = self.get_token().await?;
+    pub(crate) async fn resolve_email(&self, email: &str) -> Result<FeishuResolvedUser, String> {
         let url =
             "https://open.feishu.cn/open-apis/contact/v3/users/batch_get_id?user_id_type=open_id";
 
@@ -385,15 +416,6 @@ impl FeishuApiClient {
             "emails": [email]
         });
 
-        let resp = self
-            .http
-            .post(url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Feishu resolve email request failed: {e}"))?;
-
         #[derive(Deserialize)]
         struct BatchGetIdResp {
             code: i64,
@@ -401,30 +423,63 @@ impl FeishuApiClient {
             data: Option<serde_json::Value>,
         }
 
-        let batch_resp: BatchGetIdResp = resp
-            .json()
+        for attempt in 1..=FEISHU_INVALID_TOKEN_REFRESH_ATTEMPTS {
+            let token = self.get_token().await?;
+            let resp = send_feishu_request_with_retry(
+                self.http.post(url).bearer_auth(&token).json(&body),
+                "Feishu resolve email request",
+            )
             .await
-            .map_err(|e| format!("Feishu resolve email json err: {e}"))?;
-        if batch_resp.code != 0 {
-            return Err(format!(
-                "Feishu resolve email api error {}: {}",
-                batch_resp.code, batch_resp.msg
-            ));
+            .map_err(|e| format!("Feishu resolve email request failed: {e}"))?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if should_refresh_feishu_token_for_http_error(status, &body)
+                    && should_retry_invalid_token_refresh(attempt)
+                {
+                    self.clear_token_cache().await;
+                    continue;
+                }
+                return Err(format_feishu_http_error(
+                    "Feishu resolve email failed",
+                    status,
+                    body,
+                ));
+            }
+
+            let batch_resp: BatchGetIdResp = resp
+                .json()
+                .await
+                .map_err(|e| format!("Feishu resolve email json err: {e}"))?;
+            if batch_resp.code != 0 {
+                if is_feishu_invalid_access_token_error(batch_resp.code, &batch_resp.msg)
+                    && should_retry_invalid_token_refresh(attempt)
+                {
+                    self.clear_token_cache().await;
+                    continue;
+                }
+                return Err(format!(
+                    "Feishu resolve email api error {}: {}",
+                    batch_resp.code, batch_resp.msg
+                ));
+            }
+
+            if let Some(user_id) = first_batch_get_open_id(batch_resp.data) {
+                return Ok(FeishuResolvedUser {
+                    email: email.to_string(),
+                    mobile: String::new(),
+                    open_id: user_id,
+                });
+            }
+
+            return Err(format!("No user found for email {}", email));
         }
 
-        if let Some(user_id) = first_batch_get_open_id(batch_resp.data) {
-            return Ok(FeishuResolvedUser {
-                email: email.to_string(),
-                mobile: String::new(),
-                open_id: user_id,
-            });
-        }
-
-        Err(format!("No user found for email {}", email))
+        Err("Feishu resolve email invalid token refresh exhausted".to_string())
     }
 
-    pub async fn resolve_mobile(&self, mobile: &str) -> Result<FeishuResolvedUser, String> {
-        let token = self.get_token().await?;
+    pub(crate) async fn resolve_mobile(&self, mobile: &str) -> Result<FeishuResolvedUser, String> {
         let url =
             "https://open.feishu.cn/open-apis/contact/v3/users/batch_get_id?user_id_type=open_id";
 
@@ -432,15 +487,6 @@ impl FeishuApiClient {
             "mobiles": [mobile]
         });
 
-        let resp = self
-            .http
-            .post(url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Feishu resolve mobile request failed: {e}"))?;
-
         #[derive(Deserialize)]
         struct BatchGetIdResp {
             code: i64,
@@ -448,29 +494,63 @@ impl FeishuApiClient {
             data: Option<serde_json::Value>,
         }
 
-        let batch_resp: BatchGetIdResp = resp
-            .json()
+        for attempt in 1..=FEISHU_INVALID_TOKEN_REFRESH_ATTEMPTS {
+            let token = self.get_token().await?;
+            let resp = send_feishu_request_with_retry(
+                self.http.post(url).bearer_auth(&token).json(&body),
+                "Feishu resolve mobile request",
+            )
             .await
-            .map_err(|e| format!("Feishu resolve mobile json err: {e}"))?;
-        if batch_resp.code != 0 {
-            return Err(format!(
-                "Feishu resolve mobile api error {}: {}",
-                batch_resp.code, batch_resp.msg
-            ));
+            .map_err(|e| format!("Feishu resolve mobile request failed: {e}"))?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if should_refresh_feishu_token_for_http_error(status, &body)
+                    && should_retry_invalid_token_refresh(attempt)
+                {
+                    self.clear_token_cache().await;
+                    continue;
+                }
+                return Err(format_feishu_http_error(
+                    "Feishu resolve mobile failed",
+                    status,
+                    body,
+                ));
+            }
+
+            let batch_resp: BatchGetIdResp = resp
+                .json()
+                .await
+                .map_err(|e| format!("Feishu resolve mobile json err: {e}"))?;
+            if batch_resp.code != 0 {
+                if is_feishu_invalid_access_token_error(batch_resp.code, &batch_resp.msg)
+                    && should_retry_invalid_token_refresh(attempt)
+                {
+                    self.clear_token_cache().await;
+                    continue;
+                }
+                return Err(format!(
+                    "Feishu resolve mobile api error {}: {}",
+                    batch_resp.code, batch_resp.msg
+                ));
+            }
+
+            if let Some(user_id) = first_batch_get_open_id(batch_resp.data) {
+                return Ok(FeishuResolvedUser {
+                    mobile: mobile.to_string(),
+                    email: String::new(),
+                    open_id: user_id,
+                });
+            }
+
+            return Err(format!("No user found for mobile {}", mobile));
         }
 
-        if let Some(user_id) = first_batch_get_open_id(batch_resp.data) {
-            return Ok(FeishuResolvedUser {
-                mobile: mobile.to_string(),
-                email: String::new(),
-                open_id: user_id,
-            });
-        }
-
-        Err(format!("No user found for mobile {}", mobile))
+        Err("Feishu resolve mobile invalid token refresh exhausted".to_string())
     }
 
-    pub async fn download_resource(
+    pub(crate) async fn download_resource(
         &self,
         message_id: &str,
         file_key: &str,
@@ -511,67 +591,12 @@ impl FeishuApiClient {
 
     // ── CardKit API ──────────────────────────────────────────────────────────
     // 飞书 CardKit 是独立的流式卡片 API，与普通消息更新 API 完全分离：
-    //   POST   /cardkit/v1/cards                          — 创建卡片实体
     //   PUT    /cardkit/v1/cards/{id}/elements/{eid}/content — 更新单个元素内容
     //   PATCH  /cardkit/v1/cards/{id}/settings            — 修改卡片配置（关闭流式）
 
-    /// 创建 CardKit 卡片实体，返回 `card_id`。
-    /// `card_json` 为完整卡片 JSON 字符串（schema 2.0）。
-    /// 当前流程已改为直接发普通卡片+ticker，此方法预留供后续 CardKit 流式迭代使用。
-    #[allow(dead_code)]
-    pub async fn create_card(&self, card_json: &str) -> Result<String, String> {
-        let token = self.get_token().await?;
-        let url = "https://open.feishu.cn/open-apis/cardkit/v1/cards";
-
-        let body = serde_json::json!({
-            "type": "card_json",
-            "data": card_json,
-        });
-
-        let resp = self
-            .http
-            .post(url)
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("CardKit create card request failed: {e}"))?;
-
-        #[derive(Deserialize)]
-        struct CreateResp {
-            code: i64,
-            msg: String,
-            data: Option<CardCreateData>,
-        }
-        #[derive(Deserialize)]
-        struct CardCreateData {
-            card_id: String,
-        }
-
-        if !resp.status().is_success() {
-            return Err(format!("CardKit create card HTTP {}", resp.status()));
-        }
-
-        let create_resp: CreateResp = resp
-            .json()
-            .await
-            .map_err(|e| format!("CardKit create card json err: {e}"))?;
-        if create_resp.code != 0 {
-            return Err(format!(
-                "CardKit create card api error {}: {}",
-                create_resp.code, create_resp.msg
-            ));
-        }
-
-        create_resp
-            .data
-            .map(|d| d.card_id)
-            .ok_or_else(|| "CardKit create card: no card_id in response".to_string())
-    }
-
     /// 更新 CardKit 卡片中指定元素（`element_id`）的 `content` 字段。
     /// `sequence` 必须严格递增；`uuid` 用于幂等去重。
-    pub async fn update_card_element(
+    pub(crate) async fn update_card_element(
         &self,
         card_id: &str,
         element_id: &str,
@@ -602,9 +627,10 @@ impl FeishuApiClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "CardKit update element HTTP {} - {}",
-                status, body_text
+            return Err(format_feishu_http_error(
+                "CardKit update element failed",
+                status,
+                body_text,
             ));
         }
 
@@ -624,7 +650,7 @@ impl FeishuApiClient {
     }
 
     /// 关闭 CardKit 卡片的流式模式，并设置 summary（用于折叠预览）。
-    pub async fn close_card_streaming(
+    pub(crate) async fn close_card_streaming(
         &self,
         card_id: &str,
         summary: &str,
@@ -661,9 +687,10 @@ impl FeishuApiClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "CardKit close streaming HTTP {} - {}",
-                status, body_text
+            return Err(format_feishu_http_error(
+                "CardKit close streaming failed",
+                status,
+                body_text,
             ));
         }
 
@@ -681,7 +708,10 @@ impl FeishuApiClient {
         }
     }
 
-    pub async fn get_user_by_open_id(&self, open_id: &str) -> Result<FeishuResolvedUser, String> {
+    pub(crate) async fn get_user_by_open_id(
+        &self,
+        open_id: &str,
+    ) -> Result<FeishuResolvedUser, String> {
         let token = self.get_token().await?;
         let url = format!(
             "https://open.feishu.cn/open-apis/contact/v3/users/{open_id}?user_id_type=open_id"
@@ -696,7 +726,13 @@ impl FeishuApiClient {
             .map_err(|e| format!("Feishu get user request failed: {e}"))?;
 
         if !resp.status().is_success() {
-            return Err(format!("Feishu get user failed: HTTP {}", resp.status()));
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format_feishu_http_error(
+                "Feishu get user failed",
+                status,
+                body,
+            ));
         }
 
         let json: serde_json::Value = resp
@@ -786,6 +822,72 @@ fn should_retry_feishu_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+fn should_retry_invalid_token_refresh(attempt: usize) -> bool {
+    attempt < FEISHU_INVALID_TOKEN_REFRESH_ATTEMPTS
+}
+
+fn should_refresh_feishu_token_for_http_error(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::UNAUTHORIZED || contains_invalid_access_token_text(body)
+}
+
+fn is_feishu_invalid_access_token_error(code: i64, msg: &str) -> bool {
+    matches!(code, 99991663 | 99991668) || contains_invalid_access_token_text(msg)
+}
+
+fn contains_invalid_access_token_text(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    normalized.contains("invalid access token")
+        || normalized.contains("access token invalid")
+        || normalized.contains("tenant_access_token invalid")
+}
+
+fn format_feishu_http_error(action: &str, status: StatusCode, body: impl AsRef<str>) -> String {
+    let detail = extract_feishu_error_detail(body.as_ref());
+    if detail.is_empty() {
+        format!("{action}: HTTP {status} (empty response body)")
+    } else {
+        format!("{action}: HTTP {status} - {detail}")
+    }
+}
+
+fn extract_feishu_error_detail(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return truncate_feishu_error_body(trimmed);
+    };
+    let error = value.get("error").unwrap_or(&value);
+    let message = error
+        .get("message")
+        .or_else(|| error.get("msg"))
+        .or_else(|| error.get("detail"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| truncate_feishu_error_body(trimmed));
+    let code = error.get("code").or_else(|| value.get("code"));
+    match code {
+        Some(serde_json::Value::String(code)) if !code.is_empty() => {
+            format!("{message} (code: {code})")
+        }
+        Some(serde_json::Value::Number(code)) => format!("{message} (code: {code})"),
+        _ => message,
+    }
+}
+
+fn truncate_feishu_error_body(text: &str) -> String {
+    if text.chars().count() <= FEISHU_ERROR_BODY_MAX_CHARS {
+        return text.to_string();
+    }
+    text.chars()
+        .take(FEISHU_ERROR_BODY_MAX_CHARS)
+        .collect::<String>()
+        + "..."
+}
+
 fn image_mime_type(path: &str) -> &'static str {
     match Path::new(path)
         .extension()
@@ -816,7 +918,12 @@ fn first_batch_get_open_id(data: Option<serde_json::Value>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{feishu_retry_delay, first_batch_get_open_id, should_retry_feishu_status};
+    use super::{
+        FEISHU_ERROR_BODY_MAX_CHARS, feishu_retry_delay, first_batch_get_open_id,
+        format_feishu_http_error, is_feishu_invalid_access_token_error,
+        should_refresh_feishu_token_for_http_error, should_retry_feishu_status,
+        should_retry_invalid_token_refresh,
+    };
     use reqwest::StatusCode;
     use serde_json::json;
     use std::time::Duration;
@@ -859,5 +966,79 @@ mod tests {
         assert_eq!(feishu_retry_delay(1), Duration::from_millis(500));
         assert_eq!(feishu_retry_delay(2), Duration::from_millis(1500));
         assert_eq!(feishu_retry_delay(99), Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn contact_lookup_json_request_is_cloneable_for_retry() {
+        let client = reqwest::Client::new();
+        let request = client
+            .post("https://open.feishu.cn/open-apis/contact/v3/users/batch_get_id")
+            .bearer_auth("token")
+            .json(&json!({ "mobiles": ["+8613800138000"] }));
+
+        assert!(request.try_clone().is_some());
+    }
+
+    #[test]
+    fn invalid_access_token_errors_trigger_one_cache_refresh() {
+        assert!(is_feishu_invalid_access_token_error(
+            99991663,
+            "Invalid access token"
+        ));
+        assert!(is_feishu_invalid_access_token_error(
+            0,
+            "tenant_access_token invalid"
+        ));
+        assert!(should_refresh_feishu_token_for_http_error(
+            StatusCode::UNAUTHORIZED,
+            ""
+        ));
+        assert!(should_refresh_feishu_token_for_http_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"msg":"Invalid access token"}"#
+        ));
+        assert!(should_retry_invalid_token_refresh(1));
+        assert!(!should_retry_invalid_token_refresh(2));
+        assert!(!is_feishu_invalid_access_token_error(
+            99992361,
+            "open_id cross app"
+        ));
+    }
+
+    #[test]
+    fn feishu_http_error_extracts_message_and_code() {
+        let message = format_feishu_http_error(
+            "Feishu send message failed",
+            StatusCode::BAD_REQUEST,
+            r#"{"code":99991663,"msg":"Invalid access token","debug":"ignored"}"#,
+        );
+        assert_eq!(
+            message,
+            "Feishu send message failed: HTTP 400 Bad Request - Invalid access token (code: 99991663)"
+        );
+    }
+
+    #[test]
+    fn feishu_http_error_marks_empty_body() {
+        let message =
+            format_feishu_http_error("CardKit create card failed", StatusCode::BAD_GATEWAY, " ");
+        assert_eq!(
+            message,
+            "CardKit create card failed: HTTP 502 Bad Gateway (empty response body)"
+        );
+    }
+
+    #[test]
+    fn feishu_http_error_truncates_unstructured_body() {
+        let body = "x".repeat(FEISHU_ERROR_BODY_MAX_CHARS + 10);
+        let message =
+            format_feishu_http_error("Feishu upload image failed", StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            message,
+            format!(
+                "Feishu upload image failed: HTTP 400 Bad Request - {}...",
+                "x".repeat(FEISHU_ERROR_BODY_MAX_CHARS)
+            )
+        );
     }
 }

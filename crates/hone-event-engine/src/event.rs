@@ -32,24 +32,34 @@ pub enum EventKind {
     EarningsReleased,
     EarningsCallTranscript,
     NewsCritical,
-    PressRelease,
+    /// `window` 取值约定:
+    /// - `"day"`   — 常规盘中 PricePoller 产出(`changesPercentage` = 当日涨跌幅)
+    /// - `"close"` — 收盘 quote 命中(美股 ET 16:00 附近,`policy::is_price_close_alert`
+    ///   据此判 quiet_mode 不允许立即推)
+    /// - `"pre"` / `"post"` — ExtendedHoursPoller 产出(盘前/盘后 30min 振幅,
+    ///   `changesPercentage` 是带方向的振幅幅度)
+    ///
+    /// **关键不变量**:`window != "close"` 在 `policy::quiet_mode_allows_immediate`
+    /// 里被允许在 quiet_mode 即时推 —— pre/post 自然继承这条策略,quiet_hours 仍
+    /// 走 hold→Fix #2 overnight recap。
     PriceAlert {
         pct_change_bps: i64,
         window: String,
     },
     Weekly52High,
     Weekly52Low,
-    VolumeSpike,
     Dividend,
     Split,
-    Buyback,
+    /// SEC EDGAR filing。form 取值与 FMP `/v3/sec_filings` 的 `type` 字段对齐
+    /// (如 `"8-K"` / `"10-Q"` / `"10-K"` / `"S-1"` / `"DEF 14A"`)。
+    /// Severity 由 `pollers::corp_action::events_from_sec_filings` 按 form 映射。
+    /// payload 里可能存在 `"llm_summary"` 字符串字段(由 `pollers::sec_enrichment`
+    /// 写入,~200 字长期主线投资者视角中文摘要),renderer 优先渲染该字段。
     SecFiling {
         form: String,
     },
     AnalystGrade,
     MacroEvent,
-    PortfolioPreMarket,
-    PortfolioPostMarket,
     /// 第三方社交源帖子 (Telegram channel 等)。severity 默认 Low,
     /// router 的 LLM 仲裁链路按 `payload.source_class == "uncertain"` 决定是否升 Medium。
     SocialPost,
@@ -61,25 +71,19 @@ impl EventKind {
     /// 隔夜仍有阅读价值）。原则：**仅盘中市场微观状态会过期**。
     pub fn shelf_life(&self) -> Option<Duration> {
         match self {
-            // 盘中价格/成交量微观状态：过夜失效
-            EventKind::PriceAlert { .. } | EventKind::VolumeSpike => Some(Duration::hours(2)),
+            // 盘中价格微观状态：过夜失效
+            EventKind::PriceAlert { .. } => Some(Duration::hours(2)),
             // 52 周高低虽然技术性强，跨开盘后仍能用一段时间
             EventKind::Weekly52High | EventKind::Weekly52Low => Some(Duration::hours(8)),
             // 社交流热度衰减快，但少数 trusted 源也可能值得隔夜看
             EventKind::SocialPost => Some(Duration::hours(12)),
-            // PortfolioPre/Post 本身就是窗口聚合产物，过窗口失效
-            EventKind::PortfolioPreMarket | EventKind::PortfolioPostMarket => {
-                Some(Duration::hours(6))
-            }
             // 事实性事件 —— 永不过期
             EventKind::EarningsUpcoming
             | EventKind::EarningsReleased
             | EventKind::EarningsCallTranscript
             | EventKind::NewsCritical
-            | EventKind::PressRelease
             | EventKind::Dividend
             | EventKind::Split
-            | EventKind::Buyback
             | EventKind::SecFiling { .. }
             | EventKind::AnalystGrade
             | EventKind::MacroEvent => None,
@@ -123,6 +127,15 @@ pub fn is_noop_analyst_grade(event: &MarketEvent) -> bool {
     if !matches!(event.kind, EventKind::AnalystGrade) {
         return false;
     }
+    if analyst_grade_has_target_change(event) {
+        return false;
+    }
+    let previous = normalized_grade(event.payload.get("previousGrade").and_then(|v| v.as_str()));
+    let new = normalized_grade(event.payload.get("newGrade").and_then(|v| v.as_str()));
+    if new.is_empty() || previous != new {
+        return false;
+    }
+
     let action = event
         .payload
         .get("action")
@@ -130,12 +143,54 @@ pub fn is_noop_analyst_grade(event: &MarketEvent) -> bool {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    if !matches!(action.as_str(), "hold" | "maintained" | "reiterated") {
-        return false;
+    matches!(
+        action.as_str(),
+        "hold" | "maintained" | "reiterated" | "downgrade" | "upgrade" | "initiated" | "initialise"
+    )
+}
+
+fn analyst_grade_has_target_change(event: &MarketEvent) -> bool {
+    let news_title = event
+        .payload
+        .get("newsTitle")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    news_title.contains("price target raised")
+        || news_title.contains("price target lowered")
+        || news_title.contains("target raised")
+        || news_title.contains("target lowered")
+        || target_field_changed(event)
+}
+
+fn target_field_changed(event: &MarketEvent) -> bool {
+    let old = first_payload_f64(
+        &event.payload,
+        &[
+            "previousPriceTarget",
+            "oldPriceTarget",
+            "previousTargetPrice",
+            "oldTargetPrice",
+        ],
+    );
+    let new = first_payload_f64(
+        &event.payload,
+        &[
+            "newPriceTarget",
+            "priceTarget",
+            "targetPrice",
+            "newTargetPrice",
+        ],
+    );
+    match (old, new) {
+        (Some(old), Some(new)) => (old - new).abs() > f64::EPSILON,
+        _ => false,
     }
-    let previous = normalized_grade(event.payload.get("previousGrade").and_then(|v| v.as_str()));
-    let new = normalized_grade(event.payload.get("newGrade").and_then(|v| v.as_str()));
-    !new.is_empty() && previous == new
+}
+
+fn first_payload_f64(payload: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| payload.get(*key).and_then(|v| v.as_f64()))
 }
 
 fn normalized_grade(raw: Option<&str>) -> String {
@@ -163,10 +218,6 @@ mod tests {
             Some(Duration::hours(2))
         );
         assert_eq!(
-            EventKind::VolumeSpike.shelf_life(),
-            Some(Duration::hours(2))
-        );
-        assert_eq!(
             EventKind::Weekly52High.shelf_life(),
             Some(Duration::hours(8))
         );
@@ -178,24 +229,14 @@ mod tests {
             EventKind::SocialPost.shelf_life(),
             Some(Duration::hours(12))
         );
-        assert_eq!(
-            EventKind::PortfolioPreMarket.shelf_life(),
-            Some(Duration::hours(6))
-        );
-        assert_eq!(
-            EventKind::PortfolioPostMarket.shelf_life(),
-            Some(Duration::hours(6))
-        );
 
         // 事实性事件 → None,永不过期
         assert_eq!(EventKind::EarningsReleased.shelf_life(), None);
         assert_eq!(EventKind::EarningsUpcoming.shelf_life(), None);
         assert_eq!(EventKind::EarningsCallTranscript.shelf_life(), None);
         assert_eq!(EventKind::NewsCritical.shelf_life(), None);
-        assert_eq!(EventKind::PressRelease.shelf_life(), None);
         assert_eq!(EventKind::Dividend.shelf_life(), None);
         assert_eq!(EventKind::Split.shelf_life(), None);
-        assert_eq!(EventKind::Buyback.shelf_life(), None);
         assert_eq!(
             EventKind::SecFiling { form: "8-K".into() }.shelf_life(),
             None
@@ -281,6 +322,32 @@ mod tests {
     }
 
     #[test]
+    fn detects_noop_analyst_grade_dirty_downgrade_label() {
+        let ev = MarketEvent {
+            id: "grade:AMD:test".into(),
+            kind: EventKind::AnalystGrade,
+            severity: Severity::High,
+            symbols: vec!["AMD".into()],
+            occurred_at: Utc::now(),
+            title: "AMD · Oppenheimer 下调至 Perform（原 Perform）".into(),
+            summary: "Perform → Perform".into(),
+            url: Some("https://thefly.com/ajax/news_get.php?id=4346982".into()),
+            source: "fmp.upgrades_downgrades".into(),
+            payload: serde_json::json!({
+                "action": "downgrade",
+                "previousGrade": "Perform",
+                "newGrade": "Perform",
+                "newsURL": "https://thefly.com/ajax/news_get.php?id=4346982"
+            }),
+        };
+
+        assert!(
+            is_noop_analyst_grade(&ev),
+            "same-rating dirty downgrade rows should not force immediate delivery"
+        );
+    }
+
+    #[test]
     fn target_change_with_same_rating_is_not_noop_grade() {
         let ev = MarketEvent {
             id: "grade:GEV:test".into(),
@@ -296,6 +363,29 @@ mod tests {
                 "action": "target-raised",
                 "previousGrade": "Outperform",
                 "newGrade": "Outperform"
+            }),
+        };
+
+        assert!(!is_noop_analyst_grade(&ev));
+    }
+
+    #[test]
+    fn target_change_news_title_with_hold_action_is_not_noop_grade() {
+        let ev = MarketEvent {
+            id: "grade:GOOGL:test".into(),
+            kind: EventKind::AnalystGrade,
+            severity: Severity::Low,
+            symbols: vec!["GOOGL".into()],
+            occurred_at: Utc::now(),
+            title: "GOOGL · Barclays hold · Overweight".into(),
+            summary: "Overweight → Overweight".into(),
+            url: None,
+            source: "fmp.upgrades_downgrades".into(),
+            payload: serde_json::json!({
+                "action": "hold",
+                "previousGrade": "Overweight",
+                "newGrade": "Overweight",
+                "newsTitle": "Alphabet price target raised to $405 from $360 at Barclays"
             }),
         };
 

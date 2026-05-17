@@ -72,12 +72,12 @@ impl EventDeduper for PassThroughDeduper {
         &self,
         candidates: Vec<GlobalDigestCandidate>,
     ) -> (Vec<GlobalDigestCandidate>, DedupeStats, Vec<ClusterAudit>) {
-        let n = candidates.len();
+        let candidate_count = candidates.len();
         (
             candidates,
             DedupeStats {
-                input: n,
-                clusters: n,
+                input: candidate_count,
+                clusters: candidate_count,
                 multi_clusters: 0,
                 silent_drops_recovered: 0,
                 fell_back_to_pass_through: false,
@@ -102,14 +102,20 @@ impl LlmEventDeduper {
     }
 
     fn build_prompt(candidates: &[GlobalDigestCandidate]) -> String {
-        let cand_block: String = candidates
+        let candidate_block: String = candidates
             .iter()
             .enumerate()
-            .map(|(i, c)| format!("[{i}] {}", truncate(&c.event.title, 120)))
+            .map(|(candidate_index, candidate)| {
+                format!(
+                    "[{candidate_index}] {}",
+                    truncate(&candidate.event.title, 120)
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
+        let candidate_count = candidates.len();
         format!(
-            "把下面 {n} 条新闻分组,**目标是 event-level cluster,不是 theme-level**。\n\
+            "把下面 {candidate_count} 条新闻分组,**目标是 event-level cluster,不是 theme-level**。\n\
              \n\
              **event-cluster 的定义**:\n\
              1. 同一具体真实事件的多篇报道(同一组 actor、同一时间窗口内的同一行动)= 同一 cluster\n\
@@ -128,8 +134,7 @@ impl LlmEventDeduper {
              {{\"clusters\":[{{\"id\":\"some-event-id\",\"items\":[0,3,7]}},...]}}\n\
              \n\
              候选:\n\
-             {cand_block}\n",
-            n = candidates.len()
+             {candidate_block}\n"
         )
     }
 }
@@ -159,25 +164,26 @@ impl EventDeduper for LlmEventDeduper {
         let messages = vec![Message {
             role: "user".into(),
             content: Some(prompt),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
         }];
 
-        let resp = match self.provider.chat(&messages, Some(&self.model)).await {
-            Ok(r) => r,
+        let llm_response = match self.provider.chat(&messages, Some(&self.model)).await {
+            Ok(response) => response,
             Err(e) => {
                 tracing::warn!(model = %self.model, "event_dedupe LLM call failed: {e}; falling back to pass-through");
                 return pass_through(candidates, true);
             }
         };
 
-        let parsed: DedupResponse = match parse_dedupe_json(&resp.content) {
+        let parsed: DedupResponse = match parse_dedupe_json(&llm_response.content) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(
                     model = %self.model,
-                    raw_prefix = %resp.content.chars().take(160).collect::<String>(),
+                    raw_prefix = %llm_response.content.chars().take(160).collect::<String>(),
                     "event_dedupe JSON parse failed: {e}; falling back to pass-through"
                 );
                 return pass_through(candidates, true);
@@ -187,26 +193,26 @@ impl EventDeduper for LlmEventDeduper {
         // 收集 grok 覆盖的 idx,缺的当 singleton 补回(grok 偶尔丢条)
         let mut covered: Vec<bool> = vec![false; input_n];
         let mut clusters: Vec<(String, Vec<usize>)> = Vec::with_capacity(parsed.clusters.len());
-        for c in parsed.clusters {
-            let valid_items: Vec<usize> = c
+        for cluster in parsed.clusters {
+            let valid_items: Vec<usize> = cluster
                 .items
                 .iter()
                 .copied()
-                .filter(|i| *i < input_n && !covered[*i])
+                .filter(|candidate_index| *candidate_index < input_n && !covered[*candidate_index])
                 .collect();
-            for i in &valid_items {
-                covered[*i] = true;
+            for candidate_index in &valid_items {
+                covered[*candidate_index] = true;
             }
             if !valid_items.is_empty() {
-                clusters.push((c.id, valid_items));
+                clusters.push((cluster.id, valid_items));
             }
         }
         let mut silent_drops = 0;
-        for (i, c) in covered.iter().enumerate() {
-            if !*c {
+        for (candidate_index, is_covered) in covered.iter().enumerate() {
+            if !*is_covered {
                 silent_drops += 1;
-                let id = format!("recovered-singleton-{i}");
-                clusters.push((id, vec![i]));
+                let id = format!("recovered-singleton-{candidate_index}");
+                clusters.push((id, vec![candidate_index]));
             }
         }
 
@@ -219,8 +225,8 @@ impl EventDeduper for LlmEventDeduper {
         sorted_clusters.sort_by_key(|(_, items)| *items.iter().min().unwrap_or(&0));
         for (id, items) in sorted_clusters {
             let rep_local_idx = pick_representative_idx(&candidates, &items);
-            let rep = candidates[rep_local_idx].clone();
-            let kept_event_id = rep.event.id.clone();
+            let representative = candidates[rep_local_idx].clone();
+            let kept_event_id = representative.event.id.clone();
             let merged: Vec<String> = items
                 .iter()
                 .filter(|i| **i != rep_local_idx)
@@ -234,7 +240,7 @@ impl EventDeduper for LlmEventDeduper {
                 kept_event_id,
                 merged_event_ids: merged,
             });
-            reps.push(rep);
+            reps.push(representative);
         }
 
         (
@@ -255,12 +261,12 @@ fn pass_through(
     candidates: Vec<GlobalDigestCandidate>,
     failed: bool,
 ) -> (Vec<GlobalDigestCandidate>, DedupeStats, Vec<ClusterAudit>) {
-    let n = candidates.len();
+    let candidate_count = candidates.len();
     (
         candidates,
         DedupeStats {
-            input: n,
-            clusters: n,
+            input: candidate_count,
+            clusters: candidate_count,
             multi_clusters: 0,
             silent_drops_recovered: 0,
             fell_back_to_pass_through: failed,
@@ -273,21 +279,22 @@ fn pass_through(
 fn pick_representative_idx(candidates: &[GlobalDigestCandidate], items: &[usize]) -> usize {
     *items
         .iter()
-        .max_by(|a, b| {
-            let ca = &candidates[**a];
-            let cb = &candidates[**b];
-            let trust_a = matches!(ca.source_class, NewsSourceClass::Trusted) as u8;
-            let trust_b = matches!(cb.source_class, NewsSourceClass::Trusted) as u8;
-            // 注意:这里用 Greater = a 更优;max_by 返回最大者
+        .max_by(|left_index, right_index| {
+            let left_candidate = &candidates[**left_index];
+            let right_candidate = &candidates[**right_index];
+            let left_trust = matches!(left_candidate.source_class, NewsSourceClass::Trusted) as u8;
+            let right_trust =
+                matches!(right_candidate.source_class, NewsSourceClass::Trusted) as u8;
+            // 注意:这里用 Greater = left 更优;max_by 返回最大者
             (
-                trust_a,
-                ca.event.summary.len(),
-                ca.event.occurred_at.timestamp(),
+                left_trust,
+                left_candidate.event.summary.len(),
+                left_candidate.event.occurred_at.timestamp(),
             )
                 .cmp(&(
-                    trust_b,
-                    cb.event.summary.len(),
-                    cb.event.occurred_at.timestamp(),
+                    right_trust,
+                    right_candidate.event.summary.len(),
+                    right_candidate.event.occurred_at.timestamp(),
                 ))
         })
         .unwrap_or(&items[0])
@@ -299,21 +306,21 @@ pub(crate) fn parse_dedupe_json(content: &str) -> anyhow::Result<DedupResponse> 
     serde_json::from_str(&cleaned).map_err(|e| anyhow::anyhow!("parse: {e}"))
 }
 
-fn strip_fence(s: &str) -> String {
-    let s = s.trim();
-    if let Some(rest) = s.strip_prefix("```") {
+fn strip_fence(raw_content: &str) -> String {
+    let trimmed_content = raw_content.trim();
+    if let Some(rest) = trimmed_content.strip_prefix("```") {
         let rest = rest.trim_start_matches("json").trim_start_matches('\n');
         if let Some(end) = rest.rfind("```") {
             return rest[..end].trim().to_string();
         }
     }
     // 找 JSON 主体的起止 brace
-    if let (Some(start), Some(end)) = (s.find('{'), s.rfind('}')) {
-        if end > start {
-            return s[start..=end].to_string();
-        }
+    if let (Some(start), Some(end)) = (trimmed_content.find('{'), trimmed_content.rfind('}'))
+        && end > start
+    {
+        return trimmed_content[start..=end].to_string();
     }
-    s.to_string()
+    trimmed_content.to_string()
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -695,8 +702,9 @@ mod tests {
 
     #[test]
     fn parse_dedupe_json_handles_prose_wrapping() {
-        let raw = "Sure, here is the JSON:\n{\"clusters\":[{\"id\":\"x\",\"items\":[0]}]}\nThanks!";
-        let parsed = parse_dedupe_json(raw).unwrap();
+        let prose_wrapped_json =
+            "Sure, here is the JSON:\n{\"clusters\":[{\"id\":\"x\",\"items\":[0]}]}\nThanks!";
+        let parsed = parse_dedupe_json(prose_wrapped_json).unwrap();
         assert_eq!(parsed.clusters.len(), 1);
     }
 }

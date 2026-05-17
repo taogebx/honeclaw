@@ -1,6 +1,6 @@
 //! `HoneBotCore` 的回归测试。
 //!
-//! 覆盖三组场景:
+//! 覆盖四组场景:
 //! - 管理员运行时注册 (`/register-admin`) 的白名单 / 口令 / 作用域判定;
 //! - `is_admin*` 对各渠道 actor 的识别;
 //! - `create_tool_registry` 的 actor-scoped 工具注入;
@@ -146,7 +146,7 @@ fn report_intercept_parses_company_name_and_progress() {
         parse_report_intercept("/report progress"),
         Some(ReportIntercept::Progress)
     );
-    assert_eq!(parse_report_intercept("/report"), None);
+    assert!(parse_report_intercept("/report").is_none());
 }
 
 #[test]

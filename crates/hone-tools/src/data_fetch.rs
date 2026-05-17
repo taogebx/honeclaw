@@ -11,6 +11,8 @@ use serde_json::Value;
 
 use crate::base::{Tool, ToolParameter};
 
+const MAX_FMP_TRANSPORT_ERROR_CHARS: usize = 300;
+
 /// DataFetchTool — 金融数据获取（FMP，多 Key fallback）
 pub struct DataFetchTool {
     /// 有效 API Key 列表（过滤空值、去重后）
@@ -25,7 +27,7 @@ impl DataFetchTool {
         let pool = hone_core::ApiKeyPool::new(keys);
         Self {
             keys: pool.keys().to_vec(),
-            base_url: Self::normalize_base_url(base_url),
+            base_url: base_url.trim_end_matches('/').to_string(),
             timeout,
             http: reqwest::Client::new(),
         }
@@ -35,20 +37,10 @@ impl DataFetchTool {
         let pool = config.fmp.effective_key_pool();
         Self {
             keys: pool.keys().to_vec(),
-            base_url: Self::normalize_base_url(&config.fmp.base_url),
+            base_url: config.fmp.base_url.trim_end_matches('/').to_string(),
             timeout: config.fmp.timeout,
             http: reqwest::Client::new(),
         }
-    }
-
-    // FMP 在 2025-08-31 后废弃 /api/v{3,4}/*, 全部迁到 /stable/*. 这里把 base_url 末尾的 /api 剥掉,
-    // 让旧 config (base_url = ".../api") 和新 config (base_url = ".../") 都能拼出 .../stable/* 路径.
-    fn normalize_base_url(raw: &str) -> String {
-        let mut base = raw.trim_end_matches('/').to_string();
-        if let Some(stripped) = base.strip_suffix("/api") {
-            base = stripped.to_string();
-        }
-        base.trim_end_matches('/').to_string()
     }
 
     /// 用指定 key 执行一次 FMP 请求
@@ -56,21 +48,24 @@ impl DataFetchTool {
         let connector = if url.contains('?') { "&" } else { "?" };
         let full_url = format!("{}{connector}apikey={}", url, key);
 
-        let resp = self
+        let response = self
             .http
             .get(&full_url)
             .timeout(std::time::Duration::from_secs(self.timeout))
             .send()
             .await
-            .map_err(|e| format!("FMP API 请求失败: {e}"))?;
+            .map_err(|e| format_fmp_transport_error("请求", &e))?;
 
-        let status = resp.status();
-        let body = resp
+        let status = response.status();
+        let body = response
             .text()
             .await
-            .map_err(|e| format!("FMP 响应读取失败: {e}"))?;
-        let data: Value = serde_json::from_str(&body).map_err(|e| {
-            let prefix = body.chars().take(200).collect::<String>();
+            .map_err(|e| format_fmp_transport_error("响应读取", &e))?;
+        let response_json: Value = serde_json::from_str(&body).map_err(|e| {
+            let prefix = sanitize_fmp_error_detail(&body)
+                .chars()
+                .take(200)
+                .collect::<String>();
             format!("FMP JSON 解析失败: {e}; body_prefix={prefix}")
         })?;
 
@@ -80,56 +75,52 @@ impl DataFetchTool {
         }
 
         // FMP 在 HTTP 200 时也可能返回认证错误（"Error Message" 字段）
-        if let Some(err_msg) = data.get("Error Message").and_then(|v| v.as_str()) {
+        if let Some(err_msg) = response_json
+            .get("Error Message")
+            .and_then(|value| value.as_str())
+        {
             let lower = err_msg.to_lowercase();
             if lower.contains("invalid api key")
                 || lower.contains("api key")
                 || lower.contains("limit reach")
                 || lower.contains("upgrade")
             {
-                return Err(format!("FMP API Key 被拒绝: {err_msg}"));
+                return Err(format!(
+                    "FMP API Key 被拒绝: {}",
+                    sanitize_fmp_error_detail(err_msg)
+                ));
             }
         }
 
-        Ok(data)
+        Ok(response_json)
     }
 
     fn build_url(&self, data_type: &str, ticker: &str) -> Result<String, String> {
         match data_type {
-            "quote" => Ok(format!("{}/stable/quote?symbol={}", self.base_url, ticker)),
-            "profile" => Ok(format!("{}/stable/profile?symbol={}", self.base_url, ticker)),
+            "quote" => Ok(format!("{}/v3/quote/{}", self.base_url, ticker)),
+            "profile" => Ok(format!("{}/v3/profile/{}", self.base_url, ticker)),
             "search" => Ok(format!(
-                "{}/stable/search-name?query={}&limit=10",
+                "{}/v3/search?query={}&limit=10",
                 self.base_url, ticker
             )),
             "financials" => Ok(format!(
-                "{}/stable/income-statement?symbol={}&limit=4",
+                "{}/v3/income-statement/{}?limit=4",
                 self.base_url, ticker
             )),
             "news" => {
                 if ticker.is_empty() {
-                    Ok(format!("{}/stable/news/stock-latest?limit=10", self.base_url))
+                    Ok(format!("{}/v3/stock_news?limit=10", self.base_url))
                 } else {
                     Ok(format!(
-                        "{}/stable/news/stock?symbols={}&limit=10",
+                        "{}/v3/stock_news?tickers={}&limit=10",
                         self.base_url, ticker
                     ))
                 }
             }
-            "gainers_losers" => Ok(format!("{}/stable/most-actives", self.base_url)),
-            "sector_performance" => {
-                let today = hone_core::beijing_now().date_naive();
-                Ok(format!(
-                    "{}/stable/sector-performance-snapshot?date={}",
-                    self.base_url,
-                    today.format("%Y-%m-%d")
-                ))
-            }
-            "crypto_quote" => Ok(format!("{}/stable/quote?symbol={}", self.base_url, ticker)),
-            "etf_holdings" => Ok(format!(
-                "{}/stable/etf/holdings?symbol={}",
-                self.base_url, ticker
-            )),
+            "gainers_losers" => Ok(format!("{}/v3/stock_market/actives", self.base_url)),
+            "sector_performance" => Ok(format!("{}/v3/sector-performance", self.base_url)),
+            "crypto_quote" => Ok(format!("{}/v3/quote/{}", self.base_url, ticker)),
+            "etf_holdings" => Ok(format!("{}/v3/etf-holder/{}", self.base_url, ticker)),
             "earnings_calendar" => Err(
                 "earnings_calendar 需要显式窗口，通过 build_earnings_calendar_url 构造".to_string(),
             ),
@@ -166,7 +157,7 @@ impl DataFetchTool {
 
     fn build_earnings_calendar_url(&self, from: NaiveDate, to: NaiveDate) -> String {
         format!(
-            "{}/stable/earnings-calendar?from={}&to={}",
+            "{}/v3/earning_calendar?from={}&to={}",
             self.base_url,
             from.format("%Y-%m-%d"),
             to.format("%Y-%m-%d")
@@ -261,6 +252,111 @@ impl DataFetchTool {
 
         payload
     }
+}
+
+fn format_fmp_transport_error(operation: &str, error: &reqwest::Error) -> String {
+    let detail = sanitize_fmp_error_detail(&error.to_string());
+    if detail.is_empty() {
+        format!("FMP {operation}失败")
+    } else {
+        format!("FMP {operation}失败: {detail}")
+    }
+}
+
+fn sanitize_fmp_error_detail(text: &str) -> String {
+    let redacted = redact_fmp_query_secrets(text);
+    if redacted.chars().count() <= MAX_FMP_TRANSPORT_ERROR_CHARS {
+        return redacted;
+    }
+    redacted
+        .chars()
+        .take(MAX_FMP_TRANSPORT_ERROR_CHARS)
+        .collect::<String>()
+        + "..."
+}
+
+fn redact_fmp_query_secrets(text: &str) -> String {
+    let mut output = text.to_string();
+    for key in ["apikey", "api_key", "apiKey"] {
+        output = redact_delimited_fmp_secret_value(&output, &format!("{key}="));
+        output = redact_delimited_fmp_secret_value(&output, &format!("{key}:"));
+        output = redact_fmp_json_string_field(&output, key);
+    }
+    output
+}
+
+fn redact_delimited_fmp_secret_value(text: &str, needle: &str) -> String {
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find(needle) {
+        let value_start = index + needle.len();
+        output.push_str(&remaining[..value_start]);
+        let leading_whitespace = remaining[value_start..]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        output.push_str(&remaining[value_start..value_start + leading_whitespace]);
+        output.push_str("<redacted>");
+        let value_tail = remaining[value_start + leading_whitespace..]
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                (ch == '&'
+                    || ch == ')'
+                    || ch == ','
+                    || ch == '"'
+                    || ch == '\''
+                    || ch == '}'
+                    || ch == ']'
+                    || ch.is_whitespace())
+                .then_some(idx)
+            })
+            .unwrap_or(remaining[value_start + leading_whitespace..].len());
+        remaining = &remaining[value_start + leading_whitespace + value_tail..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn redact_fmp_json_string_field(text: &str, key: &str) -> String {
+    let key_marker = format!("\"{key}\"");
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find(&key_marker) {
+        let after_key = index + key_marker.len();
+        let tail = &remaining[after_key..];
+        let Some((colon_offset, _)) = tail.char_indices().find(|(_, ch)| !ch.is_whitespace())
+        else {
+            break;
+        };
+        if !tail[colon_offset..].starts_with(':') {
+            output.push_str(&remaining[..after_key]);
+            remaining = &remaining[after_key..];
+            continue;
+        }
+        let after_colon = &tail[colon_offset + 1..];
+        let Some((quote_offset, _)) = after_colon
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+        else {
+            break;
+        };
+        if !after_colon[quote_offset..].starts_with('"') {
+            output.push_str(&remaining[..after_key]);
+            remaining = &remaining[after_key..];
+            continue;
+        }
+        let value_start = after_key + colon_offset + 1 + quote_offset + 1;
+        output.push_str(&remaining[..value_start]);
+        output.push_str("<redacted>");
+        let value_tail = remaining[value_start..]
+            .char_indices()
+            .find_map(|(idx, ch)| (ch == '"').then_some(idx))
+            .unwrap_or(remaining[value_start..].len());
+        remaining = &remaining[value_start + value_tail..];
+    }
+    output.push_str(remaining);
+    output
 }
 
 #[async_trait]
@@ -396,21 +492,24 @@ impl Tool for DataFetchTool {
 
 #[cfg(test)]
 mod tests {
-    use super::DataFetchTool;
+    use super::{DataFetchTool, sanitize_fmp_error_detail};
     use crate::base::Tool;
     use chrono::{Duration, NaiveDate};
     use serde_json::json;
 
+    fn tool_with_test_key() -> DataFetchTool {
+        DataFetchTool::new(vec!["test_key".to_string()], "https://example.com/api", 30)
+    }
+
     #[test]
-    fn test_url_building() {
-        // base_url 末尾的 /api 会被 normalize 剥掉, 拼出 stable 端点
-        let tool = DataFetchTool::new(vec!["test_key".to_string()], "https://example.com/api", 30);
+    fn build_url_supports_plain_and_existing_query_paths() {
+        let tool = tool_with_test_key();
 
         let url1 = tool.build_url("quote", "AAPL").expect("quote url");
-        let full_url1 = format!("{}&apikey=test_key", url1);
+        let full_url1 = format!("{}?apikey=test_key", url1);
         assert_eq!(
             full_url1,
-            "https://example.com/stable/quote?symbol=AAPL&apikey=test_key"
+            "https://example.com/api/v3/quote/AAPL?apikey=test_key"
         );
 
         let url2 = tool
@@ -419,35 +518,50 @@ mod tests {
         let full_url2 = format!("{}&apikey=test_key", url2);
         assert_eq!(
             full_url2,
-            "https://example.com/stable/income-statement?symbol=AAPL&limit=4&apikey=test_key"
+            "https://example.com/api/v3/income-statement/AAPL?limit=4&apikey=test_key"
         );
     }
 
     #[test]
-    fn test_base_url_normalization() {
-        // 旧 config: 末尾带 /api → 被剥掉
-        let tool_legacy = DataFetchTool::new(vec!["k".to_string()], "https://example.com/api", 30);
-        assert_eq!(
-            tool_legacy.build_url("quote", "AAPL").unwrap(),
-            "https://example.com/stable/quote?symbol=AAPL"
+    fn fmp_transport_error_detail_redacts_apikey_query_param() {
+        let detail = sanitize_fmp_error_detail(
+            "error sending request for url (https://example.com/api/v3/quote/AAPL?apikey=test_key)",
         );
-        // 新 config: 不带 /api
-        let tool_new = DataFetchTool::new(vec!["k".to_string()], "https://example.com", 30);
         assert_eq!(
-            tool_new.build_url("quote", "AAPL").unwrap(),
-            "https://example.com/stable/quote?symbol=AAPL"
+            detail,
+            "error sending request for url (https://example.com/api/v3/quote/AAPL?apikey=<redacted>)"
         );
-        // 末尾带 / 也被吃掉
-        let tool_slash = DataFetchTool::new(vec!["k".to_string()], "https://example.com/api/", 30);
+    }
+
+    #[test]
+    fn fmp_error_detail_redacts_api_key_aliases() {
+        let detail = sanitize_fmp_error_detail(
+            "https://example.com/api/v3/quote/AAPL?api_key=one&apiKey=two&apikey=three apiKey: header-four",
+        );
         assert_eq!(
-            tool_slash.build_url("quote", "AAPL").unwrap(),
-            "https://example.com/stable/quote?symbol=AAPL"
+            detail,
+            "https://example.com/api/v3/quote/AAPL?api_key=<redacted>&apiKey=<redacted>&apikey=<redacted> apiKey: <redacted>"
         );
+    }
+
+    #[test]
+    fn fmp_error_detail_redacts_json_api_key_aliases() {
+        let detail = sanitize_fmp_error_detail(
+            r#"backend failed {"api_key":"one","apiKey":"two","apikey":"three","safe":"kept"}"#,
+        );
+
+        assert!(detail.contains("\"api_key\":\"<redacted>\""));
+        assert!(detail.contains("\"apiKey\":\"<redacted>\""));
+        assert!(detail.contains("\"apikey\":\"<redacted>\""));
+        assert!(detail.contains("\"safe\":\"kept\""));
+        assert!(!detail.contains("\"one\""));
+        assert!(!detail.contains("\"two\""));
+        assert!(!detail.contains("\"three\""));
     }
 
     #[test]
     fn snapshot_is_exposed_in_tool_schema() {
-        let tool = DataFetchTool::new(vec!["test_key".to_string()], "https://example.com/api", 30);
+        let tool = tool_with_test_key();
         let parameters = tool.parameters();
         let data_type = parameters
             .iter()
@@ -459,7 +573,7 @@ mod tests {
 
     #[test]
     fn snapshot_response_aggregates_quote_profile_and_news() {
-        let tool = DataFetchTool::new(vec!["test_key".to_string()], "https://example.com/api", 30);
+        let tool = tool_with_test_key();
         let payload = tool.build_snapshot_response(
             "AAPL",
             Ok(json!([{ "symbol": "AAPL", "price": 100.0 }])),
@@ -477,7 +591,7 @@ mod tests {
 
     #[test]
     fn snapshot_response_keeps_partial_errors_visible() {
-        let tool = DataFetchTool::new(vec!["test_key".to_string()], "https://example.com/api", 30);
+        let tool = tool_with_test_key();
         let payload = tool.build_snapshot_response(
             "AAPL",
             Ok(json!([{ "symbol": "AAPL" }])),
@@ -495,7 +609,7 @@ mod tests {
 
     #[test]
     fn resolve_earnings_window_defaults_to_today_plus_14_days() {
-        let tool = DataFetchTool::new(vec!["test_key".to_string()], "https://example.com/api", 30);
+        let tool = tool_with_test_key();
         let (from, to) = tool
             .resolve_earnings_window(&json!({ "data_type": "earnings_calendar" }))
             .expect("default earnings window");
@@ -506,7 +620,7 @@ mod tests {
 
     #[test]
     fn resolve_earnings_window_respects_explicit_dates() {
-        let tool = DataFetchTool::new(vec!["test_key".to_string()], "https://example.com/api", 30);
+        let tool = tool_with_test_key();
         let (from, to) = tool
             .resolve_earnings_window(&json!({
                 "data_type": "earnings_calendar",
@@ -520,13 +634,13 @@ mod tests {
 
     #[test]
     fn build_earnings_calendar_url_uses_dynamic_dates() {
-        let tool = DataFetchTool::new(vec!["test_key".to_string()], "https://example.com/api", 30);
+        let tool = tool_with_test_key();
         let from = NaiveDate::from_ymd_opt(2026, 4, 9).unwrap();
         let to = NaiveDate::from_ymd_opt(2026, 4, 23).unwrap();
         let url = tool.build_earnings_calendar_url(from, to);
         assert_eq!(
             url,
-            "https://example.com/stable/earnings-calendar?from=2026-04-09&to=2026-04-23"
+            "https://example.com/api/v3/earning_calendar?from=2026-04-09&to=2026-04-23"
         );
     }
 }

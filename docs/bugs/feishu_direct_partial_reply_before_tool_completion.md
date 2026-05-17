@@ -14,6 +14,18 @@
     - `2026-04-23 13:28:53` 同一会话记录 `done ... success=true ... tools=6(Tool: hone/data_fetch,Tool: hone/local_list_files,Tool: hone/skill_tool,Tool: hone/web_search) reply.chars=96`，随后 `reply.send ... segments.sent=1/1`。
     - ACP 事件显示同轮用户上下文明确为 `【本轮用户输入】攜程，價值分析`，且系统已执行多次搜索/行情/财报查询；最终仍只外发核验摘要，没有进入正式分析结构。
     - 同轮在 `session.persist_assistant/done` 之后还继续出现 `local_list_files path="company_profiles"` 和 `local_search_files query="Trip.com" path="company_profiles"` 的工具调用请求与结果，说明收口与后续画像检索动作之间仍存在时序错位。
+
+## 2026-05-13 复发证据
+
+- 本轮巡检确认该缺陷在最近四小时真实 Feishu direct 会话中复发，状态从 `Fixed` 调回 `New`。
+- `data/sessions/Actor_feishu__direct__ou_5f44eaaa05cec98860b5336c3bddcc22d1.json`
+  - `2026-05-12T23:30:12.730157+08:00` 用户要求：`我当前持仓股中还未建立公司画像的，帮我建一下`。
+  - `2026-05-12T23:34:53.820728+08:00` assistant 最终可见文本只包含工具进度与失败尾注：`执行完成：本地命令`、`正在调用 Searching the Web...`、`工具执行完成`、`处理中发生错误，内容可能不完整`。
+  - 该回复没有告诉用户哪些持仓缺画像、哪些画像已创建、哪些失败、失败原因是什么、下一步如何补救。
+- 结论：
+  - 这是同一根因 / 同一影响范围的复发，不新建重复文档。
+  - 本轮不是单纯表达质量问题：用户明确要求批量补建公司画像，但系统把工具轨迹和不完整错误当成最终回复，任务完成情况不可判定，影响直聊工作流正确性。
+  - 严重等级维持 `P2`：它会导致用户无法确认画像维护任务是否完成，但当前证据没有显示跨用户错投、全渠道不可用或数据破坏，因此不升为 `P1`。
   - `data/sessions.sqlite3` -> `session_messages`
     - `session_id=Actor_feishu__direct__ou_5fe31244b1208749f16773dce0c822801a`
     - `2026-04-22T22:43:47.623958+08:00` 用户提问：`分析LRCX公司，基本面，护城河，财务，估值，及最新的一些情况`
@@ -139,6 +151,14 @@
     - `2026-04-16T16:01:05+08:00` assistant 只收到 55 字过渡句：`美股行情已经拿到。港股代码格式在底层数据里没直接回出...`
     - 同轮日志同样显示 `session.persist_assistant/done` 之后仍继续启动 `Tool: hone/web_search`
 
+## 2026-05-15 修复
+
+- 本轮把 2026-05-12 23:34 最新复发样本里的 failure partial 收口缺口补到了 [`/Users/fengming2/Desktop/honeclaw/bins/hone-feishu/src/handler.rs`](/Users/fengming2/Desktop/honeclaw/bins/hone-feishu/src/handler.rs)：
+  - `sanitize_failed_partial_reply(...)` 现在在去掉进度行后，会继续丢弃过渡性计划句，避免把 `我先核验...再批量补建` 这类内部执行语句拼成用户可见失败答复。
+  - `looks_like_progress_trace_line(...)` 新增覆盖 `执行完成：本地命令`、`正在调用 Searching the Web...`、`工具执行完成` 与裸 `Searching the Web`，补上 Codex/ACP 最近复发样本里原先未被识别的轨迹文案。
+- 这次修复只改变 Feishu 失败态 fallback 的用户可见文本，不改变 runner 成败判定，也不影响 quota / usage-limit 等已有错误映射优先级。
+- 状态更新为 `Fixed`：当前仓库代码已覆盖这类“工具轨迹/计划句被当成最终失败回复”的活跃复发形态；由于本任务不重启现有服务，真实运行态仍需后续只读复核后再决定是否 `Closed`。
+
 ## 端到端链路
 
 1. Feishu 直聊用户发起需要正式分析的请求，例如 `美股TEMPUS AI 的value analysis`。
@@ -209,11 +229,20 @@
 - 已在 `bins/hone-feishu/src/handler.rs` 的失败收口中补充“过渡计划句”过滤；如果 partial stream 只剩 `我先核验...`、`下一步补...` 一类过渡句，则直接回退到产品化错误文案，不再把半成品正文发给用户。
 - 这轮修复覆盖的是“工具未完成却提前收口”的共享根因；尚未包含 `idle timeout`、`reply_chars=0` 这类其它 Answer 失败形态，因此相关 P1 缺陷继续独立跟踪。
 
+## 修复情况（2026-05-15）
+
+- 本轮复核 `2026-05-13 03:02 CST` 复发样本后，确认当前剩余可本地闭环的缺口在 Feishu 失败 partial stream 过滤：ACP compact stream 会输出 `执行完成：本地命令`、`正在调用 Searching the Web...`、`工具执行完成` 与 `_(处理中发生错误，内容可能不完整)_` 这类用户可见进度行，旧过滤只覆盖 `Tool:` / `hone/*` / `正在执行：` 等协议形态，导致纯工具进度在失败收口时仍被当作“部分答复”外发。
+- `bins/hone-feishu/src/handler.rs` 现已把上述 compact 工具进度 / 不完整尾注识别为失败 partial 噪声；当 partial 只剩工具进度时，会回退到 `user_visible_error_message(...)` 的产品化错误文案，不再向用户发送 `本地命令`、`Searching the Web` 或重复的“不完整”尾注。
+- 新增回归 `failed_reply_text_drops_compact_tool_progress_only_partial_stream` 锁住本次复发形态。
+
 ## 回归验证
 
 - `cargo test -p hone-channels acp_prompt_`
 - `cargo test -p hone-channels user_visible_error_message_`
 - `cargo test -p hone-feishu failed_reply_text_`
+- `cargo test -p hone-feishu stream_buffer_visible_final_rejects_placeholder_and_progress -- --nocapture`
+- `rustfmt --edition 2024 --check bins/hone-feishu/src/handler.rs`
+- `cargo check -p hone-feishu --tests`
 
 ## 下一步建议
 

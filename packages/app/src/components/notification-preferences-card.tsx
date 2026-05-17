@@ -19,18 +19,16 @@ import {
   type ActorRef,
 } from "@/lib/actors";
 import type { UserInfo } from "@/lib/types";
-
-const DEFAULT_PREFS: NotificationPrefs = {
-  enabled: true,
-  portfolio_only: false,
-  min_severity: "low",
-  allow_kinds: null,
-  blocked_kinds: [],
-  timezone: null,
-  digest_windows: null,
-  price_high_pct_override: null,
-  immediate_kinds: null,
-};
+import { NOTIFICATIONS } from "@/lib/admin-content/notifications";
+import { tpl } from "@/lib/i18n";
+import {
+  DEFAULT_NOTIFICATION_PREFS,
+  isValidDigestSlotTime,
+  sameActor,
+  sortDigestSlots,
+  timeFallsInQuiet,
+  toggleTag,
+} from "./notification-preferences-model";
 
 type RosterEntry = {
   actor: ActorRef;
@@ -38,61 +36,71 @@ type RosterEntry = {
   kindTags: string[];
 };
 
-function sameActor(a?: ActorRef, b?: ActorRef) {
-  if (!a || !b) return false;
-  return (
-    a.channel === b.channel &&
-    a.user_id === b.user_id &&
-    (a.channel_scope ?? "") === (b.channel_scope ?? "")
-  );
-}
-
 async function loadActorsList(): Promise<ActorRef[]> {
   const [portfolioList, userList] = await Promise.all([
     listPortfolioActors().catch(() => []),
     getUsers().catch(() => [] as UserInfo[]),
   ]);
   const map = new Map<string, ActorRef>();
-  for (const s of portfolioList) {
-    const a: ActorRef = {
-      channel: s.channel,
-      user_id: s.user_id,
-      channel_scope: s.channel_scope,
+  for (const portfolioActor of portfolioList) {
+    const actor: ActorRef = {
+      channel: portfolioActor.channel,
+      user_id: portfolioActor.user_id,
+      channel_scope: portfolioActor.channel_scope,
     };
-    map.set(actorKey(a), a);
+    map.set(actorKey(actor), actor);
   }
-  for (const u of userList) {
-    const a: ActorRef = {
-      channel: u.channel,
-      user_id: u.user_id,
-      channel_scope: u.channel_scope,
+  for (const user of userList) {
+    const actor: ActorRef = {
+      channel: user.channel,
+      user_id: user.user_id,
+      channel_scope: user.channel_scope,
     };
-    if (!map.has(actorKey(a))) map.set(actorKey(a), a);
+    if (!map.has(actorKey(actor))) map.set(actorKey(actor), actor);
   }
   return Array.from(map.values());
 }
 
-function summarize(p: NotificationPrefs): string {
-  if (!p.enabled) return "已关闭";
-  const parts: string[] = [p.min_severity];
-  if (p.portfolio_only) parts.push("仅持仓");
-  if (p.allow_kinds && p.allow_kinds.length)
-    parts.push(`白名单 ${p.allow_kinds.length}`);
-  if (p.blocked_kinds && p.blocked_kinds.length)
-    parts.push(`黑名单 ${p.blocked_kinds.length}`);
-  if (p.timezone) parts.push(`TZ=${p.timezone}`);
-  if (p.digest_windows) {
+function summarize(prefs: NotificationPrefs): string {
+  if (!prefs.enabled) return NOTIFICATIONS.prefs.summarize_disabled;
+  const parts: string[] = [prefs.min_severity];
+  if (prefs.portfolio_only) parts.push(NOTIFICATIONS.prefs.summarize_only_portfolio);
+  if (prefs.allow_kinds && prefs.allow_kinds.length)
     parts.push(
-      p.digest_windows.length === 0
-        ? "关 digest"
-        : `digest×${p.digest_windows.length}`,
+      tpl(NOTIFICATIONS.prefs.summarize_allow, {
+        count: prefs.allow_kinds.length,
+      }),
+    );
+  if (prefs.blocked_kinds && prefs.blocked_kinds.length)
+    parts.push(
+      tpl(NOTIFICATIONS.prefs.summarize_block, {
+        count: prefs.blocked_kinds.length,
+      }),
+    );
+  if (prefs.timezone) parts.push(tpl(NOTIFICATIONS.prefs.summarize_tz, { tz: prefs.timezone }));
+  if (prefs.digest_slots) {
+    parts.push(
+      prefs.digest_slots.length === 0
+        ? NOTIFICATIONS.prefs.summarize_digest_off
+        : tpl(NOTIFICATIONS.prefs.summarize_digest_count, { count: prefs.digest_slots.length }),
     );
   }
-  if (p.price_high_pct_override != null)
-    parts.push(`⚡${p.price_high_pct_override}%`);
-  if (p.immediate_kinds && p.immediate_kinds.length)
-    parts.push(`强升 ${p.immediate_kinds.length}`);
-  return `启用 · ${parts.join(" · ")}`;
+  if (prefs.price_high_pct_override != null)
+    parts.push(tpl(NOTIFICATIONS.prefs.summarize_price, { value: prefs.price_high_pct_override }));
+  if (prefs.immediate_kinds && prefs.immediate_kinds.length)
+    parts.push(
+      tpl(NOTIFICATIONS.prefs.summarize_immediate, {
+        count: prefs.immediate_kinds.length,
+      }),
+    );
+  if (prefs.quiet_hours)
+    parts.push(
+      tpl(NOTIFICATIONS.prefs.summarize_quiet, {
+        from: prefs.quiet_hours.from,
+        to: prefs.quiet_hours.to,
+      }),
+    );
+  return `${NOTIFICATIONS.prefs.summarize_enabled_prefix} · ${parts.join(" · ")}`;
 }
 
 export function NotificationPreferencesCard() {
@@ -104,50 +112,65 @@ export function NotificationPreferencesCard() {
   const [detailDirty, setDetailDirty] = createSignal(false);
   const [message, setMessage] = createSignal("");
   const [error, setError] = createSignal("");
+  const clearFeedback = () => {
+    setMessage("");
+    setError("");
+  };
   const [manual, setManual] = createSignal<ActorRef>({
     channel: "",
     user_id: "",
     channel_scope: "",
   });
+  const updateManual = (patch: Partial<ActorRef>) => {
+    setManual((current) => ({ ...current, ...patch }));
+  };
 
   const currentActor = createMemo(() => parseActorKey(selectedKey()));
+  const currentActorKey = createMemo(() => {
+    const actor = currentActor();
+    return actor ? actorKey(actor) : "";
+  });
   const currentEntry = createMemo(() => {
-    const a = currentActor();
-    if (!a) return undefined;
-    return roster().find((e) => sameActor(e.actor, a));
+    const actor = currentActor();
+    if (!actor) return undefined;
+    return roster().find((entry) => sameActor(entry.actor, actor));
   });
   const currentPrefs = createMemo(
-    () => currentEntry()?.prefs ?? DEFAULT_PREFS,
+    () => currentEntry()?.prefs ?? DEFAULT_NOTIFICATION_PREFS,
   );
   const currentKindTags = createMemo(() => currentEntry()?.kindTags ?? []);
 
   const patchEntry = (
     actor: ActorRef,
-    patch: Partial<RosterEntry> | ((e: RosterEntry) => RosterEntry),
+    patch: Partial<RosterEntry> | ((entry: RosterEntry) => RosterEntry),
   ) => {
     setRoster(
-      roster().map((e) =>
-        sameActor(e.actor, actor)
+      roster().map((entry) =>
+        sameActor(entry.actor, actor)
           ? typeof patch === "function"
-            ? patch(e)
-            : { ...e, ...patch }
-          : e,
+            ? patch(entry)
+            : { ...entry, ...patch }
+          : entry,
       ),
     );
   };
 
   const upsertEntry = (entry: RosterEntry) => {
-    const list = roster();
-    if (list.some((e) => sameActor(e.actor, entry.actor))) {
+    const currentRoster = roster();
+    if (
+      currentRoster.some((rosterEntry) =>
+        sameActor(rosterEntry.actor, entry.actor),
+      )
+    ) {
       patchEntry(entry.actor, entry);
     } else {
-      setRoster([...list, entry]);
+      setRoster([...currentRoster, entry]);
     }
   };
 
   const fetchEntry = async (actor: ActorRef): Promise<RosterEntry> => {
-    const b = await getNotificationPrefs(actor);
-    return { actor, prefs: b.prefs, kindTags: b.kind_tags };
+    const prefsBundle = await getNotificationPrefs(actor);
+    return { actor, prefs: prefsBundle.prefs, kindTags: prefsBundle.kind_tags };
   };
 
   const refreshRoster = async () => {
@@ -162,7 +185,7 @@ export function NotificationPreferencesCard() {
           } catch {
             return {
               actor,
-              prefs: { ...DEFAULT_PREFS },
+              prefs: { ...DEFAULT_NOTIFICATION_PREFS },
               kindTags: [],
             } satisfies RosterEntry;
           }
@@ -181,16 +204,18 @@ export function NotificationPreferencesCard() {
   });
 
   const savePrefs = async (actor: ActorRef, prefs: NotificationPrefs) => {
-    const k = actorKey(actor);
-    setSavingKey(k);
-    setMessage("");
-    setError("");
+    const savingActorKey = actorKey(actor);
+    setSavingKey(savingActorKey);
+    clearFeedback();
     try {
       const saved = await putNotificationPrefs(actor, prefs);
-      patchEntry(actor, (e) => ({ ...e, prefs: saved }));
+      patchEntry(actor, (entry) => ({ ...entry, prefs: saved }));
       if (sameActor(actor, currentActor())) setDetailDirty(false);
       setMessage(
-        `已保存 ${actor.channel} · ${actorLabel(actor)} 的推送偏好,下一条事件即刻生效`,
+        tpl(NOTIFICATIONS.prefs.save_success, {
+          channel: actor.channel,
+          label: actorLabel(actor),
+        }),
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -201,126 +226,194 @@ export function NotificationPreferencesCard() {
   };
 
   const toggleRosterEnabled = async (actor: ActorRef, enabled: boolean) => {
-    const entry = roster().find((e) => sameActor(e.actor, actor));
+    const entry = roster().find((rosterEntry) =>
+      sameActor(rosterEntry.actor, actor),
+    );
     if (!entry) return;
     const next = { ...entry.prefs, enabled };
-    patchEntry(actor, (e) => ({ ...e, prefs: next }));
+    patchEntry(actor, (rosterEntry) => ({ ...rosterEntry, prefs: next }));
     try {
       await savePrefs(actor, next);
     } catch {
-      patchEntry(actor, (e) => ({ ...e, prefs: entry.prefs }));
+      patchEntry(actor, (rosterEntry) => ({ ...rosterEntry, prefs: entry.prefs }));
     }
   };
 
   const chooseActor = async (actor: ActorRef) => {
-    setMessage("");
-    setError("");
+    clearFeedback();
     setSelectedKey(actorKey(actor));
     setDetailDirty(false);
-    if (!roster().some((e) => sameActor(e.actor, actor))) {
+    if (!roster().some((rosterEntry) => sameActor(rosterEntry.actor, actor))) {
       try {
         upsertEntry(await fetchEntry(actor));
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
-        upsertEntry({ actor, prefs: { ...DEFAULT_PREFS }, kindTags: [] });
+        upsertEntry({ actor, prefs: { ...DEFAULT_NOTIFICATION_PREFS }, kindTags: [] });
       }
     }
   };
 
   const applyManual = () => {
-    const m = manual();
-    if (!m.channel.trim() || !m.user_id.trim()) return;
+    const manualActor = manual();
+    if (!manualActor.channel.trim() || !manualActor.user_id.trim()) return;
     void chooseActor({
-      channel: m.channel.trim(),
-      user_id: m.user_id.trim(),
-      channel_scope: m.channel_scope?.trim() || undefined,
+      channel: manualActor.channel.trim(),
+      user_id: manualActor.user_id.trim(),
+      channel_scope: manualActor.channel_scope?.trim() || undefined,
     });
   };
 
   const editCurrent = (
-    updater: (p: NotificationPrefs) => NotificationPrefs,
+    updater: (prefs: NotificationPrefs) => NotificationPrefs,
   ) => {
-    const a = currentActor();
-    if (!a) return;
-    patchEntry(a, (e) => ({ ...e, prefs: updater(e.prefs) }));
+    const actor = currentActor();
+    if (!actor) return;
+    patchEntry(actor, (entry) => ({ ...entry, prefs: updater(entry.prefs) }));
     setDetailDirty(true);
   };
 
-  const toggleTag = (list: string[], tag: string) =>
-    list.includes(tag) ? list.filter((t) => t !== tag) : [...list, tag];
+  const updateCurrentPrefs = (
+    patch:
+      | Partial<NotificationPrefs>
+      | ((prefs: NotificationPrefs) => Partial<NotificationPrefs>),
+  ) => {
+    editCurrent((prefs) => ({
+      ...prefs,
+      ...(typeof patch === "function" ? patch(prefs) : patch),
+    }));
+  };
 
   const handleAllowToggle = (tag: string) => {
-    editCurrent((p) => {
-      const next = toggleTag(p.allow_kinds ?? [], tag);
-      return { ...p, allow_kinds: next.length === 0 ? null : next };
+    editCurrent((prefs) => {
+      const nextTags = toggleTag(prefs.allow_kinds ?? [], tag);
+      return { ...prefs, allow_kinds: nextTags.length === 0 ? null : nextTags };
     });
   };
 
   const handleBlockToggle = (tag: string) => {
-    editCurrent((p) => ({
-      ...p,
-      blocked_kinds: toggleTag(p.blocked_kinds ?? [], tag),
+    editCurrent((prefs) => ({
+      ...prefs,
+      blocked_kinds: toggleTag(prefs.blocked_kinds ?? [], tag),
     }));
   };
 
   const handleImmediateToggle = (tag: string) => {
-    editCurrent((p) => {
-      const next = toggleTag(p.immediate_kinds ?? [], tag);
-      return { ...p, immediate_kinds: next.length === 0 ? null : next };
+    editCurrent((prefs) => {
+      const nextTags = toggleTag(prefs.immediate_kinds ?? [], tag);
+      return { ...prefs, immediate_kinds: nextTags.length === 0 ? null : nextTags };
     });
   };
 
-  // digest_windows 操作:null = 沿用全局,[] = 关 digest,[..] = 自定义。
-  const [windowDraft, setWindowDraft] = createSignal("");
-  const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
-  const sortedUniqueWindows = (list: string[]): string[] =>
-    Array.from(new Set(list)).sort();
-  const addWindow = () => {
-    const v = windowDraft().trim();
-    if (!HHMM_RE.test(v)) return;
-    editCurrent((p) => ({
-      ...p,
-      digest_windows: sortedUniqueWindows([...(p.digest_windows ?? []), v]),
-    }));
-    setWindowDraft("");
+  // digest_slots 操作:null = 沿用全局 default_slots,[] = 关 digest,[..] = 自定义。
+  // 每个 slot 是 {id, time, label?, floor_macro?},UI 只编辑 time;新增时给 id
+  // `slot_<n>`,label/floor_macro 留空(后端默认即可),已存在 slot 的 label/floor_macro
+  // 如果是后端蒸馏出来的会原样透传不破坏。
+  const [slotDraft, setSlotDraft] = createSignal("");
+  const addSlot = () => {
+    const slotTime = slotDraft().trim();
+    if (!isValidDigestSlotTime(slotTime)) return;
+    editCurrent((prefs) => {
+      const existingSlots = prefs.digest_slots ?? [];
+      if (existingSlots.some((slot) => slot.time === slotTime)) return prefs; // 同时刻去重
+      const slotId = `slot_${existingSlots.length}`;
+      return {
+        ...prefs,
+        digest_slots: sortDigestSlots([
+          ...existingSlots,
+          { id: slotId, time: slotTime },
+        ]),
+      };
+    });
+    setSlotDraft("");
   };
-  const removeWindow = (hhmm: string) => {
-    editCurrent((p) => ({
-      ...p,
-      digest_windows: (p.digest_windows ?? []).filter((w) => w !== hhmm),
+  const removeSlot = (id: string) => {
+    updateCurrentPrefs((prefs) => ({
+      digest_slots: (prefs.digest_slots ?? []).filter((slot) => slot.id !== id),
     }));
   };
-  const resetWindowsToGlobal = () => {
-    editCurrent((p) => ({ ...p, digest_windows: null }));
+  const resetSlotsToGlobal = () => {
+    updateCurrentPrefs({ digest_slots: null });
   };
   const muteAllDigest = () => {
-    editCurrent((p) => ({ ...p, digest_windows: [] }));
+    updateCurrentPrefs({ digest_slots: [] });
+  };
+
+  // quiet_hours 操作:null = 关勿扰;{from,to,exempt_kinds} = 启用。from==to 等价于
+  // 全天静音的歧义形式,后端会拒绝(空区间永远 false),UI 提示用户避免。
+  const setQuietFrom = (raw: string) => {
+    const quietStart = raw.trim();
+    if (!isValidDigestSlotTime(quietStart)) return;
+    editCurrent((prefs) => ({
+      ...prefs,
+      quiet_hours: {
+        from: quietStart,
+        to: prefs.quiet_hours?.to ?? "08:00",
+        exempt_kinds: prefs.quiet_hours?.exempt_kinds ?? [],
+      },
+    }));
+  };
+  const setQuietTo = (raw: string) => {
+    const quietEnd = raw.trim();
+    if (!isValidDigestSlotTime(quietEnd)) return;
+    editCurrent((prefs) => ({
+      ...prefs,
+      quiet_hours: {
+        from: prefs.quiet_hours?.from ?? "00:00",
+        to: quietEnd,
+        exempt_kinds: prefs.quiet_hours?.exempt_kinds ?? [],
+      },
+    }));
+  };
+  const enableQuiet = () => {
+    editCurrent((prefs) =>
+      prefs.quiet_hours
+        ? prefs
+        : {
+            ...prefs,
+            quiet_hours: { from: "00:00", to: "08:00", exempt_kinds: [] },
+          },
+    );
+  };
+  const clearQuiet = () => {
+    updateCurrentPrefs({ quiet_hours: null });
+  };
+  const toggleQuietExempt = (tag: string) => {
+    editCurrent((prefs) => {
+      if (!prefs.quiet_hours) return prefs;
+      const nextTags = toggleTag(prefs.quiet_hours.exempt_kinds, tag);
+      return {
+        ...prefs,
+        quiet_hours: { ...prefs.quiet_hours, exempt_kinds: nextTags },
+      };
+    });
   };
 
   const handleTimezoneInput = (raw: string) => {
-    const v = raw.trim();
-    editCurrent((p) => ({ ...p, timezone: v === "" ? null : v }));
+    const timezone = raw.trim();
+    updateCurrentPrefs({ timezone: timezone === "" ? null : timezone });
   };
 
   const handlePriceHighInput = (raw: string) => {
-    const v = raw.trim();
-    if (v === "") {
-      editCurrent((p) => ({ ...p, price_high_pct_override: null }));
+    const priceThreshold = raw.trim();
+    if (priceThreshold === "") {
+      editCurrent((prefs) => ({ ...prefs, price_high_pct_override: null }));
       return;
     }
-    const n = Number(v);
-    editCurrent((p) => ({
-      ...p,
-      price_high_pct_override: Number.isFinite(n) ? n : p.price_high_pct_override,
+    const parsedThreshold = Number(priceThreshold);
+    editCurrent((prefs) => ({
+      ...prefs,
+      price_high_pct_override: Number.isFinite(parsedThreshold)
+        ? parsedThreshold
+        : prefs.price_high_pct_override,
     }));
   };
 
   const submitDetail = async () => {
-    const a = currentActor();
-    const e = currentEntry();
-    if (!a || !e) return;
+    const actor = currentActor();
+    const entry = currentEntry();
+    if (!actor || !entry) return;
     try {
-      await savePrefs(a, e.prefs);
+      await savePrefs(actor, entry.prefs);
     } catch {
       /* savePrefs 已把 error 落到 banner */
     }
@@ -331,10 +424,10 @@ export function NotificationPreferencesCard() {
       <div class="flex items-center justify-between">
         <div>
           <div class="text-sm font-bold text-[color:var(--text-primary)]">
-            通知偏好(per-actor)
+            {NOTIFICATIONS.prefs.title}
           </div>
           <div class="mt-0.5 text-[10px] text-[color:var(--text-secondary)]">
-            上区:一键启停,切换即保存;下区:点一个 actor 做严重度 / 白黑名单细调
+            {NOTIFICATIONS.prefs.subtitle}
           </div>
         </div>
         <button
@@ -342,23 +435,23 @@ export function NotificationPreferencesCard() {
           class="rounded-md border border-[color:var(--border)] px-2 py-1 text-[11px] text-[color:var(--text-secondary)] transition hover:text-[color:var(--text-primary)]"
           onClick={() => void refreshRoster()}
         >
-          刷新
+          {NOTIFICATIONS.prefs.refresh_button}
         </button>
       </div>
 
       <div class="mt-4">
         <div class="text-[11px] font-semibold text-[color:var(--text-secondary)]">
-          actor 列表
+          {NOTIFICATIONS.prefs.actor_list_label}
         </div>
         <div class="mt-2 divide-y divide-[color:var(--border)] rounded-md border border-[color:var(--border)] bg-[color:var(--surface)]">
           <Show when={rosterLoading()}>
             <div class="px-3 py-2 text-[11px] text-[color:var(--text-secondary)]">
-              加载中...
+              {NOTIFICATIONS.prefs.actor_loading}
             </div>
           </Show>
           <Show when={!rosterLoading() && roster().length === 0}>
             <div class="px-3 py-2 text-[11px] text-[color:var(--text-secondary)]">
-              还没有可选 actor(手动输入下方字段或先让渠道产生一条消息)
+              {NOTIFICATIONS.prefs.actor_empty}
             </div>
           </Show>
           <For each={roster()}>
@@ -394,7 +487,7 @@ export function NotificationPreferencesCard() {
                     class="flex items-center gap-1.5 text-[10px] text-[color:var(--text-secondary)]"
                     onClick={(e) => e.stopPropagation()}
                   >
-                    <span>{isSaving() ? "保存中..." : entry.prefs.enabled ? "推送中" : "已关"}</span>
+                    <span>{isSaving() ? NOTIFICATIONS.prefs.saving_label : entry.prefs.enabled ? NOTIFICATIONS.prefs.pushing_label : NOTIFICATIONS.prefs.off_label}</span>
                     <input
                       type="checkbox"
                       checked={entry.prefs.enabled}
@@ -417,27 +510,27 @@ export function NotificationPreferencesCard() {
       <div class="mt-3 grid grid-cols-3 gap-2">
         <input
           class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-1 text-xs"
-          placeholder="channel"
+          placeholder={NOTIFICATIONS.prefs.manual_channel_placeholder}
           value={manual().channel}
           onInput={(e) =>
-            setManual({ ...manual(), channel: e.currentTarget.value })
+            updateManual({ channel: e.currentTarget.value })
           }
         />
         <input
           class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-1 text-xs"
-          placeholder="user_id"
+          placeholder={NOTIFICATIONS.prefs.manual_user_placeholder}
           value={manual().user_id}
           onInput={(e) =>
-            setManual({ ...manual(), user_id: e.currentTarget.value })
+            updateManual({ user_id: e.currentTarget.value })
           }
         />
         <div class="flex gap-1">
           <input
             class="flex-1 rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-1 text-xs"
-            placeholder="channel_scope(可选)"
+            placeholder={NOTIFICATIONS.prefs.manual_scope_placeholder}
             value={manual().channel_scope ?? ""}
             onInput={(e) =>
-              setManual({ ...manual(), channel_scope: e.currentTarget.value })
+              updateManual({ channel_scope: e.currentTarget.value })
             }
           />
           <button
@@ -445,7 +538,7 @@ export function NotificationPreferencesCard() {
             class="rounded-md border border-[color:var(--border)] px-2 text-[11px]"
             onClick={applyManual}
           >
-            载入
+            {NOTIFICATIONS.prefs.manual_load}
           </button>
         </div>
       </div>
@@ -454,10 +547,13 @@ export function NotificationPreferencesCard() {
         <div class="mt-5 space-y-4 rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] p-4">
           <div class="flex items-center justify-between">
             <div class="text-[11px] font-semibold text-[color:var(--text-primary)]">
-              细调 {currentActor()!.channel} · {actorLabel(currentActor()!)}
+              {tpl(NOTIFICATIONS.prefs.detail_title, {
+                channel: currentActor()!.channel,
+                label: actorLabel(currentActor()!),
+              })}
             </div>
             <div class="text-[10px] text-[color:var(--text-secondary)]">
-              启用/关闭回上方列表切换
+              {NOTIFICATIONS.prefs.detail_hint}
             </div>
           </div>
           <div class="flex items-center justify-between">
@@ -466,22 +562,22 @@ export function NotificationPreferencesCard() {
                 type="checkbox"
                 checked={currentPrefs().portfolio_only}
                 onChange={(e) =>
-                  editCurrent((p) => ({
-                    ...p,
+                  editCurrent((prefs) => ({
+                    ...prefs,
                     portfolio_only: e.currentTarget.checked,
                   }))
                 }
               />
-              <span>仅持仓相关</span>
+              <span>{NOTIFICATIONS.prefs.portfolio_only}</span>
             </label>
             <label class="flex items-center gap-2 text-sm">
-              <span>最低严重度</span>
+              <span>{NOTIFICATIONS.prefs.min_severity}</span>
               <select
                 class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-1 text-xs"
                 value={currentPrefs().min_severity}
                 onChange={(e) =>
-                  editCurrent((p) => ({
-                    ...p,
+                  editCurrent((prefs) => ({
+                    ...prefs,
                     min_severity: e.currentTarget
                       .value as NotificationPrefs["min_severity"],
                   }))
@@ -496,7 +592,7 @@ export function NotificationPreferencesCard() {
 
           <div>
             <div class="text-[11px] font-semibold text-[color:var(--text-secondary)]">
-              白名单 allow_kinds(空 = 不启用白名单)
+              {NOTIFICATIONS.prefs.allow_kinds_label}
             </div>
             <div class="mt-1 flex flex-wrap gap-1">
               <For each={currentKindTags()}>
@@ -525,7 +621,7 @@ export function NotificationPreferencesCard() {
 
           <div>
             <div class="text-[11px] font-semibold text-[color:var(--text-secondary)]">
-              黑名单 blocked_kinds(优先级高于白名单)
+              {NOTIFICATIONS.prefs.block_kinds_label}
             </div>
             <div class="mt-1 flex flex-wrap gap-1">
               <For each={currentKindTags()}>
@@ -554,16 +650,16 @@ export function NotificationPreferencesCard() {
 
           <div class="space-y-3 rounded-md border border-dashed border-[color:var(--border)] p-3">
             <div class="text-[11px] font-semibold text-[color:var(--text-secondary)]">
-              推送节奏(per-actor;留空 = 沿用全局)
+              {NOTIFICATIONS.prefs.cadence_title}
             </div>
 
             <label class="flex flex-col gap-1 text-[11px]">
               <span class="text-[color:var(--text-secondary)]">
-                时区 (IANA, 例 Asia/Shanghai、America/New_York)
+                {NOTIFICATIONS.prefs.timezone_label}
               </span>
               <input
                 class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-1 text-xs"
-                placeholder="留空 → 沿用全局 digest.timezone"
+                placeholder={NOTIFICATIONS.prefs.timezone_placeholder}
                 value={currentPrefs().timezone ?? ""}
                 onInput={(e) => handleTimezoneInput(e.currentTarget.value)}
               />
@@ -571,28 +667,36 @@ export function NotificationPreferencesCard() {
 
             <div class="flex flex-col gap-1.5 text-[11px]">
               <span class="text-[color:var(--text-secondary)]">
-                Digest 时刻 (本地 HH:MM;不设 = 沿用全局,清空 = 关 digest)
+                {NOTIFICATIONS.prefs.digest_label}
               </span>
               <div class="flex flex-wrap items-center gap-1">
-                <Show when={currentPrefs().digest_windows === null}>
+                <Show when={currentPrefs().digest_slots === null}>
                   <span class="text-[10px] italic text-[color:var(--text-secondary)]">
-                    当前:沿用全局 pre/post-market
+                    {NOTIFICATIONS.prefs.digest_inherit_global}
                   </span>
                 </Show>
-                <Show when={currentPrefs().digest_windows?.length === 0}>
+                <Show when={currentPrefs().digest_slots?.length === 0}>
                   <span class="rounded-md border border-amber-500 bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-500">
-                    关 digest(只接收 immediate sink)
+                    {NOTIFICATIONS.prefs.digest_off_badge}
                   </span>
                 </Show>
-                <For each={currentPrefs().digest_windows ?? []}>
-                  {(hhmm) => (
-                    <span class="inline-flex items-center gap-1 rounded-md border border-emerald-500 bg-emerald-500/10 px-2 py-0.5 font-mono text-[11px] text-emerald-600">
-                      {hhmm}
+                <For each={currentPrefs().digest_slots ?? []}>
+                  {(slot) => (
+                    <span
+                      class="inline-flex items-center gap-1 rounded-md border border-emerald-500 bg-emerald-500/10 px-2 py-0.5 font-mono text-[11px] text-emerald-600"
+                      title={slot.label ?? slot.id}
+                    >
+                      {slot.time}
+                      <Show when={slot.label}>
+                        <span class="font-sans not-italic opacity-70">
+                          · {slot.label}
+                        </span>
+                      </Show>
                       <button
                         type="button"
                         class="-mr-0.5 rounded text-emerald-700 hover:text-rose-500"
-                        title="移除"
-                        onClick={() => removeWindow(hhmm)}
+                        title={NOTIFICATIONS.prefs.digest_remove_title}
+                        onClick={() => removeSlot(slot.id)}
                       >
                         ×
                       </button>
@@ -604,46 +708,62 @@ export function NotificationPreferencesCard() {
                 <input
                   type="time"
                   class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-1 font-mono text-xs"
-                  value={windowDraft()}
-                  onInput={(e) => setWindowDraft(e.currentTarget.value)}
+                  value={slotDraft()}
+                  onInput={(e) => setSlotDraft(e.currentTarget.value)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter") {
                       e.preventDefault();
-                      addWindow();
+                      addSlot();
                     }
                   }}
                 />
                 <button
                   type="button"
                   class="rounded-md border border-emerald-500 px-2 py-1 text-[11px] text-emerald-600 hover:bg-emerald-500/10 disabled:opacity-40"
-                  disabled={!HHMM_RE.test(windowDraft().trim())}
-                  onClick={addWindow}
+                  disabled={!isValidDigestSlotTime(slotDraft().trim())}
+                  onClick={addSlot}
                 >
-                  + 添加
+                  {NOTIFICATIONS.prefs.digest_add_button}
                 </button>
                 <button
                   type="button"
                   class="rounded-md border border-[color:var(--border)] px-2 py-1 text-[11px] text-[color:var(--text-secondary)] hover:text-[color:var(--text-primary)]"
-                  onClick={resetWindowsToGlobal}
-                  title="清掉自定义 → 沿用全局 pre/post-market"
+                  onClick={resetSlotsToGlobal}
+                  title={NOTIFICATIONS.prefs.digest_reset_global_title}
                 >
-                  恢复全局
+                  {NOTIFICATIONS.prefs.digest_reset_global}
                 </button>
                 <button
                   type="button"
                   class="rounded-md border border-amber-500 px-2 py-1 text-[11px] text-amber-500 hover:bg-amber-500/10"
                   onClick={muteAllDigest}
-                  title="设为空数组,即完全不发 digest"
+                  title={NOTIFICATIONS.prefs.digest_mute_title}
                 >
-                  关 digest
+                  {NOTIFICATIONS.prefs.digest_mute_button}
                 </button>
               </div>
+              <Show
+                when={(() => {
+                  const digestSlots = currentPrefs().digest_slots ?? [];
+                  const quietHours = currentPrefs().quiet_hours;
+                  if (!quietHours) return false;
+                  return digestSlots.some((digestSlot) =>
+                    timeFallsInQuiet(digestSlot.time, quietHours),
+                  );
+                })()}
+              >
+                <span class="rounded-md border border-rose-500/50 bg-rose-500/10 px-2 py-1 text-[10px] text-rose-500">
+                  {tpl(NOTIFICATIONS.prefs.digest_quiet_warning, {
+                    from: currentPrefs().quiet_hours!.from,
+                    to: currentPrefs().quiet_hours!.to,
+                  })}
+                </span>
+              </Show>
             </div>
 
             <label class="flex flex-col gap-1 text-[11px]">
               <span class="text-[color:var(--text-secondary)]">
-                价格异动即时推阈值 (% 绝对值, 0&lt;x≤50;留空 = 沿用全局,
-                通常调低如 3.5 = 更敏感)
+                {NOTIFICATIONS.prefs.price_label}
               </span>
               <input
                 type="number"
@@ -651,7 +771,7 @@ export function NotificationPreferencesCard() {
                 min="0"
                 max="50"
                 class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-1 text-xs"
-                placeholder="留空 → 沿用全局 thresholds.price_alert_high_pct"
+                placeholder={NOTIFICATIONS.prefs.price_placeholder}
                 value={currentPrefs().price_high_pct_override ?? ""}
                 onInput={(e) => handlePriceHighInput(e.currentTarget.value)}
               />
@@ -659,8 +779,7 @@ export function NotificationPreferencesCard() {
 
             <div>
               <div class="text-[11px] text-[color:var(--text-secondary)]">
-                强制升 High 即时推 immediate_kinds(命中元素无视 poller 给的
-                severity,直接 High 走 sink)
+                {NOTIFICATIONS.prefs.immediate_label}
               </div>
               <div class="mt-1 flex flex-wrap gap-1">
                 <For each={currentKindTags()}>
@@ -686,23 +805,112 @@ export function NotificationPreferencesCard() {
                 </For>
               </div>
             </div>
+
+            <div class="space-y-1.5 rounded-md border border-dashed border-[color:var(--border)] p-2.5">
+              <div class="flex items-center justify-between text-[11px]">
+                <span class="font-semibold text-[color:var(--text-secondary)]">
+                  {NOTIFICATIONS.prefs.quiet_section}
+                </span>
+                <Show
+                  when={currentPrefs().quiet_hours}
+                  fallback={
+                    <button
+                      type="button"
+                      class="rounded-md border border-[color:var(--accent)] px-2 py-0.5 text-[10px] text-[color:var(--accent)] hover:bg-[color:var(--accent)]/10"
+                      onClick={enableQuiet}
+                    >
+                      {NOTIFICATIONS.prefs.quiet_enable_button}
+                    </button>
+                  }
+                >
+                  <button
+                    type="button"
+                    class="rounded-md border border-rose-500 px-2 py-0.5 text-[10px] text-rose-500 hover:bg-rose-500/10"
+                    onClick={clearQuiet}
+                  >
+                    {NOTIFICATIONS.prefs.quiet_disable_button}
+                  </button>
+                </Show>
+              </div>
+              <Show when={currentPrefs().quiet_hours}>
+                <div class="flex flex-wrap items-center gap-2 text-[11px]">
+                  <label class="flex items-center gap-1">
+                    <span class="text-[color:var(--text-secondary)]">{NOTIFICATIONS.prefs.quiet_from}</span>
+                    <input
+                      type="time"
+                      class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-0.5 font-mono text-xs"
+                      value={currentPrefs().quiet_hours!.from}
+                      onInput={(e) => setQuietFrom(e.currentTarget.value)}
+                    />
+                  </label>
+                  <label class="flex items-center gap-1">
+                    <span class="text-[color:var(--text-secondary)]">{NOTIFICATIONS.prefs.quiet_to}</span>
+                    <input
+                      type="time"
+                      class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-0.5 font-mono text-xs"
+                      value={currentPrefs().quiet_hours!.to}
+                      onInput={(e) => setQuietTo(e.currentTarget.value)}
+                    />
+                  </label>
+                  <span class="text-[10px] italic text-[color:var(--text-secondary)]">
+                    {NOTIFICATIONS.prefs.quiet_hint}
+                  </span>
+                </div>
+                <Show
+                  when={
+                    currentPrefs().quiet_hours!.from ===
+                    currentPrefs().quiet_hours!.to
+                  }
+                >
+                  <span class="rounded-md border border-rose-500/50 bg-rose-500/10 px-2 py-0.5 text-[10px] text-rose-500">
+                    {NOTIFICATIONS.prefs.quiet_invalid}
+                  </span>
+                </Show>
+                <div class="text-[10px] text-[color:var(--text-secondary)]">
+                  {NOTIFICATIONS.prefs.quiet_exempt_hint}
+                </div>
+                <div class="flex flex-wrap gap-1">
+                  <For each={currentKindTags()}>
+                    {(tag) => {
+                      const selected = () =>
+                        (currentPrefs().quiet_hours?.exempt_kinds ?? []).includes(
+                          tag,
+                        );
+                      return (
+                        <button
+                          type="button"
+                          class="rounded-md border px-2 py-0.5 text-[11px]"
+                          classList={{
+                            "border-sky-500 bg-sky-500/10 text-sky-600":
+                              selected(),
+                            "border-[color:var(--border)] text-[color:var(--text-secondary)]":
+                              !selected(),
+                          }}
+                          onClick={() => toggleQuietExempt(tag)}
+                        >
+                          {tag}
+                        </button>
+                      );
+                    }}
+                  </For>
+                </div>
+              </Show>
+            </div>
           </div>
 
           <div class="flex items-center justify-end gap-2">
             <Show when={detailDirty()}>
-              <span class="text-[10px] text-amber-500">有未保存改动</span>
+              <span class="text-[10px] text-amber-500">{NOTIFICATIONS.prefs.dirty_label}</span>
             </Show>
             <button
               type="button"
               class="rounded-md bg-[color:var(--accent)] px-3 py-1 text-xs font-bold text-white disabled:opacity-50"
-              disabled={
-                savingKey() === actorKey(currentActor()!) || !detailDirty()
-              }
+              disabled={savingKey() === currentActorKey() || !detailDirty()}
               onClick={() => void submitDetail()}
             >
-              {savingKey() === actorKey(currentActor()!)
-                ? "保存中..."
-                : "保存细调"}
+              {savingKey() === currentActorKey()
+                ? NOTIFICATIONS.prefs.save_detail_saving
+                : NOTIFICATIONS.prefs.save_detail_button}
             </button>
           </div>
         </div>

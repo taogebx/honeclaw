@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use hone_core::HoneConfig;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
-use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use serde::{Deserialize, Serialize};
 use tauri::async_runtime;
 use tauri::{AppHandle, Manager, State};
@@ -18,6 +17,9 @@ use tauri_plugin_shell::{
     ShellExt,
     process::{CommandChild, CommandEvent},
 };
+
+#[cfg(not(test))]
+use rfd::{MessageButtons, MessageDialog, MessageLevel};
 
 mod processes;
 mod runtime_env;
@@ -57,34 +59,70 @@ impl Default for BackendConfig {
 pub(crate) struct DesktopChannelSettings {
     config_path: String,
     imessage_enabled: bool,
+    #[serde(default)]
+    imessage_target_handle: String,
     feishu_enabled: bool,
     #[serde(default)]
     feishu_app_id: String,
     #[serde(default)]
     feishu_app_secret: String,
+    #[serde(default)]
+    feishu_chat_scope: String,
+    #[serde(default)]
+    feishu_allow_emails: Vec<String>,
+    #[serde(default)]
+    feishu_allow_mobiles: Vec<String>,
+    #[serde(default)]
+    feishu_allow_open_ids: Vec<String>,
     telegram_enabled: bool,
     #[serde(default)]
     telegram_bot_token: String,
+    #[serde(default)]
+    telegram_chat_scope: String,
+    #[serde(default)]
+    telegram_allow_from: Vec<String>,
     discord_enabled: bool,
     #[serde(default)]
     discord_bot_token: String,
+    #[serde(default)]
+    discord_chat_scope: String,
+    #[serde(default)]
+    discord_allow_from: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopChannelSettingsInput {
     imessage_enabled: bool,
+    #[serde(default)]
+    imessage_target_handle: String,
     feishu_enabled: bool,
     #[serde(default)]
     feishu_app_id: String,
     #[serde(default)]
     feishu_app_secret: String,
+    #[serde(default)]
+    feishu_chat_scope: String,
+    #[serde(default)]
+    feishu_allow_emails: Vec<String>,
+    #[serde(default)]
+    feishu_allow_mobiles: Vec<String>,
+    #[serde(default)]
+    feishu_allow_open_ids: Vec<String>,
     telegram_enabled: bool,
     #[serde(default)]
     telegram_bot_token: String,
+    #[serde(default)]
+    telegram_chat_scope: String,
+    #[serde(default)]
+    telegram_allow_from: Vec<String>,
     discord_enabled: bool,
     #[serde(default)]
     discord_bot_token: String,
+    #[serde(default)]
+    discord_chat_scope: String,
+    #[serde(default)]
+    discord_allow_from: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,7 +158,7 @@ pub(crate) struct ChannelProcessCleanupResult {
     message: String,
 }
 
-/// Agent 基础设置（写入运行时覆盖层）
+/// Multi-agent search-stage settings saved under `agent.multi_agent.search`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MultiAgentSearchSettings {
@@ -134,6 +172,7 @@ pub(crate) struct MultiAgentSearchSettings {
     max_iterations: u32,
 }
 
+/// Multi-agent answer-stage settings saved under `agent.multi_agent.answer`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MultiAgentAnswerSettings {
@@ -169,8 +208,81 @@ pub(crate) struct AuxiliarySettings {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct HoneCloudSettings {
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    model: String,
+}
+
+const LLM_PROFILE_UI_IDS: &[&str] = &[
+    "main",
+    "aux",
+    "news_classifier",
+    "filing_summary",
+    "earnings_quality",
+    "digest_fast",
+    "digest_strong",
+    "mainline_short",
+];
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LlmProfileEntrySettings {
+    id: String,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    reasoning_max_tokens: Option<u32>,
+    #[serde(default)]
+    response_format_json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LlmProfileSettings {
+    #[serde(default)]
+    default_profile: String,
+    #[serde(default)]
+    auxiliary_profile: String,
+    #[serde(default)]
+    polish_profile: String,
+    #[serde(default)]
+    news_classifier_profile: String,
+    #[serde(default)]
+    filing_summary_profile: String,
+    #[serde(default)]
+    earnings_quality_profile: String,
+    #[serde(default)]
+    digest_pass1_profile: String,
+    #[serde(default)]
+    digest_pass2_profile: String,
+    #[serde(default)]
+    digest_event_dedupe_profile: String,
+    #[serde(default)]
+    mainline_distill_profile: String,
+    #[serde(default)]
+    profiles: Vec<LlmProfileEntrySettings>,
+}
+
+/// Desktop Agent settings payload; saving writes canonical config.yaml and regenerates effective config.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct AgentSettings {
-    /// function_calling | gemini_cli | gemini_acp | codex_cli | codex_acp | opencode_acp | multi-agent
+    /// function_calling | gemini_cli | codex_cli | codex_acp | opencode_acp | multi-agent | hone_cloud
+    /// gemini_acp remains parseable for legacy config migration but is disabled at runtime.
     runner: String,
     /// codex_cli 专用，其他 provider 忽略
     codex_model: String,
@@ -186,7 +298,11 @@ pub(crate) struct AgentSettings {
     #[serde(default)]
     auxiliary: Option<AuxiliarySettings>,
     #[serde(default)]
+    hone_cloud: Option<HoneCloudSettings>,
+    #[serde(default)]
     multi_agent: Option<MultiAgentSettings>,
+    #[serde(default)]
+    llm_profiles: Option<LlmProfileSettings>,
 }
 
 /// CLI 联通检测结果
@@ -197,7 +313,7 @@ pub(crate) struct CliCheckResult {
     message: String,
 }
 
-/// OpenRouter API Key 设置（写入运行时覆盖层的 llm.openrouter.api_keys）
+/// OpenRouter API Key 设置（写入 canonical config 的 llm.providers.openrouter.api_keys）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OpenRouterSettings {
@@ -205,7 +321,7 @@ pub(crate) struct OpenRouterSettings {
     api_keys: Vec<String>,
 }
 
-/// FMP API Key 设置（写入运行时覆盖层的 fmp.api_keys）
+/// FMP API Key 设置（写入 canonical config.yaml 的 fmp.api_keys）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FmpSettings {
@@ -213,7 +329,7 @@ pub(crate) struct FmpSettings {
     api_keys: Vec<String>,
 }
 
-/// Tavily API Key 设置（写入运行时覆盖层的 search.api_keys）
+/// Tavily API Key 设置（写入 canonical config.yaml 的 search.api_keys）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TavilySettings {
@@ -315,6 +431,7 @@ struct RuntimePaths {
     effective_config_path: PathBuf,
     data_dir: PathBuf,
     runtime_dir: PathBuf,
+    sandbox_dir: PathBuf,
     skills_dir: PathBuf,
 }
 
@@ -373,13 +490,55 @@ fn validate_meta(meta: MetaInfo) -> Result<MetaInfo, String> {
     }
 }
 
+pub(crate) fn record_startup_error(app: &AppHandle, message: &str) {
+    log_desktop(
+        app,
+        "ERROR",
+        format!("desktop startup blocked before backend bootstrap: {message}"),
+    );
+    eprintln!("Hone Startup Blocked: {message}");
+}
+
+fn startup_error_dialog_suppressed_from_env_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|raw| raw.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+    )
+}
+
+fn startup_error_dialog_suppressed() -> bool {
+    startup_error_dialog_suppressed_from_env_value(
+        env::var("HONE_SUPPRESS_STARTUP_DIALOG").ok().as_deref(),
+    ) || startup_error_dialog_suppressed_from_env_value(env::var("CI").ok().as_deref())
+}
+
+#[cfg(not(test))]
+fn spawn_startup_error_dialog(message: String) {
+    let _ = std::thread::Builder::new()
+        .name("hone-startup-error-dialog".to_string())
+        .spawn(move || {
+            let _ = MessageDialog::new()
+                .set_level(MessageLevel::Error)
+                .set_title("Hone Startup Blocked")
+                .set_description(&message)
+                .set_buttons(MessageButtons::Ok)
+                .show();
+        });
+}
+
+#[cfg(test)]
+static STARTUP_ERROR_DIALOG_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn spawn_startup_error_dialog(_message: String) {
+    STARTUP_ERROR_DIALOG_SPAWNS.fetch_add(1, Ordering::SeqCst);
+}
+
 pub(crate) fn show_startup_error_dialog(message: &str) {
-    let _ = MessageDialog::new()
-        .set_level(MessageLevel::Error)
-        .set_title("Hone Startup Blocked")
-        .set_description(message)
-        .set_buttons(MessageButtons::Ok)
-        .show();
+    if startup_error_dialog_suppressed() {
+        return;
+    }
+    spawn_startup_error_dialog(message.to_string());
 }
 
 impl DesktopBackendManager {
@@ -774,14 +933,14 @@ pub(crate) async fn set_channel_settings_impl(
         }
         let status = connect_backend_serialized(&app, &state).await?;
         let message = if status.connected {
-            "已保存到运行时覆盖层，并已重启内置后端".to_string()
+            "已保存渠道设置，并已重启内置后端".to_string()
         } else {
             format!(
-                "已保存到运行时覆盖层，但内置后端重启后未连接：{}",
+                "已保存渠道设置，但当前运行时尚未生效：{}",
                 status
                     .last_error
                     .clone()
-                    .unwrap_or_else(|| "未知错误".to_string())
+                    .unwrap_or_else(|| "内置后端重启后未连接".to_string())
             )
         };
         return Ok(DesktopChannelSettingsUpdateResult {
@@ -795,7 +954,7 @@ pub(crate) async fn set_channel_settings_impl(
     Ok(DesktopChannelSettingsUpdateResult {
         settings: saved,
         restarted_bundled_backend: false,
-        message: "已保存到本地运行时覆盖层。当前为远程模式，下次切回内置后端时生效".to_string(),
+        message: "已保存渠道设置。当前为远程模式，下次切回内置后端时生效".to_string(),
         backend_status: None,
     })
 }
@@ -832,52 +991,74 @@ pub(crate) fn get_agent_settings_impl(app: AppHandle) -> Result<AgentSettings, S
         openai_model: config.agent.opencode.model.clone(),
         openai_api_key: config.agent.opencode.api_key.clone(),
         auxiliary: Some(seed_auxiliary_settings(&config)),
+        hone_cloud: Some(HoneCloudSettings {
+            base_url: config.agent.hone_cloud.base_url.clone(),
+            api_key: config.agent.hone_cloud.api_key.clone(),
+            model: config.agent.hone_cloud.model.clone(),
+        }),
         multi_agent: Some(seed_multi_agent_settings(&config)),
+        llm_profiles: Some(seed_llm_profile_settings(&config)),
     })
 }
 
-fn build_agent_setting_updates(settings: &AgentSettings) -> Vec<(&'static str, serde_yaml::Value)> {
+fn setting(path: impl Into<String>, value: serde_yaml::Value) -> (String, serde_yaml::Value) {
+    (path.into(), value)
+}
+
+fn build_agent_setting_updates(settings: &AgentSettings) -> Vec<(String, serde_yaml::Value)> {
     let mut updates = vec![
-        (
+        setting(
             "agent.runner",
             serde_yaml::Value::String(settings.runner.clone()),
         ),
-        (
+        setting(
             "agent.codex_model",
             serde_yaml::Value::String(settings.codex_model.clone()),
         ),
-        (
+        setting(
             "agent.opencode.api_base_url",
             serde_yaml::Value::String(settings.openai_url.clone()),
         ),
-        (
+        setting(
             "agent.opencode.model",
             serde_yaml::Value::String(settings.openai_model.clone()),
         ),
-        (
+        setting(
             "agent.opencode.api_key",
             serde_yaml::Value::String(settings.openai_api_key.clone()),
         ),
     ];
+    if let Some(hone_cloud) = &settings.hone_cloud {
+        updates.extend([
+            setting(
+                "agent.hone_cloud.base_url",
+                serde_yaml::Value::String(hone_cloud.base_url.clone()),
+            ),
+            setting(
+                "agent.hone_cloud.api_key",
+                serde_yaml::Value::String(hone_cloud.api_key.clone()),
+            ),
+            setting(
+                "agent.hone_cloud.model",
+                serde_yaml::Value::String(hone_cloud.model.clone()),
+            ),
+        ]);
+    }
     if let Some(auxiliary) = &settings.auxiliary {
         updates.extend([
-            (
+            setting(
                 "llm.auxiliary.base_url",
                 serde_yaml::Value::String(auxiliary.base_url.clone()),
             ),
-            (
+            setting(
                 "llm.auxiliary.api_key",
                 serde_yaml::Value::String(auxiliary.api_key.clone()),
             ),
-            (
-                "llm.auxiliary.api_key_env",
-                serde_yaml::Value::String("MINIMAX_API_KEY".to_string()),
-            ),
-            (
+            setting(
                 "llm.auxiliary.model",
                 serde_yaml::Value::String(auxiliary.model.clone()),
             ),
-            (
+            setting(
                 "llm.openrouter.sub_model",
                 serde_yaml::Value::String(auxiliary.model.clone()),
             ),
@@ -885,41 +1066,41 @@ fn build_agent_setting_updates(settings: &AgentSettings) -> Vec<(&'static str, s
     }
     if let Some(multi_agent) = &settings.multi_agent {
         updates.extend([
-            (
+            setting(
                 "agent.multi_agent.search.base_url",
                 serde_yaml::Value::String(multi_agent.search.base_url.clone()),
             ),
-            (
+            setting(
                 "agent.multi_agent.search.api_key",
                 serde_yaml::Value::String(multi_agent.search.api_key.clone()),
             ),
-            (
+            setting(
                 "agent.multi_agent.search.model",
                 serde_yaml::Value::String(multi_agent.search.model.clone()),
             ),
-            (
+            setting(
                 "agent.multi_agent.search.max_iterations",
                 serde_yaml::Value::Number(serde_yaml::Number::from(
                     multi_agent.search.max_iterations,
                 )),
             ),
-            (
+            setting(
                 "agent.multi_agent.answer.api_base_url",
                 serde_yaml::Value::String(multi_agent.answer.base_url.clone()),
             ),
-            (
+            setting(
                 "agent.multi_agent.answer.api_key",
                 serde_yaml::Value::String(multi_agent.answer.api_key.clone()),
             ),
-            (
+            setting(
                 "agent.multi_agent.answer.model",
                 serde_yaml::Value::String(multi_agent.answer.model.clone()),
             ),
-            (
+            setting(
                 "agent.multi_agent.answer.variant",
                 serde_yaml::Value::String(multi_agent.answer.variant.clone()),
             ),
-            (
+            setting(
                 "agent.multi_agent.answer.max_tool_calls",
                 serde_yaml::Value::Number(serde_yaml::Number::from(
                     multi_agent.answer.max_tool_calls,
@@ -927,6 +1108,125 @@ fn build_agent_setting_updates(settings: &AgentSettings) -> Vec<(&'static str, s
             ),
         ]);
     }
+    if let Some(llm_profiles) = &settings.llm_profiles {
+        updates.extend(build_llm_profile_setting_updates(llm_profiles));
+    }
+    updates
+}
+
+fn optional_string_value(value: &Option<String>) -> serde_yaml::Value {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| serde_yaml::Value::String(value.to_string()))
+        .unwrap_or(serde_yaml::Value::Null)
+}
+
+fn optional_u32_value(value: Option<u32>) -> serde_yaml::Value {
+    value
+        .map(|value| serde_yaml::Value::Number(serde_yaml::Number::from(value)))
+        .unwrap_or(serde_yaml::Value::Null)
+}
+
+fn optional_f32_value(value: Option<f32>) -> serde_yaml::Value {
+    value
+        .and_then(|value| serde_yaml::to_value(value).ok())
+        .unwrap_or(serde_yaml::Value::Null)
+}
+
+fn build_llm_profile_setting_updates(
+    settings: &LlmProfileSettings,
+) -> Vec<(String, serde_yaml::Value)> {
+    let mut updates = vec![
+        setting(
+            "llm.default_profile",
+            serde_yaml::Value::String(settings.default_profile.clone()),
+        ),
+        setting(
+            "llm.auxiliary_profile",
+            serde_yaml::Value::String(settings.auxiliary_profile.clone()),
+        ),
+        setting(
+            "event_engine.renderer.polish_llm",
+            serde_yaml::Value::String(settings.polish_profile.clone()),
+        ),
+        setting(
+            "event_engine.news_classifier_llm",
+            serde_yaml::Value::String(settings.news_classifier_profile.clone()),
+        ),
+        setting(
+            "event_engine.sec_filings.enrichment.llm",
+            serde_yaml::Value::String(settings.filing_summary_profile.clone()),
+        ),
+        setting(
+            "event_engine.earnings.quality_review.llm",
+            serde_yaml::Value::String(settings.earnings_quality_profile.clone()),
+        ),
+        setting(
+            "event_engine.global_digest.pass1_llm",
+            serde_yaml::Value::String(settings.digest_pass1_profile.clone()),
+        ),
+        setting(
+            "event_engine.global_digest.pass2_llm",
+            serde_yaml::Value::String(settings.digest_pass2_profile.clone()),
+        ),
+        setting(
+            "event_engine.global_digest.event_dedupe_llm",
+            serde_yaml::Value::String(settings.digest_event_dedupe_profile.clone()),
+        ),
+        setting(
+            "event_engine.global_digest.mainline_distill_llm",
+            serde_yaml::Value::String(settings.mainline_distill_profile.clone()),
+        ),
+    ];
+
+    for profile in &settings.profiles {
+        let id = profile.id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let prefix = format!("llm.profiles.{id}");
+        updates.extend([
+            setting(
+                format!("{prefix}.provider"),
+                serde_yaml::Value::String(profile.provider.clone()),
+            ),
+            setting(
+                format!("{prefix}.model"),
+                serde_yaml::Value::String(profile.model.clone()),
+            ),
+            setting(
+                format!("{prefix}.params.max_tokens"),
+                optional_u32_value(profile.max_tokens),
+            ),
+            setting(
+                format!("{prefix}.params.temperature"),
+                optional_f32_value(profile.temperature),
+            ),
+            setting(
+                format!("{prefix}.params.top_p"),
+                optional_f32_value(profile.top_p),
+            ),
+            setting(
+                format!("{prefix}.params.reasoning.effort"),
+                optional_string_value(&profile.reasoning_effort),
+            ),
+            setting(
+                format!("{prefix}.params.reasoning.max_tokens"),
+                optional_u32_value(profile.reasoning_max_tokens),
+            ),
+            setting(
+                format!("{prefix}.params.response_format.type"),
+                if profile.response_format_json {
+                    serde_yaml::Value::String("json_object".to_string())
+                } else {
+                    serde_yaml::Value::Null
+                },
+            ),
+        ]);
+    }
+
     updates
 }
 
@@ -944,7 +1244,7 @@ fn build_agent_settings_update_result(
                 "已保存 Agent 设置，并已重启内置后端".to_string()
             } else {
                 format!(
-                    "已保存 Agent 设置，但当前 runtime 尚未生效：{}",
+                    "已保存 Agent 设置，但当前运行时尚未生效：{}",
                     status
                         .last_error
                         .clone()
@@ -1033,8 +1333,7 @@ pub(crate) async fn test_openai_channel_impl(
     use reqwest::Client;
     use serde_json::json;
 
-    let base = url.trim_end_matches('/');
-    let endpoint = format!("{}/chat/completions", base);
+    let endpoint = resolve_openai_chat_completions_endpoint(&url);
 
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -1076,6 +1375,15 @@ pub(crate) async fn test_openai_channel_impl(
             ok: false,
             message: format!("请求失败：{}", e),
         }),
+    }
+}
+
+fn resolve_openai_chat_completions_endpoint(url: &str) -> String {
+    let base = url.trim().trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else {
+        format!("{base}/chat/completions")
     }
 }
 
@@ -1135,6 +1443,26 @@ mod tests {
                 meta.capabilities.iter().any(|value| value == capability),
                 "bundled desktop meta should expose {capability}"
             );
+        }
+    }
+
+    #[test]
+    fn startup_error_dialog_uses_nonblocking_spawn_path() {
+        STARTUP_ERROR_DIALOG_SPAWNS.store(0, Ordering::SeqCst);
+
+        show_startup_error_dialog("startup failed during smoke test");
+
+        assert_eq!(STARTUP_ERROR_DIALOG_SPAWNS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn startup_error_dialog_suppression_parses_truthy_env_values() {
+        for value in ["1", "true", "TRUE", "yes", "on", " on "] {
+            assert!(startup_error_dialog_suppressed_from_env_value(Some(value)));
+        }
+
+        for value in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+            assert!(!startup_error_dialog_suppressed_from_env_value(value));
         }
     }
 
@@ -1361,6 +1689,7 @@ fmp:
             openai_model: "openai/gpt-5.4".to_string(),
             openai_api_key: "sk-opencode".to_string(),
             auxiliary: None,
+            hone_cloud: None,
             multi_agent: Some(MultiAgentSettings {
                 search: MultiAgentSearchSettings {
                     base_url: "https://search.example/v1".to_string(),
@@ -1376,6 +1705,7 @@ fmp:
                     max_tool_calls: 2,
                 },
             }),
+            llm_profiles: None,
         };
 
         let updates = build_agent_setting_updates(&settings);
@@ -1430,6 +1760,103 @@ fmp:
     }
 
     #[test]
+    fn build_agent_setting_updates_persists_llm_profile_bindings_and_params() {
+        let settings = AgentSettings {
+            runner: "hone_cloud".to_string(),
+            codex_model: String::new(),
+            openai_url: String::new(),
+            openai_model: String::new(),
+            openai_api_key: String::new(),
+            auxiliary: None,
+            hone_cloud: None,
+            multi_agent: None,
+            llm_profiles: Some(LlmProfileSettings {
+                default_profile: "main".to_string(),
+                auxiliary_profile: "aux".to_string(),
+                polish_profile: "aux".to_string(),
+                news_classifier_profile: "news_classifier".to_string(),
+                filing_summary_profile: "filing_summary".to_string(),
+                earnings_quality_profile: "earnings_quality".to_string(),
+                digest_pass1_profile: "digest_fast".to_string(),
+                digest_pass2_profile: "digest_strong".to_string(),
+                digest_event_dedupe_profile: "digest_strong".to_string(),
+                mainline_distill_profile: "mainline_short".to_string(),
+                profiles: vec![LlmProfileEntrySettings {
+                    id: "digest_strong".to_string(),
+                    provider: "openrouter".to_string(),
+                    model: "x-ai/grok-4.1-fast".to_string(),
+                    max_tokens: Some(1600),
+                    temperature: Some(0.2),
+                    top_p: None,
+                    reasoning_effort: Some("low".to_string()),
+                    reasoning_max_tokens: Some(512),
+                    response_format_json: true,
+                }],
+            }),
+        };
+
+        let updates = build_agent_setting_updates(&settings);
+        let update_map = updates
+            .into_iter()
+            .map(|(path, value)| (path, value))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            update_map
+                .get("event_engine.global_digest.pass2_llm")
+                .and_then(serde_yaml::Value::as_str),
+            Some("digest_strong")
+        );
+        assert_eq!(
+            update_map
+                .get("llm.profiles.digest_strong.model")
+                .and_then(serde_yaml::Value::as_str),
+            Some("x-ai/grok-4.1-fast")
+        );
+        assert_eq!(
+            update_map
+                .get("llm.profiles.digest_strong.params.reasoning.effort")
+                .and_then(serde_yaml::Value::as_str),
+            Some("low")
+        );
+        assert_eq!(
+            update_map
+                .get("llm.profiles.digest_strong.params.response_format.type")
+                .and_then(serde_yaml::Value::as_str),
+            Some("json_object")
+        );
+    }
+
+    #[test]
+    fn build_agent_setting_updates_persists_auxiliary_key_without_env_field() {
+        let settings = AgentSettings {
+            runner: "opencode_acp".to_string(),
+            codex_model: String::new(),
+            openai_url: String::new(),
+            openai_model: String::new(),
+            openai_api_key: String::new(),
+            auxiliary: Some(AuxiliarySettings {
+                base_url: "https://api.minimaxi.com/v1".to_string(),
+                api_key: "sk-cp-aux".to_string(),
+                model: "MiniMax-M2.7-highspeed".to_string(),
+            }),
+            hone_cloud: None,
+            multi_agent: None,
+            llm_profiles: None,
+        };
+
+        let updates = build_agent_setting_updates(&settings);
+        assert!(updates.iter().any(|(path, value)| {
+            path == "llm.auxiliary.api_key" && value.as_str() == Some("sk-cp-aux")
+        }));
+        assert!(
+            updates
+                .iter()
+                .all(|(path, _)| path != "llm.auxiliary.api_key_env")
+        );
+    }
+
+    #[test]
     fn agent_settings_require_save_skips_identical_runner_payloads() {
         let settings = AgentSettings {
             runner: "opencode_acp".to_string(),
@@ -1441,6 +1868,11 @@ fmp:
                 base_url: "https://api.minimaxi.com/v1".to_string(),
                 api_key: "sk-cp-aux".to_string(),
                 model: "MiniMax-M2.7-highspeed".to_string(),
+            }),
+            hone_cloud: Some(HoneCloudSettings {
+                base_url: "https://hone-claw.com".to_string(),
+                api_key: "hck_test".to_string(),
+                model: "hone-cloud".to_string(),
             }),
             multi_agent: Some(MultiAgentSettings {
                 search: MultiAgentSearchSettings {
@@ -1457,6 +1889,7 @@ fmp:
                     max_tool_calls: 1,
                 },
             }),
+            llm_profiles: None,
         };
 
         assert!(
@@ -1483,7 +1916,9 @@ fmp:
             openai_model: "google/gemini-2.5-pro-preview".to_string(),
             openai_api_key: String::new(),
             auxiliary: None,
+            hone_cloud: None,
             multi_agent: None,
+            llm_profiles: None,
         };
         let status = BackendStatusInfo {
             config: BackendConfig {
@@ -1509,7 +1944,7 @@ fmp:
         assert!(result.restarted_bundled_backend);
         assert_eq!(result.settings.runner, "multi-agent");
         assert!(
-            result.message.contains("当前 runtime 尚未生效"),
+            result.message.contains("当前运行时尚未生效"),
             "should explicitly surface that runtime did not apply the new runner"
         );
         assert_eq!(
@@ -1536,13 +1971,17 @@ fmp:
         .expect("desktop channel payload should deserialize");
 
         assert!(input.imessage_enabled);
+        assert_eq!(input.imessage_target_handle, "");
         assert!(input.feishu_enabled);
         assert_eq!(input.feishu_app_id, "cli_test");
         assert_eq!(input.feishu_app_secret, "secret-value");
+        assert_eq!(input.feishu_chat_scope, "");
         assert!(input.telegram_enabled);
         assert_eq!(input.telegram_bot_token, "tg-token");
+        assert_eq!(input.telegram_allow_from, Vec::<String>::new());
         assert!(input.discord_enabled);
         assert_eq!(input.discord_bot_token, "discord-token");
+        assert_eq!(input.discord_allow_from, Vec::<String>::new());
     }
 
     #[test]
@@ -1550,21 +1989,34 @@ fmp:
         let settings = DesktopChannelSettings {
             config_path: "/tmp/config.yaml".to_string(),
             imessage_enabled: false,
+            imessage_target_handle: "+15551234567".to_string(),
             feishu_enabled: true,
             feishu_app_id: "cli_test".to_string(),
             feishu_app_secret: "secret-value".to_string(),
+            feishu_chat_scope: "ALL".to_string(),
+            feishu_allow_emails: vec!["admin@example.com".to_string()],
+            feishu_allow_mobiles: vec![],
+            feishu_allow_open_ids: vec!["ou_abc".to_string()],
             telegram_enabled: true,
             telegram_bot_token: "tg-token".to_string(),
+            telegram_chat_scope: "DM_ONLY".to_string(),
+            telegram_allow_from: vec!["123".to_string()],
             discord_enabled: true,
             discord_bot_token: "discord-token".to_string(),
+            discord_chat_scope: "GROUPCHAT_ONLY".to_string(),
+            discord_allow_from: vec!["456".to_string()],
         };
 
         let json =
             serde_json::to_value(&settings).expect("desktop channel settings should serialize");
         assert_eq!(json["feishuAppId"], "cli_test");
         assert_eq!(json["feishuAppSecret"], "secret-value");
+        assert_eq!(json["imessageTargetHandle"], "+15551234567");
+        assert_eq!(json["feishuAllowOpenIds"][0], "ou_abc");
         assert_eq!(json["telegramBotToken"], "tg-token");
+        assert_eq!(json["telegramAllowFrom"][0], "123");
         assert_eq!(json["discordBotToken"], "discord-token");
+        assert_eq!(json["discordAllowFrom"][0], "456");
     }
 
     #[test]
@@ -1611,8 +2063,8 @@ fmp:
     }
 }
 
-/// 检测本地 CLI/ACP runner 是否可用（运行 --version）。
-/// 仅检查二进制是否存在且可执行，不发送真实请求，通常在 1～2s 内完成。
+/// 检测 runner 对应的本机 CLI 二进制是否可用。
+/// 仅运行 `AgentRunnerKind::cli_probe()` 提供的轻量参数；不发送真实请求，也不启动 runner。
 pub(crate) async fn check_agent_cli_impl(runner: String) -> Result<CliCheckResult, String> {
     let probe = hone_core::config::AgentRunnerKind::from_config_value(&runner)
         .cli_probe()
@@ -1650,18 +2102,17 @@ pub(crate) async fn check_agent_cli_impl(runner: String) -> Result<CliCheckResul
     }
 }
 
-/// 读取运行时覆盖层中的 OpenRouter API Key 设置（多 Key）
+/// 读取 config.yaml 中的 OpenRouter API Key 设置（多 Key）
 pub(crate) fn get_openrouter_settings_impl(app: AppHandle) -> Result<OpenRouterSettings, String> {
     let runtime = ensure_runtime_paths(&app)?;
     let config = HoneConfig::from_file(&runtime.config_path).map_err(|e| e.to_string())?;
-    // 合并 api_key（旧格式）和 api_keys（新格式）
-    let pool = config.llm.openrouter.effective_key_pool();
+    let pool = config.llm.openrouter_key_pool();
     Ok(OpenRouterSettings {
         api_keys: pool.keys().to_vec(),
     })
 }
 
-/// 保存 OpenRouter API Keys 到运行时覆盖层，并重启内置后端立即生效
+/// 保存 OpenRouter API Keys 到 config.yaml，并重启内置后端立即生效
 pub(crate) async fn set_openrouter_settings_impl(
     app: AppHandle,
     state: State<'_, DesktopState>,
@@ -1679,7 +2130,7 @@ pub(crate) async fn set_openrouter_settings_impl(
             &runtime.effective_config_path,
             vec![
                 (
-                    "llm.openrouter.api_keys",
+                    "llm.providers.openrouter.api_keys",
                     serde_yaml::Value::Sequence(
                         valid_keys
                             .iter()
@@ -1687,6 +2138,14 @@ pub(crate) async fn set_openrouter_settings_impl(
                             .map(serde_yaml::Value::String)
                             .collect(),
                     ),
+                ),
+                (
+                    "llm.providers.openrouter.api_key",
+                    serde_yaml::Value::String(String::new()),
+                ),
+                (
+                    "llm.openrouter.api_keys",
+                    serde_yaml::Value::Sequence(Vec::new()),
                 ),
                 (
                     "llm.openrouter.api_key",
@@ -1717,7 +2176,7 @@ pub(crate) async fn set_openrouter_settings_impl(
     Ok(())
 }
 
-/// 读取运行时覆盖层中的 FMP API Key 设置（多 Key）
+/// 读取 canonical config.yaml 中的 FMP API Key 设置（多 Key）
 pub(crate) fn get_fmp_settings_impl(app: AppHandle) -> Result<FmpSettings, String> {
     let runtime = ensure_runtime_paths(&app)?;
     let config = HoneConfig::from_file(&runtime.config_path).map_err(|e| e.to_string())?;
@@ -1727,7 +2186,7 @@ pub(crate) fn get_fmp_settings_impl(app: AppHandle) -> Result<FmpSettings, Strin
     })
 }
 
-/// 保存 FMP API Keys 到运行时覆盖层，并重启内置后端立即生效
+/// 保存 FMP API Keys 到 canonical config.yaml，并重启内置后端立即生效
 pub(crate) async fn set_fmp_settings_impl(
     app: AppHandle,
     state: State<'_, DesktopState>,
@@ -1779,7 +2238,7 @@ pub(crate) async fn set_fmp_settings_impl(
     Ok(())
 }
 
-/// 读取运行时覆盖层中的 Tavily API Key 设置（多 Key）
+/// 读取 canonical config.yaml 中的 Tavily API Key 设置（多 Key）
 pub(crate) fn get_tavily_settings_impl(app: AppHandle) -> Result<TavilySettings, String> {
     let runtime = ensure_runtime_paths(&app)?;
     let config = HoneConfig::from_file(&runtime.config_path).map_err(|e| e.to_string())?;
@@ -1795,7 +2254,7 @@ pub(crate) fn get_tavily_settings_impl(app: AppHandle) -> Result<TavilySettings,
     })
 }
 
-/// 保存 Tavily API Keys 到运行时覆盖层，并重启内置后端立即生效
+/// 保存 Tavily API Keys 到 canonical config.yaml，并重启内置后端立即生效
 pub(crate) async fn set_tavily_settings_impl(
     app: AppHandle,
     state: State<'_, DesktopState>,

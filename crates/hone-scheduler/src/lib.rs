@@ -4,7 +4,11 @@
 
 use chrono::{Datelike, FixedOffset, Timelike, Utc};
 use hone_core::ActorIdentity;
-use hone_memory::{CronJobStorage, cron_job::ExecutionFilter};
+use hone_memory::{
+    CronJobStorage,
+    cron_job::{CronJobExecutionInput, ExecutionFilter},
+};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -32,6 +36,38 @@ pub struct SchedulerEvent {
     /// 是否绕过用户的 quiet_hours 静音。来源是 `CronJob.bypass_quiet_hours`，
     /// 默认 false（cron 任务遵守用户的勿扰时段）。
     pub bypass_quiet_hours: bool,
+}
+
+/// Ensure cron execution history can finalize the pre-written `running/pending` row.
+///
+/// `CronJobStorage::record_execution_event` matches terminal records to started
+/// records by a top-level `detail.delivery_key`. Scheduler execution metadata is
+/// often a domain-specific object and may not carry that key, so channel
+/// handlers should wrap every terminal detail through this helper before
+/// recording it.
+pub fn execution_detail_with_delivery_key(detail: Value, delivery_key: &str) -> Value {
+    let mut object = match detail {
+        Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            if !other.is_null() {
+                map.insert("scheduler".to_string(), other);
+            }
+            map
+        }
+    };
+    let existing_key = object
+        .get("delivery_key")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim();
+    if existing_key.is_empty() {
+        object.insert(
+            "delivery_key".to_string(),
+            Value::String(delivery_key.to_string()),
+        );
+    }
+    Value::Object(object)
 }
 
 /// 定时任务调度器
@@ -102,6 +138,37 @@ impl HoneScheduler {
         );
 
         for (actor, job) in due_jobs {
+            let delivery_key = scheduled_delivery_key(&job, &now);
+            if job.channel_target.trim().is_empty() {
+                warn!(
+                    "⏰ 定时任务缺少 channel_target，跳过投递并记录失败: actor={} job={}",
+                    actor.storage_key(),
+                    job.id
+                );
+                let _ = self.storage.record_execution_event(
+                    &actor,
+                    &job.id,
+                    &job.name,
+                    "",
+                    job.is_heartbeat(),
+                    CronJobExecutionInput {
+                        execution_status: "execution_failed".to_string(),
+                        message_send_status: "target_missing".to_string(),
+                        should_deliver: true,
+                        delivered: false,
+                        response_preview: None,
+                        error_message: Some(
+                            "定时任务缺少 channel_target，无法确认来源渠道投递目标".to_string(),
+                        ),
+                        detail: json!({
+                            "phase": "target_missing",
+                            "delivery_key": delivery_key,
+                        }),
+                    },
+                );
+                self.storage.mark_job_run(&actor, &job.id);
+                continue;
+            }
             let last_delivered_previews = if job.is_heartbeat() {
                 load_heartbeat_delivery_history(&self.storage, &actor)
             } else {
@@ -115,7 +182,7 @@ impl HoneScheduler {
                 channel: job.channel.clone(),
                 channel_scope: job.channel_scope.clone(),
                 channel_target: job.channel_target.clone(),
-                delivery_key: scheduled_delivery_key(&job, &now),
+                delivery_key,
                 push: job.push.clone(),
                 tags: job.tags.clone(),
                 heartbeat: job.is_heartbeat(),
@@ -195,7 +262,7 @@ fn scheduled_delivery_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hone_memory::cron_job::CronJobExecutionInput;
+    use hone_memory::cron_job::{CronJob, CronJobData, CronSchedule};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_temp_dir(prefix: &str) -> std::path::PathBuf {
@@ -257,5 +324,123 @@ mod tests {
         assert!(history[0].1.contains("小米跌破 30 港元"));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn scheduler_records_missing_channel_target_without_dispatching() {
+        let dir = make_temp_dir("hone_scheduler_missing_target");
+        let sqlite_path = dir.join("sessions.sqlite3");
+        let storage = Arc::new(CronJobStorage::with_sqlite(&dir, &sqlite_path));
+        let actor = ActorIdentity::new("telegram", "user_missing", None::<String>).expect("actor");
+        let now = Utc::now().with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap());
+        let job = CronJob {
+            id: "j_missing_target".to_string(),
+            name: "missing target".to_string(),
+            schedule: CronSchedule {
+                hour: now.hour(),
+                minute: now.minute(),
+                repeat: "daily".to_string(),
+                weekday: None,
+                date: None,
+            },
+            task_prompt: "task".to_string(),
+            push: json!({"type": "analysis"}),
+            enabled: true,
+            channel: "telegram".to_string(),
+            channel_scope: None,
+            channel_target: String::new(),
+            tags: Vec::new(),
+            created_at: None,
+            last_run_at: None,
+            bypass_quiet_hours: false,
+        };
+        storage
+            .save_jobs(
+                &actor,
+                &CronJobData {
+                    actor: Some(actor.clone()),
+                    user_id: actor.user_id.clone(),
+                    jobs: vec![job],
+                    pending_updates: Vec::new(),
+                },
+            )
+            .expect("save invalid legacy job");
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let scheduler = HoneScheduler::new(storage.clone(), tx, vec!["telegram".to_string()]);
+        scheduler.check_due_jobs().await;
+
+        assert!(rx.try_recv().is_err());
+        let records = storage
+            .list_recent_executions(&ExecutionFilter {
+                job_id: Some("j_missing_target".to_string()),
+                limit: 10,
+                ..ExecutionFilter::default()
+            })
+            .expect("list executions");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].execution_status, "execution_failed");
+        assert_eq!(records[0].message_send_status, "target_missing");
+        assert!(
+            records[0]
+                .error_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("channel_target")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn execution_detail_with_delivery_key_preserves_metadata() {
+        let detail = execution_detail_with_delivery_key(
+            serde_json::json!({
+                "parse_kind": "JsonNoop",
+                "heartbeat_model": "model-a",
+            }),
+            "delivery-123",
+        );
+
+        assert_eq!(detail["delivery_key"], "delivery-123");
+        assert_eq!(detail["parse_kind"], "JsonNoop");
+        assert_eq!(detail["heartbeat_model"], "model-a");
+    }
+
+    #[test]
+    fn execution_detail_with_delivery_key_wraps_non_object_metadata() {
+        let detail = execution_detail_with_delivery_key(Value::Null, "delivery-123");
+        assert_eq!(detail["delivery_key"], "delivery-123");
+        assert!(detail.get("scheduler").is_none());
+
+        let detail = execution_detail_with_delivery_key(
+            serde_json::json!(["metadata", "array"]),
+            "delivery-456",
+        );
+        assert_eq!(detail["delivery_key"], "delivery-456");
+        assert_eq!(detail["scheduler"][0], "metadata");
+    }
+
+    #[test]
+    fn execution_detail_with_delivery_key_overwrites_unusable_key() {
+        let detail = execution_detail_with_delivery_key(
+            serde_json::json!({
+                "delivery_key": null,
+                "parse_kind": "JsonNoop",
+            }),
+            "delivery-789",
+        );
+        assert_eq!(detail["delivery_key"], "delivery-789");
+        assert_eq!(detail["parse_kind"], "JsonNoop");
+
+        let detail = execution_detail_with_delivery_key(
+            serde_json::json!({
+                "delivery_key": "",
+                "parse_kind": "JsonTriggered",
+            }),
+            "delivery-abc",
+        );
+        assert_eq!(detail["delivery_key"], "delivery-abc");
+        assert_eq!(detail["parse_kind"], "JsonTriggered");
     }
 }

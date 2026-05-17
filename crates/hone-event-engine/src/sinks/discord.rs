@@ -19,6 +19,7 @@ use crate::digest::DigestPayload;
 use crate::renderer::RenderFormat;
 use crate::router::OutboundSink;
 use crate::sinks::discord_embed::build_discord_embed_message;
+use crate::sinks::http_error::{format_transport_error, format_upstream_http_error};
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
@@ -62,11 +63,17 @@ impl DiscordSink {
             .header("Authorization", self.auth_header())
             .json(&serde_json::json!({ "recipient_id": user_id }))
             .send()
-            .await?;
+            .await
+            .map_err(|err| anyhow::anyhow!(format_transport_error("discord", "create DM", &err)))?;
         let status = resp.status();
         if !status.is_success() {
             let detail = resp.text().await.unwrap_or_default();
-            anyhow::bail!("discord create DM {status}: {detail}");
+            anyhow::bail!(format_upstream_http_error(
+                "discord",
+                "create DM",
+                status,
+                &detail
+            ));
         }
         let parsed: CreateDmResp = resp.json().await?;
         self.dm_channel_cache
@@ -87,11 +94,14 @@ impl DiscordSink {
             .header("Authorization", self.auth_header())
             .json(&serde_json::json!({ "content": body }))
             .send()
-            .await?;
+            .await
+            .map_err(|err| anyhow::anyhow!(format_transport_error("discord", "send", &err)))?;
         let status = resp.status();
         if !status.is_success() {
             let detail = resp.text().await.unwrap_or_default();
-            anyhow::bail!("discord send {status}: {detail}");
+            anyhow::bail!(format_upstream_http_error(
+                "discord", "send", status, &detail
+            ));
         }
         Ok(())
     }
@@ -107,11 +117,14 @@ impl DiscordSink {
             .header("Authorization", self.auth_header())
             .json(&payload)
             .send()
-            .await?;
+            .await
+            .map_err(|err| anyhow::anyhow!(format_transport_error("discord", "send", &err)))?;
         let status = resp.status();
         if !status.is_success() {
             let detail = resp.text().await.unwrap_or_default();
-            anyhow::bail!("discord send {status}: {detail}");
+            anyhow::bail!(format_upstream_http_error(
+                "discord", "send", status, &detail
+            ));
         }
         Ok(())
     }

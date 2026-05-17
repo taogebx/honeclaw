@@ -49,10 +49,11 @@ pub fn render_immediate(event: &MarketEvent, fmt: RenderFormat) -> String {
 
     let mut out = format!("{head_out}\n{title_out}");
 
-    let summary_trim = event.summary.trim();
-    if !summary_trim.is_empty() {
+    let body = effective_body(event);
+    let body_trim = body.trim();
+    if !body_trim.is_empty() {
         out.push_str("\n\n");
-        out.push_str(&render_inline(summary_trim, fmt));
+        out.push_str(&render_inline(body_trim, fmt));
     }
 
     if let Some(u) = event.url.as_deref().filter(|u| !u.is_empty()) {
@@ -60,6 +61,29 @@ pub fn render_immediate(event: &MarketEvent, fmt: RenderFormat) -> String {
         out.push_str(&render_link(u, fmt));
     }
     out
+}
+
+/// 选事件正文渲染所用的字符串。
+///
+/// 默认走 `event.summary`(poller 写的简短描述,通常是一行字段)。但当事件是
+/// `EventKind::SecFiling` 且 `payload.llm_summary` 非空时,优先用 LLM 生成的
+/// ~200 字业务摘要 —— filing 的 `summary` 字段只是 filing date,信息量近零;
+/// 有 LLM 摘要时,filing date 已经在 `occurred_at_ts` 里持久化,不需要再渲染
+/// 进 body。
+///
+/// 失败 / enrichment 关闭 / payload 字段不存在 → fallback 到 `event.summary`。
+pub fn effective_body(event: &MarketEvent) -> &str {
+    if matches!(event.kind, EventKind::SecFiling { .. })
+        && let Some(summary) = non_empty_payload_str(event, "llm_summary")
+    {
+        return summary;
+    }
+    &event.summary
+}
+
+fn non_empty_payload_str<'a>(event: &'a MarketEvent, key: &str) -> Option<&'a str> {
+    let trimmed = event.payload.get(key)?.as_str()?.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 fn render_immediate_feishu_post(event: &MarketEvent) -> String {
@@ -79,9 +103,10 @@ fn render_immediate_feishu_post(event: &MarketEvent) -> String {
     }
     content.push(title_row);
 
-    let summary_trim = event.summary.trim();
-    if !summary_trim.is_empty() {
-        content.push(vec![feishu_text(summary_trim)]);
+    let body = effective_body(event);
+    let body_trim = body.trim();
+    if !body_trim.is_empty() {
+        content.push(vec![feishu_text(body_trim)]);
     }
 
     serde_json::json!({
@@ -146,19 +171,19 @@ fn kind_label(kind: &EventKind) -> String {
         EventKind::EarningsReleased => "📊 财报发布".into(),
         EventKind::EarningsCallTranscript => "📝 财报纪要".into(),
         EventKind::NewsCritical => "🔔 关键新闻".into(),
-        EventKind::PressRelease => "📣 公司公告".into(),
-        EventKind::PriceAlert { .. } => "⚡ 价格异动".into(),
+        EventKind::PriceAlert { window, .. } => match window.as_str() {
+            "close" => "🔔 收盘".into(),
+            "pre" => "☀️ 盘前".into(),
+            "post" => "🌃 盘后".into(),
+            _ => "⚡ 价格异动".into(),
+        },
         EventKind::Weekly52High => "📈 52 周新高".into(),
         EventKind::Weekly52Low => "📉 52 周新低".into(),
-        EventKind::VolumeSpike => "🔊 成交异动".into(),
         EventKind::Dividend => "💵 分红".into(),
         EventKind::Split => "✂️ 拆股".into(),
-        EventKind::Buyback => "♻️ 回购".into(),
         EventKind::SecFiling { form } => format!("📄 SEC {form}"),
         EventKind::AnalystGrade => "⭐ 评级变动".into(),
         EventKind::MacroEvent => "🌐 宏观".into(),
-        EventKind::PortfolioPreMarket => "🌅 盘前速览".into(),
-        EventKind::PortfolioPostMarket => "🌇 盘后速览".into(),
         EventKind::SocialPost => "🗣 社交".into(),
     }
 }
@@ -169,19 +194,20 @@ fn kind_short(kind: &EventKind) -> Option<String> {
         EventKind::EarningsReleased => "[财报]".into(),
         EventKind::EarningsCallTranscript => "[财报纪要]".into(),
         EventKind::NewsCritical => "[新闻]".into(),
-        EventKind::PressRelease => "[公告]".into(),
-        EventKind::PriceAlert { .. } => "[价格]".into(),
+        EventKind::PriceAlert { window, .. } => match window.as_str() {
+            "close" => "[收盘]".into(),
+            "pre" => "[盘前]".into(),
+            "post" => "[盘后]".into(),
+            _ => "[价格]".into(),
+        },
         EventKind::Weekly52High => "[52W↑]".into(),
         EventKind::Weekly52Low => "[52W↓]".into(),
-        EventKind::VolumeSpike => "[量能]".into(),
         EventKind::Dividend => "[分红]".into(),
         EventKind::Split => "[拆股]".into(),
-        EventKind::Buyback => "[回购]".into(),
         EventKind::SecFiling { form } => format!("[{form}]"),
         EventKind::AnalystGrade => "[评级]".into(),
         EventKind::MacroEvent => "[宏观]".into(),
         EventKind::SocialPost => "[社交]".into(),
-        _ => return None,
     })
 }
 
@@ -217,20 +243,25 @@ pub fn render_link_icon(url: &str, fmt: RenderFormat) -> String {
     match fmt {
         RenderFormat::Plain => format!("🔗 {}", link_label(url)),
         RenderFormat::TelegramHtml => {
-            format!("<a href=\"{}\">🔗</a>", escape_html_attr(url))
+            format!(
+                "<a href=\"{}\">{}</a>",
+                escape_html_attr(url),
+                escape_html(&link_label(url)),
+            )
         }
-        RenderFormat::DiscordMarkdown => format!("[🔗]({url})"),
+        RenderFormat::DiscordMarkdown => format!("[{}]({url})", escape_md(&link_label(url))),
         RenderFormat::FeishuPost => "🔗".into(),
     }
 }
 
-fn link_label(url: &str) -> String {
+pub(crate) fn link_label(url: &str) -> String {
     let without_scheme = url
         .trim_start_matches("https://")
         .trim_start_matches("http://");
     without_scheme
         .split('/')
         .next()
+        .map(|host| host.strip_prefix("www.").unwrap_or(host))
         .filter(|s| !s.is_empty())
         .unwrap_or(url)
         .to_string()
@@ -333,6 +364,66 @@ mod tests {
         let ev = sample(EventKind::SecFiling { form: "8-K".into() });
         let s = render_immediate(&ev, RenderFormat::Plain);
         assert!(s.contains("SEC 8-K"));
+    }
+
+    #[test]
+    fn sec_filing_prefers_llm_summary_over_event_summary() {
+        let mut ev = sample(EventKind::SecFiling {
+            form: "10-Q".into(),
+        });
+        ev.summary = "2026-04-20".into();
+        ev.payload = serde_json::json!({
+            "llm_summary": "这份 filing 最值得 长期主线投资者关注的是 GE Vernova 的 backlog 同比增加 25%。"
+        });
+        let s = render_immediate(&ev, RenderFormat::Plain);
+        assert!(
+            s.contains("这份 filing 最值得"),
+            "expected LLM summary in body, got:\n{s}"
+        );
+        assert!(
+            !s.contains("2026-04-20"),
+            "expected filing date to be replaced by LLM summary, got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn sec_filing_falls_back_to_summary_when_no_llm_summary() {
+        let mut ev = sample(EventKind::SecFiling {
+            form: "10-Q".into(),
+        });
+        ev.summary = "2026-04-20".into();
+        ev.payload = serde_json::Value::Null;
+        let s = render_immediate(&ev, RenderFormat::Plain);
+        assert!(
+            s.contains("2026-04-20"),
+            "expected fallback to filing date, got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn sec_filing_falls_back_when_llm_summary_blank() {
+        let mut ev = sample(EventKind::SecFiling {
+            form: "10-Q".into(),
+        });
+        ev.summary = "2026-04-20".into();
+        ev.payload = serde_json::json!({"llm_summary": "   "});
+        let s = render_immediate(&ev, RenderFormat::Plain);
+        assert!(
+            s.contains("2026-04-20"),
+            "blank llm_summary should fallback to summary; got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn non_secfiling_ignores_llm_summary_payload() {
+        // 防御回归:effective_body 只在 SecFiling 上看 payload.llm_summary,
+        // 其他 kind 即使 payload 里有 llm_summary 也应保持原 summary 行为。
+        let mut ev = sample(EventKind::EarningsReleased);
+        ev.summary = "EPS beat".into();
+        ev.payload = serde_json::json!({"llm_summary": "should not show up"});
+        let s = render_immediate(&ev, RenderFormat::Plain);
+        assert!(s.contains("EPS beat"));
+        assert!(!s.contains("should not show up"));
     }
 
     #[test]

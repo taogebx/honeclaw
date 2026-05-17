@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use hone_core::config::FmpConfig;
 
+const MAX_FMP_TRANSPORT_ERROR_CHARS: usize = 300;
+
 #[derive(Clone)]
 pub struct FmpClient {
     keys: Vec<String>,
@@ -63,11 +65,23 @@ impl FmpClient {
     }
 
     async fn fetch_once(&self, url: &str) -> anyhow::Result<Value> {
-        let resp = self.http.get(url).timeout(self.timeout).send().await?;
+        let resp = self
+            .http
+            .get(url)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|err| format_fmp_transport_error("请求", &err))?;
         let status = resp.status();
-        let body = resp.text().await?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|err| format_fmp_transport_error("读取响应", &err))?;
         let data: Value = serde_json::from_str(&body).map_err(|e| {
-            let prefix: String = body.chars().take(200).collect();
+            let prefix = sanitize_fmp_error_detail(&body)
+                .chars()
+                .take(200)
+                .collect::<String>();
             anyhow::anyhow!("FMP JSON 解析失败: {e}; body_prefix={prefix}")
         })?;
 
@@ -81,9 +95,83 @@ impl FmpClient {
                 || lower.contains("limit reach")
                 || lower.contains("upgrade")
             {
-                anyhow::bail!("FMP Key 被拒绝: {err_msg}");
+                anyhow::bail!("FMP Key 被拒绝: {}", sanitize_fmp_error_detail(err_msg));
             }
         }
         Ok(data)
+    }
+}
+
+fn format_fmp_transport_error(operation: &str, error: &reqwest::Error) -> anyhow::Error {
+    let detail = sanitize_fmp_error_detail(&error.to_string());
+    if detail.is_empty() {
+        anyhow::anyhow!("FMP {operation}失败")
+    } else {
+        anyhow::anyhow!("FMP {operation}失败: {detail}")
+    }
+}
+
+fn sanitize_fmp_error_detail(text: &str) -> String {
+    let redacted = redact_fmp_query_secrets(text);
+    if redacted.chars().count() <= MAX_FMP_TRANSPORT_ERROR_CHARS {
+        return redacted;
+    }
+    redacted
+        .chars()
+        .take(MAX_FMP_TRANSPORT_ERROR_CHARS)
+        .collect::<String>()
+        + "..."
+}
+
+fn redact_fmp_query_secrets(text: &str) -> String {
+    let mut output = text.to_string();
+    for key in ["apikey", "api_key", "apiKey"] {
+        output = redact_query_value(&output, key);
+    }
+    output
+}
+
+fn redact_query_value(text: &str, key: &str) -> String {
+    let needle = format!("{key}=");
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find(&needle) {
+        let value_start = index + needle.len();
+        output.push_str(&remaining[..value_start]);
+        output.push_str("<redacted>");
+        let value_tail = remaining[value_start..]
+            .char_indices()
+            .find_map(|(idx, ch)| (ch == '&' || ch == ')' || ch == ' ').then_some(idx))
+            .unwrap_or(remaining[value_start..].len());
+        remaining = &remaining[value_start + value_tail..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmp_transport_error_detail_redacts_apikey_query_param() {
+        let detail = sanitize_fmp_error_detail(
+            "error sending request for url (https://fmp.test/v3/quote/AAPL?limit=1&apikey=secret)",
+        );
+        assert_eq!(
+            detail,
+            "error sending request for url (https://fmp.test/v3/quote/AAPL?limit=1&apikey=<redacted>)"
+        );
+    }
+
+    #[test]
+    fn fmp_error_detail_redacts_api_key_aliases() {
+        let detail = sanitize_fmp_error_detail(
+            "https://fmp.test/v3/quote/AAPL?api_key=one&apiKey=two&apikey=three",
+        );
+        assert_eq!(
+            detail,
+            "https://fmp.test/v3/quote/AAPL?api_key=<redacted>&apiKey=<redacted>&apikey=<redacted>"
+        );
     }
 }

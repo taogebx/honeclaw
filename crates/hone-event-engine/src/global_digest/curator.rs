@@ -39,7 +39,7 @@ pub struct RankedCandidate {
     pub pass1_takeaway: String, // 一句话精炼
 }
 
-/// Pass 2 baseline 输出项(无 thesis,跨用户共享,落 daily_report 审计用)。
+/// Pass 2 baseline 输出项(无投资主线,跨用户共享,落 daily_report 审计用)。
 #[derive(Debug, Clone)]
 pub struct BaselineCuratedItem {
     pub candidate: GlobalDigestCandidate,
@@ -52,41 +52,44 @@ pub struct BaselineCuratedItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PickCategory {
-    /// 印证用户 thesis(rank 通常靠前)
-    ThesisAligned,
-    /// 反证 thesis(保留以警觉用户)
-    ThesisCounter,
-    /// 宏观底线 slot —— 即使 thesis 不关心,大盘背景必须保留至少 N 条
+    /// 印证用户投资主线(rank 通常靠前)
+    #[serde(alias = "thesis_aligned")]
+    MainlineAligned,
+    /// 证伪主线(保留以警觉用户)
+    #[serde(alias = "thesis_counter")]
+    MainlineCounter,
+    /// 宏观底线 slot —— 即使主线不关心,大盘背景必须保留至少 N 条
     MacroFloor,
 }
 
 impl PickCategory {
-    fn from_str(s: &str) -> Self {
-        match s {
-            "thesis_counter" => PickCategory::ThesisCounter,
+    fn from_str(raw_category: &str) -> Self {
+        match raw_category {
+            "mainline_counter" | "thesis_counter" => PickCategory::MainlineCounter,
             "macro_floor" => PickCategory::MacroFloor,
-            _ => PickCategory::ThesisAligned,
+            _ => PickCategory::MainlineAligned,
         }
     }
 }
 
-/// thesis 对该 pick 的关系标记(短评里 LLM 用,渲染时也展示)。
+/// 投资主线对该 pick 的关系标记(短评里 LLM 用,渲染时也展示)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ThesisRelation {
+pub enum MainlineRelation {
     Aligned,
     Counter,
     Neutral,
     NotApplicable,
 }
 
-impl ThesisRelation {
-    fn from_str(s: &str) -> Self {
-        match s {
-            "印证" | "aligned" => ThesisRelation::Aligned,
-            "反证" | "counter" => ThesisRelation::Counter,
-            "中立" | "neutral" => ThesisRelation::Neutral,
-            _ => ThesisRelation::NotApplicable,
+impl MainlineRelation {
+    fn from_str(raw_relation: &str) -> Self {
+        match raw_relation {
+            "印证" | "aligned" => MainlineRelation::Aligned,
+            // "反证" 是旧术语,统一为"证伪"后保留兼容 LLM prompt-cache 短期回吐
+            "证伪" | "反证" | "counter" => MainlineRelation::Counter,
+            "中立" | "neutral" => MainlineRelation::Neutral,
+            _ => MainlineRelation::NotApplicable,
         }
     }
 }
@@ -97,17 +100,17 @@ pub struct PersonalizedItem {
     pub candidate: GlobalDigestCandidate,
     pub article: ArticleBody,
     pub rank: u32,
-    pub comment: String, // ≤100 字,直接引用 thesis 关键词
+    pub comment: String, // ≤100 字,直接引用主线关键词
     pub category: PickCategory,
-    pub thesis_relation: ThesisRelation,
+    pub mainline_relation: MainlineRelation,
 }
 
-/// 用户投资逻辑输入。global_style + per-ticker theses。两个都为空时 personalize
+/// 用户投资主线输入。整体风格 + per-ticker 主线。两个都为空时 personalize
 /// 退化成 baseline 行为。
 #[derive(Debug, Clone, Default)]
-pub struct UserThesis<'a> {
-    pub global_style: Option<&'a str>,
-    pub theses: Option<&'a HashMap<String, String>>,
+pub struct UserMainline<'a> {
+    pub style: Option<&'a str>,
+    pub by_ticker: Option<&'a HashMap<String, String>>,
 }
 
 /// LLM 返回的 Pass 1 单项原始字段(不含 candidate)。
@@ -151,12 +154,12 @@ struct Pass2PersonalizeItem {
     #[serde(default)]
     url: String,
     comment: String,
-    /// "thesis_aligned" / "thesis_counter" / "macro_floor"
+    /// "mainline_aligned" / "mainline_counter" / "macro_floor"(兼容旧 thesis_* 值)
     #[serde(default)]
     category: String,
-    /// "印证" / "反证" / "中立" / "N/A" / 英文同义
-    #[serde(default)]
-    thesis_relation: String,
+    /// "印证" / "证伪" / "中立" / "N/A" / 英文同义("反证"为旧值兼容)
+    #[serde(default, alias = "thesis_relation")]
+    mainline_relation: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,8 +171,9 @@ struct Pass2PersonalizeResponse {
 
 /// Curator —— 把 LLM provider + 两个模型名包起来,所有 Pass 共享。
 pub struct Curator {
-    provider: Arc<dyn LlmProvider>,
+    pass1_provider: Arc<dyn LlmProvider>,
     pass1_model: String,
+    pass2_provider: Arc<dyn LlmProvider>,
     /// Pass 2 模型(baseline 与 personalize 共用)。本文件不直接读它,
     /// 留给同模块的 pass2_baseline / pass2_personalize。
     pub(super) pass2_model: String,
@@ -181,9 +185,19 @@ impl Curator {
         pass1_model: impl Into<String>,
         pass2_model: impl Into<String>,
     ) -> Self {
+        Self::new_with_providers(provider.clone(), pass1_model, provider, pass2_model)
+    }
+
+    pub fn new_with_providers(
+        pass1_provider: Arc<dyn LlmProvider>,
+        pass1_model: impl Into<String>,
+        pass2_provider: Arc<dyn LlmProvider>,
+        pass2_model: impl Into<String>,
+    ) -> Self {
         Self {
-            provider,
+            pass1_provider,
             pass1_model: pass1_model.into(),
+            pass2_provider,
             pass2_model: pass2_model.into(),
         }
     }
@@ -200,29 +214,29 @@ impl Curator {
             return Ok(Vec::new());
         }
         let messages = build_pass1_messages(candidates, audience);
-        let resp = self
-            .provider
+        let llm_response = self
+            .pass1_provider
             .chat(&messages, Some(&self.pass1_model))
             .await
             .map_err(|e| anyhow::anyhow!("pass1 LLM call failed: {e}"))?;
-        let parsed = parse_pass1_response(&resp.content)?;
+        let parsed = parse_pass1_response(&llm_response.content)?;
         Ok(rank_and_dedupe(candidates, parsed.items, top_n))
     }
 
-    /// Pass 2 personalize:每用户独立跑,带其 thesis + macro floor。
+    /// Pass 2 personalize:每用户独立跑,带其投资主线 + macro floor。
     ///
     /// 行为(POC 验证):
-    /// - 印证 thesis 优先(即使 Pass 1 中等分)
-    /// - 反证保留并标 ThesisCounter,LLM 必须在短评里点出"是否构成实质反证"
+    /// - 印证主线优先(即使 Pass 1 中等分)
+    /// - 证伪保留并标 MainlineCounter,LLM 必须在短评里点出"是否构成实质证伪"
     /// - 用户视角噪音(短期估值/技术见顶/单日波动/笼统泡沫论)直接剔除
-    /// - **macro_floor**:无论 thesis 怎么过滤,至少留 floor_macro 条 macro_floor 标记
+    /// - **macro_floor**:无论主线怎么过滤,至少留 floor_macro 条 macro_floor 标记
     ///   候选池真没够格的就不强加(metadata `floor_satisfied=false`,只 warn 不错)
-    /// - thesis 完全为空 → 退化成 baseline 行为(全部标 ThesisAligned + Neutral)
+    /// - 主线完全为空 → 退化成 baseline 行为(全部标 MainlineAligned + Neutral)
     pub async fn pass2_personalize(
         &self,
         picks_with_bodies: Vec<(RankedCandidate, ArticleBody)>,
         audience: &AudienceContext,
-        thesis: UserThesis<'_>,
+        mainline: UserMainline<'_>,
         floor_macro: u32,
         final_n: u32,
     ) -> anyhow::Result<Vec<PersonalizedItem>> {
@@ -232,16 +246,16 @@ impl Curator {
         let messages = build_pass2_personalize_messages(
             &picks_with_bodies,
             audience,
-            &thesis,
+            &mainline,
             floor_macro,
             final_n,
         );
-        let resp = self
-            .provider
+        let llm_response = self
+            .pass2_provider
             .chat(&messages, Some(&self.pass2_model))
             .await
             .map_err(|e| anyhow::anyhow!("pass2 personalize LLM call failed: {e}"))?;
-        let parsed = parse_pass2_personalize_response(&resp.content)?;
+        let parsed = parse_pass2_personalize_response(&llm_response.content)?;
         let macro_count = parsed
             .picks
             .iter()
@@ -262,7 +276,7 @@ impl Curator {
         Ok(map_pass2_personalize(picks_with_bodies, parsed.picks))
     }
 
-    /// Pass 2 baseline:用强模型看全文重排,无用户 thesis。**输出落 daily_report 审计**,
+    /// Pass 2 baseline:用强模型看全文重排,无用户投资主线。**输出落 daily_report 审计**,
     /// 不直接发给用户。所有用户共享同一份(节省成本)。
     pub async fn pass2_baseline(
         &self,
@@ -274,12 +288,12 @@ impl Curator {
             return Ok(Vec::new());
         }
         let messages = build_pass2_baseline_messages(&picks_with_bodies, audience, final_n);
-        let resp = self
-            .provider
+        let llm_response = self
+            .pass2_provider
             .chat(&messages, Some(&self.pass2_model))
             .await
             .map_err(|e| anyhow::anyhow!("pass2 baseline LLM call failed: {e}"))?;
-        let parsed = parse_pass2_baseline_response(&resp.content)?;
+        let parsed = parse_pass2_baseline_response(&llm_response.content)?;
         Ok(map_pass2_baseline(picks_with_bodies, parsed.picks))
     }
 }
@@ -289,9 +303,9 @@ fn build_pass2_baseline_messages(
     audience: &AudienceContext,
     final_n: u32,
 ) -> Vec<Message> {
-    let n = picks_with_bodies.len();
+    let candidate_count = picks_with_bodies.len();
     let system = format!(
-        "你是金融新闻精读助手。Pass 1 已经初筛出 {n} 篇候选,你看到了原文(部分付费墙抓不到,fallback 到 RSS / FMP 摘要)。
+        "你是金融新闻精读助手。Pass 1 已经初筛出 {candidate_count} 篇候选,你看到了原文(部分付费墙抓不到,fallback 到 RSS / FMP 摘要)。
 
 请:
 1. 重新评估每条是否真值得放进\"今日全球要闻\",按全球投资者关注度从高到低排序
@@ -306,36 +320,37 @@ fn build_pass2_baseline_messages(
     );
 
     let briefs_block = render_briefs_block(audience);
-    let cand_block: String = picks_with_bodies
+    let candidate_block: String = picks_with_bodies
         .iter()
         .enumerate()
-        .map(|(i, (rc, body))| {
-            let symbols = if rc.candidate.event.symbols.is_empty() {
+        .map(|(pick_index, (ranked_candidate, article_body))| {
+            let symbols = if ranked_candidate.candidate.event.symbols.is_empty() {
                 "[]".to_string()
             } else {
-                format!("[{}]", rc.candidate.event.symbols.join(","))
+                format!("[{}]", ranked_candidate.candidate.event.symbols.join(","))
             };
-            let body_preview: String = body.text.chars().take(5000).collect();
+            let body_preview: String = article_body.text.chars().take(5000).collect();
             format!(
-                "=== [{i}] {} ===\nsource: {} | symbols: {symbols}\nPass1 score: {} | cluster: {}\nURL: {}\n原文({:?}, {}c):\n{body_preview}",
-                rc.candidate.event.title,
-                rc.candidate.event.source,
-                rc.pass1_score,
-                rc.pass1_cluster,
-                rc.candidate.event.url.as_deref().unwrap_or(""),
-                body.source,
-                body.text.chars().count(),
+                "=== [{pick_index}] {} ===\nsource: {} | symbols: {symbols}\nPass1 score: {} | cluster: {}\nURL: {}\n原文({:?}, {}c):\n{body_preview}",
+                ranked_candidate.candidate.event.title,
+                ranked_candidate.candidate.event.source,
+                ranked_candidate.pass1_score,
+                ranked_candidate.pass1_cluster,
+                ranked_candidate.candidate.event.url.as_deref().unwrap_or(""),
+                article_body.source,
+                article_body.text.chars().count(),
             )
         })
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    let user = format!("## 受众持仓概览\n{briefs_block}\n\n## 候选全文\n{cand_block}");
+    let user = format!("## 受众持仓概览\n{briefs_block}\n\n## 候选全文\n{candidate_block}");
 
     vec![
         Message {
             role: "system".into(),
             content: Some(system),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -343,6 +358,7 @@ fn build_pass2_baseline_messages(
         Message {
             role: "user".into(),
             content: Some(user),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -364,88 +380,89 @@ fn map_pass2_baseline(
     picks_with_bodies: Vec<(RankedCandidate, ArticleBody)>,
     items: Vec<Pass2BaselineItem>,
 ) -> Vec<BaselineCuratedItem> {
-    let mut out = Vec::with_capacity(items.len());
-    for it in items {
-        if it.idx >= picks_with_bodies.len() {
+    let mut curated_items = Vec::with_capacity(items.len());
+    for baseline_pick in items {
+        if baseline_pick.idx >= picks_with_bodies.len() {
             continue;
         }
-        let (rc, body) = picks_with_bodies[it.idx].clone();
-        out.push(BaselineCuratedItem {
-            candidate: rc.candidate,
-            article: body,
-            rank: it.rank,
-            comment: it.comment,
+        let (ranked_candidate, article_body) = picks_with_bodies[baseline_pick.idx].clone();
+        curated_items.push(BaselineCuratedItem {
+            candidate: ranked_candidate.candidate,
+            article: article_body,
+            rank: baseline_pick.rank,
+            comment: baseline_pick.comment,
         });
     }
-    out.sort_by_key(|x| x.rank);
-    out
+    curated_items.sort_by_key(|item| item.rank);
+    curated_items
 }
 
 fn build_pass2_personalize_messages(
     picks_with_bodies: &[(RankedCandidate, ArticleBody)],
     audience: &AudienceContext,
-    thesis: &UserThesis<'_>,
+    mainline: &UserMainline<'_>,
     floor_macro: u32,
     final_n: u32,
 ) -> Vec<Message> {
-    let n = picks_with_bodies.len();
+    let candidate_count = picks_with_bodies.len();
     let system = format!(
-        "你是金融新闻精读助手。Pass 1 已经初筛出 {n} 篇候选,你看到了原文(部分付费墙抓不到)。
+        "你是金融新闻精读助手。Pass 1 已经初筛出 {candidate_count} 篇候选,你看到了原文(部分付费墙抓不到)。
 
-**关键 1**:用户有明确投资风格和个股逻辑(下方\"用户投资逻辑\"段)。请按用户视角:
-- 印证用户叙事的事件优先(即使 Pass1 中等分),标 category=\"thesis_aligned\"
-- 反证事件保留(用户需知道叙事是否被证伪),标 category=\"thesis_counter\",短评必须点出\"是否构成实质反证\"
+**关键 1**:用户有明确投资风格和个股投资主线(下方\"用户投资主线\"段)。请按用户视角:
+- 印证主线的事件优先(即使 Pass1 中等分),标 category=\"mainline_aligned\"
+- 证伪事件保留(用户需知道主线是否被证伪),标 category=\"mainline_counter\",短评必须点出\"是否构成实质证伪\"
 - 用户视角下的噪音(短期估值警告 / 技术见顶 / 单日涨跌评论 / 笼统泡沫论)直接剔除
 
-**关键 2:宏观底线 (floor)**:无论用户 thesis 怎么过滤,至少保留 **{floor_macro} 条**宏观/地缘/油价/联储/政策/重大监管类硬料,标 category=\"macro_floor\"。
+**关键 2:宏观底线 (floor)**:无论用户主线怎么过滤,至少保留 **{floor_macro} 条**宏观/地缘/油价/联储/政策/重大监管类硬料,标 category=\"macro_floor\"。
 - 这类事件不是噪音 —— 是大盘背景,可能波及所有持仓
 - 例:Hormuz 海峡危机、Iran-US 摩擦、Fed 政策、油价急涨急跌、关税/制裁立法、CPI/就业意外
 - 候选池里**根本没有**够格的宏观硬料(都是公司新闻),可以不强加,但要在输出 metadata 里 `floor_satisfied=false`
 
-短评 ≤100 字,直接引用用户叙事关键词;宏观条目用\"对持仓的潜在波及\"角度写。至多 {final_n} 条。
+短评 ≤100 字,直接引用用户主线关键词;宏观条目用\"对持仓的潜在波及\"角度写。至多 {final_n} 条。
 
 严格输出 JSON,无其它字符:
 {{
-  \"picks\":[{{\"idx\":0,\"rank\":1,\"title\":\"原标题\",\"url\":\"原URL\",\"comment\":\"≤100字\",\"category\":\"thesis_aligned/thesis_counter/macro_floor\",\"thesis_relation\":\"印证/中立/反证/N/A\"}}],
+  \"picks\":[{{\"idx\":0,\"rank\":1,\"title\":\"原标题\",\"url\":\"原URL\",\"comment\":\"≤100字\",\"category\":\"mainline_aligned/mainline_counter/macro_floor\",\"mainline_relation\":\"印证/中立/证伪/N/A\"}}],
   \"floor_satisfied\": true
 }}"
     );
 
     let briefs_block = render_briefs_block(audience);
-    let cand_block: String = picks_with_bodies
+    let candidate_block: String = picks_with_bodies
         .iter()
         .enumerate()
-        .map(|(i, (rc, body))| {
-            let symbols = if rc.candidate.event.symbols.is_empty() {
+        .map(|(pick_index, (ranked_candidate, article_body))| {
+            let symbols = if ranked_candidate.candidate.event.symbols.is_empty() {
                 "[]".to_string()
             } else {
-                format!("[{}]", rc.candidate.event.symbols.join(","))
+                format!("[{}]", ranked_candidate.candidate.event.symbols.join(","))
             };
-            let body_preview: String = body.text.chars().take(5000).collect();
+            let body_preview: String = article_body.text.chars().take(5000).collect();
             format!(
-                "=== [{i}] {} ===\nsource: {} | symbols: {symbols}\nPass1 score: {} | cluster: {}\nURL: {}\n原文({:?}, {}c):\n{body_preview}",
-                rc.candidate.event.title,
-                rc.candidate.event.source,
-                rc.pass1_score,
-                rc.pass1_cluster,
-                rc.candidate.event.url.as_deref().unwrap_or(""),
-                body.source,
-                body.text.chars().count(),
+                "=== [{pick_index}] {} ===\nsource: {} | symbols: {symbols}\nPass1 score: {} | cluster: {}\nURL: {}\n原文({:?}, {}c):\n{body_preview}",
+                ranked_candidate.candidate.event.title,
+                ranked_candidate.candidate.event.source,
+                ranked_candidate.pass1_score,
+                ranked_candidate.pass1_cluster,
+                ranked_candidate.candidate.event.url.as_deref().unwrap_or(""),
+                article_body.source,
+                article_body.text.chars().count(),
             )
         })
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    let thesis_block = render_thesis_block(thesis);
+    let mainline_block = render_mainline_block(mainline);
 
     let user = format!(
-        "## 受众持仓概览\n{briefs_block}\n\n## 用户投资逻辑\n{thesis_block}\n\n## 候选全文\n{cand_block}"
+        "## 受众持仓概览\n{briefs_block}\n\n## 用户投资主线\n{mainline_block}\n\n## 候选全文\n{candidate_block}"
     );
 
     vec![
         Message {
             role: "system".into(),
             content: Some(system),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -453,6 +470,7 @@ fn build_pass2_personalize_messages(
         Message {
             role: "user".into(),
             content: Some(user),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -460,25 +478,25 @@ fn build_pass2_personalize_messages(
     ]
 }
 
-fn render_thesis_block(thesis: &UserThesis<'_>) -> String {
+fn render_mainline_block(mainline: &UserMainline<'_>) -> String {
     let mut lines = Vec::new();
-    if let Some(style) = thesis.global_style {
+    if let Some(style) = mainline.style {
         lines.push(format!("### 全局风格\n{style}"));
     }
-    if let Some(theses) = thesis.theses {
-        if !theses.is_empty() {
-            lines.push("### 个股投资逻辑".to_string());
-            // 按 ticker 排序保证 prompt 稳定
-            let mut entries: Vec<_> = theses.iter().collect();
-            entries.sort_by_key(|(k, _)| k.as_str());
-            for (sym, txt) in entries {
-                lines.push(format!("- **{sym}**:{txt}"));
-            }
+    if let Some(by_ticker) = mainline.by_ticker
+        && !by_ticker.is_empty()
+    {
+        lines.push("### 个股投资主线".to_string());
+        // 按 ticker 排序保证 prompt 稳定
+        let mut entries: Vec<_> = by_ticker.iter().collect();
+        entries.sort_by_key(|(ticker, _)| ticker.as_str());
+        for (ticker, mainline_text) in entries {
+            lines.push(format!("- **{ticker}**:{mainline_text}"));
         }
     }
     if lines.is_empty() {
-        // 完全无 thesis → 给 LLM 一个明确指示退化到 baseline 风格
-        return "(用户未配置 thesis,按 baseline 排序即可。category 全部标 \"thesis_aligned\",thesis_relation 标 \"中立\"。)".to_string();
+        // 完全无投资主线 → 给 LLM 一个明确指示退化到 baseline 风格
+        return "(用户未配置投资主线,按 baseline 排序即可。category 全部标 \"mainline_aligned\",mainline_relation 标 \"中立\"。)".to_string();
     }
     lines.join("\n\n")
 }
@@ -497,23 +515,23 @@ fn map_pass2_personalize(
     picks_with_bodies: Vec<(RankedCandidate, ArticleBody)>,
     items: Vec<Pass2PersonalizeItem>,
 ) -> Vec<PersonalizedItem> {
-    let mut out = Vec::with_capacity(items.len());
-    for it in items {
-        if it.idx >= picks_with_bodies.len() {
+    let mut personalized_items = Vec::with_capacity(items.len());
+    for personalized_pick in items {
+        if personalized_pick.idx >= picks_with_bodies.len() {
             continue;
         }
-        let (rc, body) = picks_with_bodies[it.idx].clone();
-        out.push(PersonalizedItem {
-            candidate: rc.candidate,
-            article: body,
-            rank: it.rank,
-            comment: it.comment,
-            category: PickCategory::from_str(&it.category),
-            thesis_relation: ThesisRelation::from_str(&it.thesis_relation),
+        let (ranked_candidate, article_body) = picks_with_bodies[personalized_pick.idx].clone();
+        personalized_items.push(PersonalizedItem {
+            candidate: ranked_candidate.candidate,
+            article: article_body,
+            rank: personalized_pick.rank,
+            comment: personalized_pick.comment,
+            category: PickCategory::from_str(&personalized_pick.category),
+            mainline_relation: MainlineRelation::from_str(&personalized_pick.mainline_relation),
         });
     }
-    out.sort_by_key(|x| x.rank);
-    out
+    personalized_items.sort_by_key(|item| item.rank);
+    personalized_items
 }
 
 /// 渲染 audience briefs 段(给 Pass 1/2 prompt 共用)。
@@ -521,23 +539,23 @@ fn render_briefs_block(audience: &AudienceContext) -> String {
     audience
         .briefs
         .iter()
-        .map(|b| {
+        .map(|brief| {
             let mut line = format!(
                 "- {} — {} ({}{}{})\n  业务: {}",
-                b.ticker,
-                b.name,
-                b.sector,
-                if b.sector.is_empty() || b.industry.is_empty() {
+                brief.ticker,
+                brief.name,
+                brief.sector,
+                if brief.sector.is_empty() || brief.industry.is_empty() {
                     ""
                 } else {
                     " / "
                 },
-                b.industry,
-                b.one_liner,
+                brief.industry,
+                brief.one_liner,
             );
-            if !b.user_notes.is_empty() {
+            if !brief.user_notes.is_empty() {
                 line.push_str("\n  用户备注: ");
-                line.push_str(&b.user_notes.join(" | "));
+                line.push_str(&brief.user_notes.join(" | "));
             }
             line
         })
@@ -571,33 +589,34 @@ cluster id 用英文短词,同事件不同媒体一定要合并(merger/recall/la
 
     let briefs_block = render_briefs_block(audience);
 
-    let cand_block: String = candidates
+    let candidate_block: String = candidates
         .iter()
         .enumerate()
-        .map(|(i, c)| {
-            let symbols = if c.event.symbols.is_empty() {
+        .map(|(candidate_index, candidate)| {
+            let symbols = if candidate.event.symbols.is_empty() {
                 "[]".to_string()
             } else {
-                format!("[{}]", c.event.symbols.join(","))
+                format!("[{}]", candidate.event.symbols.join(","))
             };
-            let text_preview: String = c.fmp_text.chars().take(160).collect();
+            let text_preview: String = candidate.fmp_text.chars().take(160).collect();
             format!(
-                "[{i}] title={} | source={} | symbols={symbols} | text={text_preview}",
-                c.event.title, c.event.source
+                "[{candidate_index}] title={} | source={} | symbols={symbols} | text={text_preview}",
+                candidate.event.title, candidate.event.source
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
 
+    let candidate_count = candidates.len();
     let user = format!(
-        "## 受众持仓概览\n{briefs_block}\n\n## 候选({n} 篇)\n{cand_block}\n\n请输出 JSON,items 数组要覆盖全部 {n} 条候选。",
-        n = candidates.len()
+        "## 受众持仓概览\n{briefs_block}\n\n## 候选({candidate_count} 篇)\n{candidate_block}\n\n请输出 JSON,items 数组要覆盖全部 {candidate_count} 条候选。"
     );
 
     vec![
         Message {
             role: "system".into(),
             content: Some(system.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -605,6 +624,7 @@ cluster id 用英文短词,同事件不同媒体一定要合并(merger/recall/la
         Message {
             role: "user".into(),
             content: Some(user),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -623,10 +643,10 @@ pub(super) fn parse_pass1_response(content: &str) -> anyhow::Result<Pass1Respons
     })
 }
 
-pub(super) fn strip_json_fence(s: &str) -> String {
-    let s = s.trim();
+pub(super) fn strip_json_fence(raw_content: &str) -> String {
+    let trimmed_content = raw_content.trim();
     // 形如 ```json ... ``` 或 ``` ... ```
-    if let Some(rest) = s.strip_prefix("```") {
+    if let Some(rest) = trimmed_content.strip_prefix("```") {
         let rest = rest.trim_start_matches("json").trim_start_matches('\n');
         if let Some(end) = rest.rfind("```") {
             return rest[..end].trim().to_string();
@@ -634,12 +654,12 @@ pub(super) fn strip_json_fence(s: &str) -> String {
         return rest.trim().to_string();
     }
     // 找第一个 `{` 之后到最后一个 `}`,截出 JSON 主体(LLM 可能在前后加 prose)
-    if let (Some(start), Some(end)) = (s.find('{'), s.rfind('}')) {
-        if end > start {
-            return s[start..=end].to_string();
-        }
+    if let (Some(start), Some(end)) = (trimmed_content.find('{'), trimmed_content.rfind('}'))
+        && end > start
+    {
+        return trimmed_content[start..=end].to_string();
     }
-    s.to_string()
+    trimmed_content.to_string()
 }
 
 /// cluster dedup + top_n 截断。
@@ -651,37 +671,42 @@ fn rank_and_dedupe(
     use std::collections::HashMap;
     // 同 cluster 内只保留最高分 item
     let mut by_cluster: HashMap<String, Pass1Item> = HashMap::new();
-    for it in items {
-        if it.idx >= candidates.len() {
+    for pass1_item in items {
+        if pass1_item.idx >= candidates.len() {
             // 越界 idx 直接跳过(保护 LLM 编造 idx)
             continue;
         }
-        let cluster_key = if it.cluster.is_empty() {
+        let cluster_key = if pass1_item.cluster.is_empty() {
             // 空 cluster 退化成 idx-唯一,保留为独立条目
-            format!("__noclust__{}", it.idx)
+            format!("__noclust__{}", pass1_item.idx)
         } else {
-            it.cluster.clone()
+            pass1_item.cluster.clone()
         };
         by_cluster
             .entry(cluster_key)
-            .and_modify(|exist| {
-                if it.score > exist.score {
-                    *exist = it.clone();
+            .and_modify(|existing_item| {
+                if pass1_item.score > existing_item.score {
+                    *existing_item = pass1_item.clone();
                 }
             })
-            .or_insert(it);
+            .or_insert(pass1_item);
     }
     let mut deduped: Vec<Pass1Item> = by_cluster.into_values().collect();
     // 按 score 降序;同分按 idx 升序保稳定
-    deduped.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.idx.cmp(&b.idx)));
+    deduped.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.idx.cmp(&right.idx))
+    });
     deduped
         .into_iter()
         .take(top_n)
-        .map(|it| RankedCandidate {
-            candidate: candidates[it.idx].clone(),
-            pass1_score: it.score,
-            pass1_cluster: it.cluster,
-            pass1_takeaway: it.takeaway,
+        .map(|pass1_item| RankedCandidate {
+            candidate: candidates[pass1_item.idx].clone(),
+            pass1_score: pass1_item.score,
+            pass1_cluster: pass1_item.cluster,
+            pass1_takeaway: pass1_item.takeaway,
         })
         .collect()
 }
@@ -699,7 +724,7 @@ mod tests {
     use hone_llm::{ChatResponse, provider::ChatResult};
     use std::sync::Mutex;
 
-    fn cand(id: &str, title: &str) -> GlobalDigestCandidate {
+    fn fixture_candidate(id: &str, title: &str) -> GlobalDigestCandidate {
         GlobalDigestCandidate {
             event: MarketEvent {
                 id: id.into(),
@@ -734,13 +759,13 @@ mod tests {
     }
 
     /// Mock LLM:返回固定 content,记录调用次数。
-    struct MockProvider {
+    struct StaticResponseProvider {
         content: String,
         calls: Mutex<usize>,
     }
 
     #[async_trait]
-    impl LlmProvider for MockProvider {
+    impl LlmProvider for StaticResponseProvider {
         async fn chat(&self, _m: &[Message], _model: Option<&str>) -> HoneResult<ChatResult> {
             *self.calls.lock().unwrap() += 1;
             Ok(ChatResult {
@@ -765,13 +790,13 @@ mod tests {
         }
     }
 
-    fn make_curator(content: &str) -> (Curator, Arc<MockProvider>) {
-        let mock = Arc::new(MockProvider {
+    fn make_curator_with_response(content: &str) -> (Curator, Arc<StaticResponseProvider>) {
+        let response_provider = Arc::new(StaticResponseProvider {
             content: content.into(),
             calls: Mutex::new(0),
         });
-        let curator = Curator::new(mock.clone(), "p1-model", "p2-model");
-        (curator, mock)
+        let curator = Curator::new(response_provider.clone(), "p1-model", "p2-model");
+        (curator, response_provider)
     }
 
     #[test]
@@ -781,44 +806,45 @@ mod tests {
 
     #[test]
     fn strip_json_fence_strips_markdown_code_block() {
-        let s = "```json\n{\"a\":1}\n```";
-        assert_eq!(strip_json_fence(s), r#"{"a":1}"#);
+        let fenced_json = "```json\n{\"a\":1}\n```";
+        assert_eq!(strip_json_fence(fenced_json), r#"{"a":1}"#);
     }
 
     #[test]
     fn strip_json_fence_strips_unlabeled_fence() {
-        let s = "```\n{\"a\":2}\n```";
-        assert_eq!(strip_json_fence(s), r#"{"a":2}"#);
+        let fenced_json = "```\n{\"a\":2}\n```";
+        assert_eq!(strip_json_fence(fenced_json), r#"{"a":2}"#);
     }
 
     #[test]
     fn strip_json_fence_extracts_object_from_prose() {
-        let s = "Sure! Here is the JSON:\n\n{\"a\":3}\n\nLet me know if you need more.";
-        assert_eq!(strip_json_fence(s), r#"{"a":3}"#);
+        let prose_wrapped_json =
+            "Sure! Here is the JSON:\n\n{\"a\":3}\n\nLet me know if you need more.";
+        assert_eq!(strip_json_fence(prose_wrapped_json), r#"{"a":3}"#);
     }
 
     #[test]
     fn parse_pass1_handles_valid_response() {
-        let resp = r#"{"items":[{"idx":0,"score":4,"cluster":"foo","takeaway":"hello"}]}"#;
-        let p = parse_pass1_response(resp).unwrap();
-        assert_eq!(p.items.len(), 1);
-        assert_eq!(p.items[0].idx, 0);
-        assert_eq!(p.items[0].score, 4);
+        let response_json = r#"{"items":[{"idx":0,"score":4,"cluster":"foo","takeaway":"hello"}]}"#;
+        let parsed = parse_pass1_response(response_json).unwrap();
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(parsed.items[0].idx, 0);
+        assert_eq!(parsed.items[0].score, 4);
     }
 
     #[test]
     fn parse_pass1_handles_fenced_response() {
-        let resp = "```json\n{\"items\":[{\"idx\":1,\"score\":5,\"cluster\":\"x\",\"takeaway\":\"y\"}]}\n```";
-        let p = parse_pass1_response(resp).unwrap();
-        assert_eq!(p.items[0].idx, 1);
+        let response_json = "```json\n{\"items\":[{\"idx\":1,\"score\":5,\"cluster\":\"x\",\"takeaway\":\"y\"}]}\n```";
+        let parsed = parse_pass1_response(response_json).unwrap();
+        assert_eq!(parsed.items[0].idx, 1);
     }
 
     #[test]
     fn rank_and_dedupe_keeps_highest_score_per_cluster() {
-        let cands = vec![
-            cand("a", "Story A"),
-            cand("b", "Story B"),
-            cand("c", "Story C"),
+        let candidates = vec![
+            fixture_candidate("a", "Story A"),
+            fixture_candidate("b", "Story B"),
+            fixture_candidate("c", "Story C"),
         ];
         let items = vec![
             Pass1Item {
@@ -840,16 +866,22 @@ mod tests {
                 takeaway: "mid".into(),
             },
         ];
-        let out = rank_and_dedupe(&cands, items, 10);
-        assert_eq!(out.len(), 2, "merger cluster 应被 dedupe 成 1 条");
-        assert_eq!(out[0].pass1_score, 5);
-        assert_eq!(out[0].pass1_takeaway, "high");
-        assert_eq!(out[1].pass1_score, 4);
+        let ranked_candidates = rank_and_dedupe(&candidates, items, 10);
+        assert_eq!(
+            ranked_candidates.len(),
+            2,
+            "merger cluster 应被 dedupe 成 1 条"
+        );
+        assert_eq!(ranked_candidates[0].pass1_score, 5);
+        assert_eq!(ranked_candidates[0].pass1_takeaway, "high");
+        assert_eq!(ranked_candidates[1].pass1_score, 4);
     }
 
     #[test]
     fn rank_and_dedupe_truncates_to_top_n() {
-        let cands: Vec<_> = (0..5).map(|i| cand(&format!("e{i}"), "T")).collect();
+        let candidates: Vec<_> = (0..5)
+            .map(|i| fixture_candidate(&format!("e{i}"), "T"))
+            .collect();
         let items: Vec<_> = (0..5)
             .map(|i| Pass1Item {
                 idx: i,
@@ -858,16 +890,16 @@ mod tests {
                 takeaway: "t".into(),
             })
             .collect();
-        let out = rank_and_dedupe(&cands, items, 3);
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[0].pass1_score, 5);
-        assert_eq!(out[1].pass1_score, 4);
-        assert_eq!(out[2].pass1_score, 3);
+        let ranked_candidates = rank_and_dedupe(&candidates, items, 3);
+        assert_eq!(ranked_candidates.len(), 3);
+        assert_eq!(ranked_candidates[0].pass1_score, 5);
+        assert_eq!(ranked_candidates[1].pass1_score, 4);
+        assert_eq!(ranked_candidates[2].pass1_score, 3);
     }
 
     #[test]
     fn rank_and_dedupe_skips_out_of_range_idx() {
-        let cands = vec![cand("a", "T")];
+        let candidates = vec![fixture_candidate("a", "T")];
         let items = vec![
             Pass1Item {
                 idx: 0,
@@ -882,14 +914,14 @@ mod tests {
                 takeaway: "fake".into(),
             },
         ];
-        let out = rank_and_dedupe(&cands, items, 10);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].pass1_takeaway, "ok");
+        let ranked_candidates = rank_and_dedupe(&candidates, items, 10);
+        assert_eq!(ranked_candidates.len(), 1);
+        assert_eq!(ranked_candidates[0].pass1_takeaway, "ok");
     }
 
     #[test]
     fn rank_and_dedupe_treats_empty_cluster_as_unique() {
-        let cands = vec![cand("a", "T1"), cand("b", "T2")];
+        let candidates = vec![fixture_candidate("a", "T1"), fixture_candidate("b", "T2")];
         let items = vec![
             Pass1Item {
                 idx: 0,
@@ -904,30 +936,33 @@ mod tests {
                 takeaway: "u2".into(),
             },
         ];
-        let out = rank_and_dedupe(&cands, items, 10);
-        assert_eq!(out.len(), 2, "空 cluster 不应该被合并");
+        let ranked_candidates = rank_and_dedupe(&candidates, items, 10);
+        assert_eq!(ranked_candidates.len(), 2, "空 cluster 不应该被合并");
     }
 
     #[tokio::test]
     async fn pass1_select_calls_llm_and_returns_ranked() {
-        let json = r#"{"items":[{"idx":0,"score":5,"cluster":"x","takeaway":"hot"}]}"#;
-        let (curator, mock) = make_curator(json);
-        let cands = vec![cand("a", "Big news")];
-        let out = curator.pass1_select(&cands, &audience(), 10).await.unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].pass1_score, 5);
-        assert_eq!(*mock.calls.lock().unwrap(), 1);
+        let response_json = r#"{"items":[{"idx":0,"score":5,"cluster":"x","takeaway":"hot"}]}"#;
+        let (curator, response_provider) = make_curator_with_response(response_json);
+        let candidates = vec![fixture_candidate("a", "Big news")];
+        let ranked_candidates = curator
+            .pass1_select(&candidates, &audience(), 10)
+            .await
+            .unwrap();
+        assert_eq!(ranked_candidates.len(), 1);
+        assert_eq!(ranked_candidates[0].pass1_score, 5);
+        assert_eq!(*response_provider.calls.lock().unwrap(), 1);
     }
 
     #[tokio::test]
     async fn pass1_select_empty_candidates_skips_llm() {
-        let (curator, mock) = make_curator("");
-        let out = curator.pass1_select(&[], &audience(), 10).await.unwrap();
-        assert!(out.is_empty());
-        assert_eq!(*mock.calls.lock().unwrap(), 0);
+        let (curator, response_provider) = make_curator_with_response("");
+        let ranked_candidates = curator.pass1_select(&[], &audience(), 10).await.unwrap();
+        assert!(ranked_candidates.is_empty());
+        assert_eq!(*response_provider.calls.lock().unwrap(), 0);
     }
 
-    fn body(text: &str) -> ArticleBody {
+    fn fetched_article_body(text: &str) -> ArticleBody {
         ArticleBody {
             url: "https://x/y".into(),
             text: text.into(),
@@ -937,102 +972,111 @@ mod tests {
 
     #[tokio::test]
     async fn pass2_baseline_calls_llm_and_maps_picks() {
-        let json = r#"{"picks":[
+        let response_json = r#"{"picks":[
             {"idx":1,"rank":1,"title":"Story B","url":"https://x/b","comment":"nice"},
             {"idx":0,"rank":2,"title":"Story A","url":"https://x/a","comment":"ok"}
         ]}"#;
-        let (curator, _mock) = make_curator(json);
-        let cands = vec![cand("a", "Story A"), cand("b", "Story B")];
-        let picks: Vec<(RankedCandidate, ArticleBody)> = cands
+        let (curator, _response_provider) = make_curator_with_response(response_json);
+        let candidates = vec![
+            fixture_candidate("a", "Story A"),
+            fixture_candidate("b", "Story B"),
+        ];
+        let picks_with_bodies: Vec<(RankedCandidate, ArticleBody)> = candidates
             .into_iter()
             .enumerate()
-            .map(|(i, c)| {
+            .map(|(candidate_index, candidate)| {
                 (
                     RankedCandidate {
-                        candidate: c,
+                        candidate,
                         pass1_score: 5,
-                        pass1_cluster: format!("c{i}"),
+                        pass1_cluster: format!("c{candidate_index}"),
                         pass1_takeaway: "t".into(),
                     },
-                    body("article body"),
+                    fetched_article_body("article body"),
                 )
             })
             .collect();
-        let out = curator.pass2_baseline(picks, &audience(), 8).await.unwrap();
-        assert_eq!(out.len(), 2);
+        let baseline_picks = curator
+            .pass2_baseline(picks_with_bodies, &audience(), 8)
+            .await
+            .unwrap();
+        assert_eq!(baseline_picks.len(), 2);
         // 按 rank 升序
-        assert_eq!(out[0].rank, 1);
-        assert_eq!(out[0].candidate.event.id, "b");
-        assert_eq!(out[1].rank, 2);
-        assert_eq!(out[1].candidate.event.id, "a");
+        assert_eq!(baseline_picks[0].rank, 1);
+        assert_eq!(baseline_picks[0].candidate.event.id, "b");
+        assert_eq!(baseline_picks[1].rank, 2);
+        assert_eq!(baseline_picks[1].candidate.event.id, "a");
     }
 
     #[tokio::test]
     async fn pass2_baseline_skips_invalid_idx() {
-        let json = r#"{"picks":[
+        let response_json = r#"{"picks":[
             {"idx":99,"rank":1,"title":"fake","url":"x","comment":"c"},
             {"idx":0,"rank":2,"title":"real","url":"x","comment":"r"}
         ]}"#;
-        let (curator, _) = make_curator(json);
-        let cands = vec![cand("a", "T")];
-        let picks: Vec<_> = cands
+        let (curator, _) = make_curator_with_response(response_json);
+        let candidates = vec![fixture_candidate("a", "T")];
+        let picks_with_bodies: Vec<_> = candidates
             .into_iter()
-            .map(|c| {
+            .map(|candidate| {
                 (
                     RankedCandidate {
-                        candidate: c,
+                        candidate,
                         pass1_score: 5,
                         pass1_cluster: "x".into(),
                         pass1_takeaway: "".into(),
                     },
-                    body("b"),
+                    fetched_article_body("b"),
                 )
             })
             .collect();
-        let out = curator.pass2_baseline(picks, &audience(), 8).await.unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].candidate.event.id, "a");
+        let baseline_picks = curator
+            .pass2_baseline(picks_with_bodies, &audience(), 8)
+            .await
+            .unwrap();
+        assert_eq!(baseline_picks.len(), 1);
+        assert_eq!(baseline_picks[0].candidate.event.id, "a");
     }
 
     #[tokio::test]
     async fn pass2_baseline_empty_picks_skips_llm() {
-        let (curator, mock) = make_curator("");
-        let out = curator
+        let (curator, response_provider) = make_curator_with_response("");
+        let baseline_picks = curator
             .pass2_baseline(vec![], &audience(), 8)
             .await
             .unwrap();
-        assert!(out.is_empty());
-        assert_eq!(*mock.calls.lock().unwrap(), 0);
+        assert!(baseline_picks.is_empty());
+        assert_eq!(*response_provider.calls.lock().unwrap(), 0);
     }
 
-    fn picks() -> Vec<(RankedCandidate, ArticleBody)> {
+    fn sample_picks_with_bodies() -> Vec<(RankedCandidate, ArticleBody)> {
         vec![
             (
                 RankedCandidate {
-                    candidate: cand("a", "GOOGL Anthropic $40B"),
+                    candidate: fixture_candidate("a", "GOOGL Anthropic $40B"),
                     pass1_score: 5,
                     pass1_cluster: "google-anthropic".into(),
                     pass1_takeaway: "google invests".into(),
                 },
-                body("Google commits up to $40 billion in Anthropic..."),
+                fetched_article_body("Google commits up to $40 billion in Anthropic..."),
             ),
             (
                 RankedCandidate {
-                    candidate: cand("b", "Semi rally 见顶警告"),
+                    candidate: fixture_candidate("b", "Semi rally 见顶警告"),
                     pass1_score: 5,
                     pass1_cluster: "semi-rally".into(),
                     pass1_takeaway: "warning of overheat".into(),
                 },
-                body("Unprecedented semi rally triggers warnings..."),
+                fetched_article_body("Unprecedented semi rally triggers warnings..."),
             ),
             (
                 RankedCandidate {
-                    candidate: cand("c", "Macron Hormuz strait"),
+                    candidate: fixture_candidate("c", "Macron Hormuz strait"),
                     pass1_score: 4,
                     pass1_cluster: "hormuz".into(),
                     pass1_takeaway: "macron diplomacy".into(),
                 },
-                body("Macron reaffirms efforts to reopen Strait of Hormuz..."),
+                fetched_article_body("Macron reaffirms efforts to reopen Strait of Hormuz..."),
             ),
         ]
     }
@@ -1040,90 +1084,148 @@ mod tests {
     #[tokio::test]
     async fn pass2_personalize_categorizes_picks() {
         // LLM 输出:GOOGL 印证、半导体见顶被剔除、Hormuz 作为 macro_floor
-        let json = r#"{"picks":[
-            {"idx":0,"rank":1,"title":"GOOGL Anthropic","url":"u","comment":"印证 Gemini 飞轮","category":"thesis_aligned","thesis_relation":"印证"},
-            {"idx":2,"rank":2,"title":"Hormuz","url":"u","comment":"波及电力叙事","category":"macro_floor","thesis_relation":"N/A"}
+        let response_json = r#"{"picks":[
+            {"idx":0,"rank":1,"title":"GOOGL Anthropic","url":"u","comment":"印证 Gemini 飞轮","category":"mainline_aligned","mainline_relation":"印证"},
+            {"idx":2,"rank":2,"title":"Hormuz","url":"u","comment":"波及电力叙事","category":"macro_floor","mainline_relation":"N/A"}
         ],"floor_satisfied":true}"#;
-        let (curator, _) = make_curator(json);
-        let mut theses_map = HashMap::new();
-        theses_map.insert("GOOGL".into(), "看 Gemini 生态飞轮".into());
-        let thesis = UserThesis {
-            global_style: Some("长期叙事派"),
-            theses: Some(&theses_map),
+        let (curator, _) = make_curator_with_response(response_json);
+        let mut by_ticker = HashMap::new();
+        by_ticker.insert("GOOGL".into(), "看 Gemini 生态飞轮".into());
+        let mainline = UserMainline {
+            style: Some("长期叙事派"),
+            by_ticker: Some(&by_ticker),
         };
-        let out = curator
-            .pass2_personalize(picks(), &audience(), thesis, 1, 8)
+        let personalized_picks = curator
+            .pass2_personalize(sample_picks_with_bodies(), &audience(), mainline, 1, 8)
             .await
             .unwrap();
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].rank, 1);
-        assert_eq!(out[0].category, PickCategory::ThesisAligned);
-        assert_eq!(out[0].thesis_relation, ThesisRelation::Aligned);
-        assert_eq!(out[1].rank, 2);
-        assert_eq!(out[1].category, PickCategory::MacroFloor);
-        assert_eq!(out[1].thesis_relation, ThesisRelation::NotApplicable);
+        assert_eq!(personalized_picks.len(), 2);
+        assert_eq!(personalized_picks[0].rank, 1);
+        assert_eq!(
+            personalized_picks[0].category,
+            PickCategory::MainlineAligned
+        );
+        assert_eq!(
+            personalized_picks[0].mainline_relation,
+            MainlineRelation::Aligned
+        );
+        assert_eq!(personalized_picks[1].rank, 2);
+        assert_eq!(personalized_picks[1].category, PickCategory::MacroFloor);
+        assert_eq!(
+            personalized_picks[1].mainline_relation,
+            MainlineRelation::NotApplicable
+        );
     }
 
     #[tokio::test]
-    async fn pass2_personalize_empty_thesis_works_like_baseline() {
-        let json = r#"{"picks":[
-            {"idx":0,"rank":1,"title":"T","url":"u","comment":"c","category":"thesis_aligned","thesis_relation":"中立"}
+    async fn pass2_personalize_empty_mainline_works_like_baseline() {
+        let response_json = r#"{"picks":[
+            {"idx":0,"rank":1,"title":"T","url":"u","comment":"c","category":"mainline_aligned","mainline_relation":"中立"}
         ]}"#;
-        let (curator, _) = make_curator(json);
-        let thesis = UserThesis::default(); // 全 None
-        let out = curator
-            .pass2_personalize(picks(), &audience(), thesis, 0, 8)
+        let (curator, _) = make_curator_with_response(response_json);
+        let mainline = UserMainline::default(); // 全 None
+        let personalized_picks = curator
+            .pass2_personalize(sample_picks_with_bodies(), &audience(), mainline, 0, 8)
             .await
             .unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].thesis_relation, ThesisRelation::Neutral);
+        assert_eq!(personalized_picks.len(), 1);
+        assert_eq!(
+            personalized_picks[0].mainline_relation,
+            MainlineRelation::Neutral
+        );
     }
 
     #[tokio::test]
     async fn pass2_personalize_handles_unknown_category_string() {
-        // LLM 返回的 category 字符串未在 enum 里 → fallback 到 ThesisAligned
-        let json = r#"{"picks":[
-            {"idx":0,"rank":1,"title":"T","url":"u","comment":"c","category":"weird_value","thesis_relation":"???"}
+        // LLM 返回的 category 字符串未在 enum 里 → fallback 到 MainlineAligned
+        let response_json = r#"{"picks":[
+            {"idx":0,"rank":1,"title":"T","url":"u","comment":"c","category":"weird_value","mainline_relation":"???"}
         ]}"#;
-        let (curator, _) = make_curator(json);
-        let out = curator
-            .pass2_personalize(picks(), &audience(), UserThesis::default(), 0, 8)
+        let (curator, _) = make_curator_with_response(response_json);
+        let personalized_picks = curator
+            .pass2_personalize(
+                sample_picks_with_bodies(),
+                &audience(),
+                UserMainline::default(),
+                0,
+                8,
+            )
             .await
             .unwrap();
-        assert_eq!(out[0].category, PickCategory::ThesisAligned);
-        assert_eq!(out[0].thesis_relation, ThesisRelation::NotApplicable);
+        assert_eq!(
+            personalized_picks[0].category,
+            PickCategory::MainlineAligned
+        );
+        assert_eq!(
+            personalized_picks[0].mainline_relation,
+            MainlineRelation::NotApplicable
+        );
     }
 
     #[tokio::test]
     async fn pass2_personalize_skips_invalid_idx() {
-        let json = r#"{"picks":[
-            {"idx":99,"rank":1,"title":"x","url":"u","comment":"c","category":"thesis_aligned","thesis_relation":"中立"},
-            {"idx":1,"rank":2,"title":"y","url":"u","comment":"c","category":"thesis_aligned","thesis_relation":"中立"}
+        let response_json = r#"{"picks":[
+            {"idx":99,"rank":1,"title":"x","url":"u","comment":"c","category":"mainline_aligned","mainline_relation":"中立"},
+            {"idx":1,"rank":2,"title":"y","url":"u","comment":"c","category":"mainline_aligned","mainline_relation":"中立"}
         ]}"#;
-        let (curator, _) = make_curator(json);
-        let out = curator
-            .pass2_personalize(picks(), &audience(), UserThesis::default(), 0, 8)
+        let (curator, _) = make_curator_with_response(response_json);
+        let personalized_picks = curator
+            .pass2_personalize(
+                sample_picks_with_bodies(),
+                &audience(),
+                UserMainline::default(),
+                0,
+                8,
+            )
             .await
             .unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].candidate.event.id, "b");
+        assert_eq!(personalized_picks.len(), 1);
+        assert_eq!(personalized_picks[0].candidate.event.id, "b");
+    }
+
+    #[tokio::test]
+    async fn pass2_personalize_accepts_legacy_thesis_field_names() {
+        // LLM prompt-cache 短期内可能仍按旧 prompt 输出 thesis_* —— 必须能反序列化通过
+        let response_json = r#"{"picks":[
+            {"idx":0,"rank":1,"title":"T","url":"u","comment":"c","category":"thesis_counter","thesis_relation":"反证"}
+        ]}"#;
+        let (curator, _) = make_curator_with_response(response_json);
+        let personalized_picks = curator
+            .pass2_personalize(
+                sample_picks_with_bodies(),
+                &audience(),
+                UserMainline::default(),
+                0,
+                8,
+            )
+            .await
+            .unwrap();
+        assert_eq!(personalized_picks.len(), 1);
+        assert_eq!(
+            personalized_picks[0].category,
+            PickCategory::MainlineCounter
+        );
+        assert_eq!(
+            personalized_picks[0].mainline_relation,
+            MainlineRelation::Counter
+        );
     }
 
     #[test]
-    fn render_thesis_block_empty_returns_baseline_hint() {
-        let block = render_thesis_block(&UserThesis::default());
+    fn render_mainline_block_empty_returns_baseline_hint() {
+        let block = render_mainline_block(&UserMainline::default());
         assert!(block.contains("baseline"));
-        assert!(block.contains("thesis_aligned"));
+        assert!(block.contains("mainline_aligned"));
     }
 
     #[test]
-    fn render_thesis_block_includes_global_style_and_per_ticker() {
-        let mut m = HashMap::new();
-        m.insert("MU".into(), "看 NAND 稀缺".into());
-        m.insert("AAPL".into(), "看回购".into());
-        let block = render_thesis_block(&UserThesis {
-            global_style: Some("长期叙事派"),
-            theses: Some(&m),
+    fn render_mainline_block_includes_global_style_and_per_ticker() {
+        let mut mainlines_by_ticker = HashMap::new();
+        mainlines_by_ticker.insert("MU".into(), "看 NAND 稀缺".into());
+        mainlines_by_ticker.insert("AAPL".into(), "看回购".into());
+        let block = render_mainline_block(&UserMainline {
+            style: Some("长期叙事派"),
+            by_ticker: Some(&mainlines_by_ticker),
         });
         assert!(block.contains("长期叙事派"));
         assert!(block.contains("MU"));
@@ -1160,9 +1262,9 @@ mod tests {
             }
         }
         let curator = Curator::new(Arc::new(FailProvider), "p1", "p2");
-        let cands = vec![cand("a", "T")];
+        let candidates = vec![fixture_candidate("a", "T")];
         let err = curator
-            .pass1_select(&cands, &audience(), 10)
+            .pass1_select(&candidates, &audience(), 10)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("pass1 LLM call failed"));

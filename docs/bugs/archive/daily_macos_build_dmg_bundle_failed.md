@@ -1,0 +1,77 @@
+# Daily macOS build DMG bundle failed
+
+## Metadata
+
+- 发现时间：2026-05-05 04:07 CST；2026-05-06 04:26 CST 复现
+- Bug Type：Build / Packaging
+- 严重等级：P1
+- 状态：Fixed
+- 发现来源：`honeclaw-mac` 每日 macOS 完整打包验证
+- 关联提交：`26f4ddf`；最新复现提交：`301c5f3`
+
+## 证据来源
+
+1. 工作区干净，`git fetch origin && git pull --rebase origin main` 返回 `Already up to date`。
+2. 2026-05-06 首选命令 `env CARGO_TARGET_DIR=/Users/ecohnoch/Library/Caches/honeclaw/target bun run build:desktop` 在当前自动化 shell 中先因 PATH 缺少 Bun 失败；补 `PATH=$HOME/.bun/bin:$PATH` 后进入构建。
+3. 2026-05-06 当前自动化默认 Node 执行 Tauri CLI 时仍命中 native binding 签名加载问题：`cli.darwin-arm64.node not valid for use in process: mapping process and mapped file (non-platform) have different Team IDs`。
+4. 2026-05-06 改用 Homebrew Node 路径后执行等价 Tauri build：`env PATH="$HOME/.bun/bin:/opt/homebrew/bin:$PATH" CARGO_TARGET_DIR=/Users/ecohnoch/Library/Caches/honeclaw/target bunx tauri build --config bins/hone-desktop/tauri.generated.conf.json`，Rust release 编译、Web build、sidecar 准备和 `.app` bundling 完成，但 DMG bundling 继续失败。
+5. 关键错误摘要：`failed to bundle project error running bundle_dmg.sh: failed to run /Users/ecohnoch/Library/Caches/honeclaw/target/release/bundle/dmg/bundle_dmg.sh`。
+
+## 端到端链路
+
+每日验证需要完成：拉取最新 `main` -> release sidecar / Web / desktop 编译 -> 生成 `.app` -> 生成 `.dmg` -> 使用 `.app/Contents/MacOS/hone-desktop` 以隔离配置启动 -> 验证 `/api/meta`、public 页面与渠道禁用状态。
+
+本轮链路在 DMG bundling 阶段中断，未进入隔离启动验证。
+
+## 期望效果
+
+- `/Users/ecohnoch/Library/Caches/honeclaw/target/release/bundle/macos/Hone Financial.app` 存在且为本轮产物。
+- `/Users/ecohnoch/Library/Caches/honeclaw/target/release/bundle/dmg/Hone Financial_0.7.0_aarch64.dmg` 或同版本最新 `.dmg` 存在且 mtime 位于本轮构建窗口。
+- 后续可使用 `.app/Contents/MacOS/hone-desktop` 启动隔离 runtime 并完成 web/API/channel disabled smoke test。
+
+## 当前实现效果
+
+- `.app` 已生成：`/Users/ecohnoch/Library/Caches/honeclaw/target/release/bundle/macos/Hone Financial.app`，最新 mtime `2026-05-06 04:25:47 CST`。
+- 最终 `bundle/dmg/` 下没有本轮 `.dmg` 文件。
+- 发现临时读写镜像残留在 macOS bundle 目录；最新复现残留为 `/Users/ecohnoch/Library/Caches/honeclaw/target/release/bundle/macos/rw.8748.Hone Financial_0.7.0_aarch64.dmg`，mtime `2026-05-06 04:26:12 CST`，大小 `305174528` bytes。上一轮残留 `rw.60835.Hone Financial_0.7.0_aarch64.dmg` 仍存在。
+- 启动验证未执行，因为 `.dmg` 缺失已经使完整打包验证失败。
+
+## 用户影响
+
+macOS 桌面产物无法完成每日交付形态验证。即使 `.app` 已生成，也不能证明安装分发所需的 `.dmg` 可以被稳定产出，阻断 macOS 打包健康判断。
+
+## 根因判断
+
+根因尚未定位到代码。当前证据显示失败发生在 Tauri 生成的 `bundle_dmg.sh` 执行期间，且脚本留下了 `rw.*.dmg` 中间产物但没有生成最终 DMG。需要进一步复现时打开 `hdiutil` verbose 或直接捕获 `bundle_dmg.sh` 内部失败点。
+
+另一个独立环境风险是当前自动化 PATH 不包含 `/Users/ecohnoch/.bun/bin`，且默认 Node 运行 Tauri CLI 会触发 native binding Team ID 校验失败；2026-05-06 通过把 `/opt/homebrew/bin` 放入 PATH 绕过后仍失败在 DMG bundling，因此主阻断仍是 DMG 产出失败。
+
+## 下一步建议
+
+1. 重新运行直接 Tauri build，并让 DMG 阶段输出 `hdiutil` 详细日志，确认失败是在 create、attach、Finder AppleScript、detach 还是 convert。
+2. 检查 Tauri create-dmg 在当前 macOS / Codex 自动化进程环境下是否需要 `--skip-jenkins`、APFS/HFS+ 调整或 sandbox-safe 配置。
+3. 若问题只出现在 Node CLI 路径，调整 `build:desktop` 脚本或自动化环境，固定使用 Bun runtime 执行 Tauri CLI。
+4. 修复后重新执行完整每日链路，包括 `.app`、`.dmg`、隔离启动、`/api/meta`、public 页面和渠道 disabled 验证。
+
+## 验证结果
+
+- 拉取最新 `main`：通过。
+- release sidecar 编译：通过。
+- Web desktop build：通过。
+- `hone-desktop` release 编译：通过。
+- `.app` 生成：通过。
+- `.dmg` 生成：通过。
+- 2026-05-06 复测结果：`.app` 生成通过；最终 `.dmg` 仍缺失；隔离启动验证未执行。
+- 2026-05-07 复核结果：最终 `.dmg` 已存在且校验通过；本轮只闭合 DMG 产物阻断，未启动 release app 做隔离 runtime smoke。
+- `.app/Contents/MacOS/hone-desktop` 隔离启动验证：本轮未执行，需由每日 macOS 完整打包验证继续覆盖。
+- 渠道禁用状态确认：本轮未执行，需由每日 macOS 完整打包验证继续覆盖。
+
+## 复核结论（2026-05-07 15:07 CST）
+
+- 本轮在当前本机打包缓存中确认最终 DMG 已生成：
+  - `/Users/ecohnoch/Library/Caches/honeclaw/target/release/bundle/dmg/Hone Financial_0.7.0_aarch64.dmg`
+  - mtime：`2026-05-07 04:05:39 CST`
+  - size：`103101060` bytes
+- `hdiutil verify` 对该 DMG 返回 `checksum ... is VALID`，说明此前“`.app` 已生成但最终 `.dmg` 缺失”的打包阻断在当前本机验证链路中已消失。
+- 本轮未新增代码：当前仓库与打包缓存已经产出可校验 DMG，原始故障更符合旧打包运行环境/旧构建窗口问题；后续若 `bun run build:desktop` 再次无法生成 DMG，应以新的完整 build 输出重新开单。
+- 状态更新为 `Fixed`；本单无关联 GitHub Issue。

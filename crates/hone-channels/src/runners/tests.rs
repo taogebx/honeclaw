@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::acp_common::{
     AcpPromptState, AcpToolRenderPhase, CliVersion, extract_finished_tool_calls,
@@ -20,18 +20,17 @@ use super::acp_common::{
 use super::codex_acp::{
     build_codex_acp_prompt_text, codex_acp_effective_args, configured_codex_model_id,
     configured_codex_reasoning_effort, patch_codex_session_update_params, render_codex_tool_status,
-    validate_codex_version_matrix,
+    reusable_codex_acp_session_id, validate_codex_version_matrix,
 };
-use super::gemini_acp::{
-    configured_gemini_api_key_env, gemini_acp_effective_args, validate_gemini_version,
-};
+use super::gemini_acp::{gemini_acp_effective_args, validate_gemini_version};
 use super::gemini_cli::{
     GeminiCliToolRenderPhase, append_gemini_cli_tool_context_messages,
     render_gemini_cli_tool_status,
 };
 use super::opencode_acp::{
     build_opencode_acp_prompt_text, configured_opencode_model_id, effective_opencode_args,
-    handle_opencode_session_update, isolated_opencode_config, resolve_command_path_with_env,
+    handle_opencode_session_update, isolated_opencode_config, opencode_api_key_log_status,
+    resolve_command_path_with_env,
 };
 use super::tool_reasoning::{render_runner_tool_label, runner_context_messages};
 use super::types::{AgentRunnerEmitter, AgentRunnerEvent};
@@ -44,8 +43,83 @@ impl AgentRunnerEmitter for NoopEmitter {
     async fn emit(&self, _event: AgentRunnerEvent) {}
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CapturedToolEvent {
+    tool: String,
+    status: String,
+    message: Option<String>,
+    reasoning: Option<String>,
+}
+
+#[derive(Default)]
+struct CaptureEmitter {
+    events: Mutex<Vec<AgentRunnerEvent>>,
+}
+
+#[async_trait]
+impl AgentRunnerEmitter for CaptureEmitter {
+    async fn emit(&self, event: AgentRunnerEvent) {
+        self.events.lock().expect("events lock").push(event);
+    }
+}
+
+impl CaptureEmitter {
+    fn tool_events(&self) -> Vec<CapturedToolEvent> {
+        self.events
+            .lock()
+            .expect("events lock")
+            .iter()
+            .filter_map(|event| match event {
+                AgentRunnerEvent::ToolStatus {
+                    tool,
+                    status,
+                    message,
+                    reasoning,
+                } => Some(CapturedToolEvent {
+                    tool: tool.clone(),
+                    status: status.clone(),
+                    message: message.clone(),
+                    reasoning: reasoning.clone(),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+fn assert_contains_all(haystack: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(
+            haystack.contains(needle),
+            "expected text to contain {needle:?}"
+        );
+    }
+}
+
+fn assert_contains_none(haystack: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(
+            !haystack.contains(needle),
+            "expected text not to contain {needle:?}"
+        );
+    }
+}
+
+fn json_fence_body<'a>(text: &'a str, label: &str) -> &'a str {
+    let marker = "```json\n";
+    let start = text
+        .find(marker)
+        .unwrap_or_else(|| panic!("{label} missing opening JSON fence"))
+        + marker.len();
+    let end = text[start..]
+        .find("\n```")
+        .unwrap_or_else(|| panic!("{label} missing closing JSON fence"))
+        + start;
+    &text[start..end]
+}
+
 #[test]
-fn configured_model_id_appends_variant() {
+fn configured_opencode_model_id_appends_variant() {
     let config = OpencodeAcpConfig {
         model: "openrouter/openai/gpt-5.4".to_string(),
         variant: "medium".to_string(),
@@ -58,7 +132,7 @@ fn configured_model_id_appends_variant() {
 }
 
 #[test]
-fn configured_model_id_does_not_duplicate_variant_suffix() {
+fn configured_opencode_model_id_does_not_duplicate_variant_suffix() {
     let config = OpencodeAcpConfig {
         model: "openrouter/openai/gpt-5.4/medium".to_string(),
         variant: "medium".to_string(),
@@ -68,6 +142,15 @@ fn configured_model_id_does_not_duplicate_variant_suffix() {
         configured_opencode_model_id(&config).as_deref(),
         Some("openrouter/openai/gpt-5.4/medium")
     );
+}
+
+#[test]
+fn opencode_api_key_log_status_does_not_preview_secret() {
+    let status = opencode_api_key_log_status(Some("sk-or-v1-secret-value"));
+
+    assert_eq!(status, "OPENROUTER_API_KEY injected from Hone config");
+    assert!(!status.contains("sk-or"));
+    assert!(!status.contains("secret"));
 }
 
 #[test]
@@ -107,6 +190,17 @@ fn isolated_opencode_config_omits_provider_override_when_base_url_empty() {
     assert!(payload.get("provider").is_none());
     assert!(payload.get("model").is_none());
     assert_eq!(payload["permission"]["bash"], "deny");
+}
+
+#[test]
+fn codex_acp_does_not_reuse_remote_session_metadata() {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "codex_acp_session_id".to_string(),
+        Value::String("old-remote-session".to_string()),
+    );
+
+    assert!(reusable_codex_acp_session_id(&metadata).is_none());
 }
 
 fn make_temp_exec(dir: &Path, name: &str) -> PathBuf {
@@ -305,7 +399,7 @@ fn gemini_cli_tool_status_renders_argument_summary_and_reasoning() {
         rendered.tool,
         "web_search query=\"AAOI COHR after hours move and sector sympathy\""
     );
-    assert_eq!(rendered.message, None);
+    assert!(rendered.message.is_none());
     assert_eq!(
         rendered.reasoning.as_deref(),
         Some(
@@ -327,7 +421,7 @@ fn gemini_cli_tool_status_renders_argument_summary_and_reasoning() {
         done.message.as_deref(),
         Some("执行完成：data_fetch quote NVDA")
     );
-    assert_eq!(done.reasoning, None);
+    assert!(done.reasoning.is_none());
 }
 
 #[test]
@@ -451,13 +545,13 @@ fn codex_version_matrix_accepts_minimum_validated_pair() {
     let result = validate_codex_version_matrix(
         CliVersion {
             major: 0,
-            minor: 115,
+            minor: 125,
             patch: 0,
         },
         CliVersion {
             major: 0,
-            minor: 9,
-            patch: 5,
+            minor: 12,
+            patch: 0,
         },
     );
     assert!(result.is_ok());
@@ -468,12 +562,12 @@ fn codex_version_matrix_accepts_newer_adapter() {
     let result = validate_codex_version_matrix(
         CliVersion {
             major: 0,
-            minor: 115,
+            minor: 125,
             patch: 0,
         },
         CliVersion {
             major: 0,
-            minor: 11,
+            minor: 12,
             patch: 1,
         },
     );
@@ -485,13 +579,13 @@ fn codex_version_matrix_rejects_old_codex() {
     let result = validate_codex_version_matrix(
         CliVersion {
             major: 0,
-            minor: 105,
+            minor: 124,
             patch: 0,
         },
         CliVersion {
             major: 0,
-            minor: 9,
-            patch: 5,
+            minor: 12,
+            patch: 0,
         },
     );
     assert!(
@@ -506,13 +600,13 @@ fn codex_version_matrix_rejects_old_adapter() {
     let result = validate_codex_version_matrix(
         CliVersion {
             major: 0,
-            minor: 115,
+            minor: 125,
             patch: 0,
         },
         CliVersion {
             major: 0,
-            minor: 9,
-            patch: 4,
+            minor: 11,
+            patch: 1,
         },
     );
     assert!(
@@ -530,12 +624,6 @@ fn gemini_version_guard_rejects_old_binary() {
         patch: 0,
     });
     assert!(result.unwrap_err().contains("@google/gemini-cli@latest"));
-}
-
-#[test]
-fn gemini_api_key_env_defaults_to_standard_name() {
-    let config = GeminiAcpConfig::default();
-    assert_eq!(configured_gemini_api_key_env(&config), "GEMINI_API_KEY");
 }
 
 #[test]
@@ -603,7 +691,7 @@ fn extract_finished_tool_calls_returns_collected_records() {
     let calls = extract_finished_tool_calls(state);
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "web_search");
-    assert_eq!(calls[0].result["ok"], true);
+    assert_eq!(calls[0].result["ok"].as_bool(), Some(true));
 }
 
 #[test]
@@ -624,11 +712,11 @@ fn summarize_finished_tool_calls_for_log_limits_output_to_count_and_recent_entri
     ];
 
     let summary = summarize_finished_tool_calls_for_log(&calls);
-    assert!(summary.contains("count=2"));
-    assert!(summary.contains("data_fetch#call_2"));
-    assert!(summary.contains("web_search#call_1"));
-    assert!(!summary.contains("AAOI"));
-    assert!(!summary.contains("COHR"));
+    assert_contains_all(
+        &summary,
+        &["count=2", "data_fetch#call_2", "web_search#call_1"],
+    );
+    assert_contains_none(&summary, &["AAOI", "COHR"]);
 }
 
 #[tokio::test]
@@ -695,7 +783,7 @@ async fn acp_updates_build_restorable_transcript_sequence() {
     assert_eq!(messages.len(), 4);
     assert_eq!(messages[0].role, "assistant");
     assert_eq!(messages[0].content.as_deref(), Some("先查本地画像。"));
-    assert_eq!(messages[0].tool_calls, None);
+    assert!(messages[0].tool_calls.is_none());
     let tool_calls = messages[1]
         .tool_calls
         .as_ref()
@@ -725,10 +813,15 @@ fn codex_prompt_text_includes_restored_transcript_when_session_is_recreated() {
     context.add_assistant_message("我先查本地画像。", None);
 
     let prompt = build_codex_acp_prompt_text("SYSTEM", "新的问题", Some(&context));
-    assert!(prompt.contains("### Restored Conversation Transcript ###"));
-    assert!(prompt.contains("\"role\": \"user\""));
-    assert!(prompt.contains("AAOI 是什么公司"));
-    assert!(prompt.contains("### User Input ###\n新的问题"));
+    assert_contains_all(
+        &prompt,
+        &[
+            "### Restored Conversation Transcript ###",
+            "\"role\": \"user\"",
+            "AAOI 是什么公司",
+            "### User Input ###\n新的问题",
+        ],
+    );
 }
 
 #[test]
@@ -752,10 +845,15 @@ fn codex_prompt_text_serializes_message_metadata() {
     });
 
     let prompt = build_codex_acp_prompt_text("SYSTEM", "新的问题", Some(&context));
-    assert!(prompt.contains("\"metadata\""));
-    assert!(prompt.contains("\"codex_acp\""));
-    assert!(prompt.contains("\"segment_kind\": \"progress_note\""));
-    assert!(prompt.contains("\"stream_kind\": \"agent_message_chunk\""));
+    assert_contains_all(
+        &prompt,
+        &[
+            "\"metadata\"",
+            "\"codex_acp\"",
+            "\"segment_kind\": \"progress_note\"",
+            "\"stream_kind\": \"agent_message_chunk\"",
+        ],
+    );
 }
 
 #[test]
@@ -845,10 +943,15 @@ fn codex_prompt_text_uses_normalized_user_assistant_history() {
     context.add_assistant_message("AAOI 是做光模块的。", None);
 
     let prompt = build_codex_acp_prompt_text("SYSTEM", "新的问题", Some(&context));
-    assert!(prompt.contains("\"role\": \"assistant\""));
-    assert!(prompt.contains("\"type\": \"tool_call\""));
-    assert!(prompt.contains("\"type\": \"tool_result\""));
-    assert!(prompt.contains("\"type\": \"final\""));
+    assert_contains_all(
+        &prompt,
+        &[
+            "\"role\": \"assistant\"",
+            "\"type\": \"tool_call\"",
+            "\"type\": \"tool_result\"",
+            "\"type\": \"final\"",
+        ],
+    );
     assert!(!prompt.contains("\"role\": \"tool\""));
 }
 
@@ -884,27 +987,9 @@ fn codex_and_opencode_prompt_transcripts_share_the_same_normalized_history() {
     let codex_prompt = build_codex_acp_prompt_text("SYSTEM", "新的问题", Some(&context));
     let opencode_prompt = build_opencode_acp_prompt_text("SYSTEM", "新的问题", Some(&context));
 
-    let codex_marker = "```json\n";
-    let codex_start = codex_prompt
-        .find(codex_marker)
-        .expect("codex transcript start")
-        + codex_marker.len();
-    let codex_end = codex_prompt[codex_start..]
-        .find("\n```")
-        .expect("codex transcript end")
-        + codex_start;
-    let opencode_start = opencode_prompt
-        .find(codex_marker)
-        .expect("opencode transcript start")
-        + codex_marker.len();
-    let opencode_end = opencode_prompt[opencode_start..]
-        .find("\n```")
-        .expect("opencode transcript end")
-        + opencode_start;
-
     assert_eq!(
-        &codex_prompt[codex_start..codex_end],
-        &opencode_prompt[opencode_start..opencode_end]
+        json_fence_body(&codex_prompt, "codex transcript"),
+        json_fence_body(&opencode_prompt, "opencode transcript")
     );
 }
 
@@ -943,7 +1028,7 @@ fn final_response_content_prefers_last_assistant_segment() {
 }
 
 #[test]
-fn codex_execute_renderer_truncates_long_command_and_appends_purpose() {
+fn codex_execute_renderer_hides_command_and_appends_purpose() {
     let long_script = "python - <<'PY'\n".to_string() + &"x".repeat(2400);
     let rendered = render_codex_tool_status(
         &serde_json::json!({
@@ -959,14 +1044,13 @@ fn codex_execute_renderer_truncates_long_command_and_appends_purpose() {
         Some("default".to_string()),
     );
 
-    assert!(rendered.tool.contains("[truncated,"));
-    assert!(rendered.tool.starts_with("python - <<'PY'"));
-    assert_eq!(rendered.message, None);
+    assert_eq!(rendered.tool, "本地命令");
+    assert!(rendered.message.is_none());
     assert!(
         rendered
             .reasoning
             .as_deref()
-            .is_some_and(|value| value.starts_with("正在执行：python - <<'PY'"))
+            .is_some_and(|value| value.starts_with("正在执行：本地命令"))
     );
     assert!(
         rendered
@@ -991,12 +1075,9 @@ fn codex_execute_renderer_formats_done_message() {
         None,
     );
 
-    assert_eq!(rendered.tool, "rtk ls -la uploads");
-    assert_eq!(
-        rendered.message.as_deref(),
-        Some("执行完成：rtk ls -la uploads")
-    );
-    assert_eq!(rendered.reasoning, None);
+    assert_eq!(rendered.tool, "本地命令");
+    assert_eq!(rendered.message.as_deref(), Some("执行完成：本地命令"));
+    assert!(rendered.reasoning.is_none());
 }
 
 #[tokio::test]
@@ -1043,8 +1124,10 @@ async fn codex_execute_completed_update_rehydrates_tool_result_from_raw_output()
     assert_eq!(messages[1].role, "tool");
     assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_exec_1"));
     let tool_content = messages[1].content.as_deref().expect("tool content");
-    assert!(tool_content.contains("\"stdout\":\"rtk 0.35.0\\n\""));
-    assert!(tool_content.contains("\"exit_code\":0"));
+    assert_contains_all(
+        tool_content,
+        &["\"stdout\":\"rtk 0.35.0\\n\"", "\"exit_code\":0"],
+    );
 }
 
 #[tokio::test]
@@ -1169,20 +1252,6 @@ async fn opencode_updates_preserve_tool_names_and_raw_io_in_transcript() {
 
 #[tokio::test]
 async fn opencode_tool_status_uses_rendered_labels_from_raw_input() {
-    use std::sync::Mutex;
-
-    #[derive(Default)]
-    struct CaptureEmitter {
-        events: Mutex<Vec<AgentRunnerEvent>>,
-    }
-
-    #[async_trait]
-    impl AgentRunnerEmitter for CaptureEmitter {
-        async fn emit(&self, event: AgentRunnerEvent) {
-            self.events.lock().expect("events lock").push(event);
-        }
-    }
-
     let emitter = Arc::new(CaptureEmitter::default());
     let emitter_trait: Arc<dyn AgentRunnerEmitter> = emitter.clone();
     let mut state = AcpPromptState::default();
@@ -1237,70 +1306,33 @@ async fn opencode_tool_status_uses_rendered_labels_from_raw_input() {
     )
     .await;
 
-    let events = emitter.events.lock().expect("events lock");
-    let tool_events = events
-        .iter()
-        .filter_map(|event| match event {
-            AgentRunnerEvent::ToolStatus {
-                tool,
-                status,
-                message,
-                reasoning,
-            } => Some((
-                tool.clone(),
-                status.clone(),
-                message.clone(),
-                reasoning.clone(),
-            )),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
     assert_eq!(
-        tool_events[0],
-        (
-            "read uploads".to_string(),
-            "start".to_string(),
-            None,
-            Some("正在执行：read uploads".to_string()),
-        )
-    );
-    assert_eq!(
-        tool_events[1],
-        (
-            "read uploads".to_string(),
-            "done".to_string(),
-            Some("执行完成：read uploads".to_string()),
-            None,
-        )
-    );
-    assert_eq!(
-        tool_events[2],
-        (
-            "grep \"AAOI|COHR\" in runtime".to_string(),
-            "start".to_string(),
-            None,
-            Some("正在执行：grep \"AAOI|COHR\" in runtime".to_string()),
-        )
+        emitter.tool_events(),
+        vec![
+            CapturedToolEvent {
+                tool: "read uploads".to_string(),
+                status: "start".to_string(),
+                message: None,
+                reasoning: Some("正在执行：read uploads".to_string()),
+            },
+            CapturedToolEvent {
+                tool: "read uploads".to_string(),
+                status: "done".to_string(),
+                message: Some("执行完成：read uploads".to_string()),
+                reasoning: None,
+            },
+            CapturedToolEvent {
+                tool: "grep \"AAOI|COHR\" in runtime".to_string(),
+                status: "start".to_string(),
+                message: None,
+                reasoning: Some("正在执行：grep \"AAOI|COHR\" in runtime".to_string()),
+            },
+        ]
     );
 }
 
 #[tokio::test]
 async fn opencode_tool_status_labels_workspace_root_explicitly() {
-    use std::sync::Mutex;
-
-    #[derive(Default)]
-    struct CaptureEmitter {
-        events: Mutex<Vec<AgentRunnerEvent>>,
-    }
-
-    #[async_trait]
-    impl AgentRunnerEmitter for CaptureEmitter {
-        async fn emit(&self, event: AgentRunnerEvent) {
-            self.events.lock().expect("events lock").push(event);
-        }
-    }
-
     let emitter = Arc::new(CaptureEmitter::default());
     let emitter_trait: Arc<dyn AgentRunnerEmitter> = emitter.clone();
     let mut state = AcpPromptState::default();
@@ -1341,42 +1373,66 @@ async fn opencode_tool_status_labels_workspace_root_explicitly() {
     )
     .await;
 
-    let events = emitter.events.lock().expect("events lock");
-    let tool_events = events
-        .iter()
-        .filter_map(|event| match event {
-            AgentRunnerEvent::ToolStatus {
-                tool,
-                status,
-                message,
-                reasoning,
-            } => Some((
-                tool.clone(),
-                status.clone(),
-                message.clone(),
-                reasoning.clone(),
-            )),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
     assert_eq!(
-        tool_events[0],
-        (
-            "read workspace root".to_string(),
-            "start".to_string(),
-            None,
-            Some("正在执行：read workspace root".to_string()),
-        )
+        emitter.tool_events(),
+        vec![
+            CapturedToolEvent {
+                tool: "read workspace root".to_string(),
+                status: "start".to_string(),
+                message: None,
+                reasoning: Some("正在执行：read workspace root".to_string()),
+            },
+            CapturedToolEvent {
+                tool: "grep \"AAOI|COHR\" in workspace root".to_string(),
+                status: "start".to_string(),
+                message: None,
+                reasoning: Some("正在执行：grep \"AAOI|COHR\" in workspace root".to_string()),
+            },
+        ]
     );
+}
+
+#[tokio::test]
+async fn opencode_tool_status_redacts_secret_values_in_labels() {
+    let emitter = Arc::new(CaptureEmitter::default());
+    let emitter_trait: Arc<dyn AgentRunnerEmitter> = emitter.clone();
+    let mut state = AcpPromptState::default();
+
+    handle_opencode_session_update(
+        &serde_json::json!({
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_grep_secret",
+                "title": "grep",
+                "kind": "search",
+                "status": "pending",
+                "rawInput": {
+                    "pattern": "token=pattern-secret auth=Bearer bearer-secret",
+                    "path": "/tmp/runtime?api_key=path-secret",
+                    "purpose": "check apiKey: header-secret"
+                }
+            }
+        }),
+        &emitter_trait,
+        &mut state,
+    )
+    .await;
+
+    let events = emitter.tool_events();
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert!(event.tool.contains("token=<redacted>"));
+    assert!(event.tool.contains("Bearer <redacted>"));
+    assert!(event.tool.contains("api_key=<redacted>"));
+    assert!(event.tool.contains("apiKey: <redacted>"));
+    assert!(!event.tool.contains("pattern-secret"));
+    assert!(!event.tool.contains("bearer-secret"));
+    assert!(!event.tool.contains("path-secret"));
+    assert!(!event.tool.contains("header-secret"));
+    let expected_reasoning = format!("正在执行：{}", event.tool);
     assert_eq!(
-        tool_events[1],
-        (
-            "grep \"AAOI|COHR\" in workspace root".to_string(),
-            "start".to_string(),
-            None,
-            Some("正在执行：grep \"AAOI|COHR\" in workspace root".to_string()),
-        )
+        event.reasoning.as_deref(),
+        Some(expected_reasoning.as_str())
     );
 }
 
@@ -1410,12 +1466,19 @@ fn opencode_prompt_text_includes_restored_transcript_for_fresh_sessions() {
     context.add_assistant_message("runtime 目录是空的。", None);
 
     let prompt = build_opencode_acp_prompt_text("SYSTEM", "新的问题", Some(&context));
-    assert!(prompt.contains("### Restored Conversation Transcript ###"));
-    assert!(prompt.contains("\"role\": \"assistant\""));
-    assert!(prompt.contains("\"type\": \"tool_call\""));
-    assert!(prompt.contains("\"type\": \"tool_result\""));
-    assert!(prompt.contains("\"type\": \"final\""));
+    assert_contains_all(
+        &prompt,
+        &[
+            "### Restored Conversation Transcript ###",
+            "\"role\": \"assistant\"",
+            "\"type\": \"tool_call\"",
+            "\"type\": \"tool_result\"",
+            "\"type\": \"final\"",
+        ],
+    );
     assert!(!prompt.contains("\"role\": \"tool\""));
-    assert!(prompt.contains("我先检查 runtime。"));
-    assert!(prompt.contains("### User Input ###\n新的问题"));
+    assert_contains_all(
+        &prompt,
+        &["我先检查 runtime。", "### User Input ###\n新的问题"],
+    );
 }

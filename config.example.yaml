@@ -2,7 +2,11 @@
 #
 # Usage:
 # 1) Copy this file to config.yaml
-# 2) Fill in or adjust the values as needed; all API tokens are read from config.yaml
+# 2) Fill in or adjust the values as needed. Most provider tokens are config-owned;
+#    public SMS/Captcha and selected operational secrets use runtime env as noted below.
+
+# UI / CLI display language: zh or en
+language: zh
 
 # iMessage config
 imessage:
@@ -11,6 +15,8 @@ imessage:
   target_handle: ""
   db_path: "~/Library/Messages/chat.db"
   poll_interval: 2 # polling interval in seconds
+  # Local HTTP listener used by iMessage-side scheduled task callbacks
+  listen_addr: "127.0.0.1:8078"
 
 # Feishu channel config (Rust business process + Go official SDK facade)
 feishu:
@@ -36,7 +42,7 @@ feishu:
   facade_url: "http://127.0.0.1:18115/rpc"
   # Listener address for callback events from the Go facade to Rust
   callback_addr: "127.0.0.1:18116"
-  # The Go facade's own listener address; launch.sh uses it for health checks
+  # The Go facade's own listener address; used for local health checks
   facade_addr: "127.0.0.1:18115"
   # Timeout, in seconds, for waiting on the facade long connection at startup
   startup_timeout_seconds: 20
@@ -75,6 +81,14 @@ discord:
   group_reply:
     # Whether explicit-trigger group replies are enabled
     enabled: true
+  watch:
+    enabled: false
+    # Channel IDs to watch; can also be specified on the command line with --channel-id (higher priority)
+    channel_ids: []
+    # Run mode: true = long-running loop; false = one-shot run (suitable for cron)
+    loop: true
+    # Whether to print verbose logs (also prints on ticks with no new messages)
+    verbose: false
 
 # Group-chat shared session / context compression policy
 group_context:
@@ -97,76 +111,24 @@ group_context:
   # Keep the latest N messages after compression
   retain_recent_after_compress: 8
 
-# Discord channel watcher (for cron: poll channel messages -> append locally -> speak or warn when needed)
-discord_watch:
-  enabled: false
-  # Channel IDs to watch; can also be specified on the command line with --channel-id (higher priority)
-  channel_ids: []
-  # Run mode: true = long-running loop; false = one-shot run (suitable for cron)
-  loop: true
-  # Whether to print verbose logs (also prints on ticks with no new messages)
-  verbose: false
-  # Whether to print decision traces (why it stayed silent / why it joined)
-  log_decisions: true
-  # Whether to persist structured decision traces (JSONL) for postmortem review
-  decision_log_enabled: true
-  # Poll interval in seconds for loop mode; only used when --loop is set
-  poll_interval_seconds: 30
-  # Log and state files are written under storage.base_path
-  log_dir: "discord_channel_logs"
-  state_dir: "discord_channel_watch"
-  decision_log_dir: "discord_channel_decisions"
-  # Pull the last N messages at startup as context (record only; do not speak or warn)
-  bootstrap_limit: 50
-  moderation:
-    enabled: true
-    # Minimum interval between warnings of the same type, to avoid spam
-    warning_cooldown_seconds: 60
-  participation:
-    enabled: true
-    # Participation window after an @ mention or scheduled trigger, in minutes
-    window_minutes: 15
-    # Scheduled participation interval in minutes; only fires when a question / opinion signal is present
-    schedule_minutes: 30
-    # Cooldown between two scheduled participations, in minutes; @ mentions ignore this limit
-    cooldown_minutes: 90
-    # Minimum reply interval inside the window, in seconds
-    reply_min_interval_seconds: 240
-    # Follow-up grace period after the bot replies, for the same user's continued question or intent, in seconds
-    same_user_followup_grace_seconds: 900
-    # Grace period for one quick non-@ follow-up question after an @ mention, in seconds
-    mention_followup_grace_seconds: 120
-    # Whether to send an immediate "seen it" acknowledgement after an @ mention (disabled by default; go straight to the full reply)
-    mention_immediate_ack: false
-    # Immediate acknowledgement text
-    mention_ack_text: "Got it, let me take a look."
-    # Cooldown for the immediate acknowledgement, in seconds; 0 means acknowledge every @ mention
-    mention_ack_cooldown_seconds: 0
-    # Only reply when the input contains a question / help / opinion-seeking signal
-    require_question_like: true
-
-# Nano Banana Pro image generation config
+# Nano Banana image generation config
 nano_banana:
   enabled: true
   # Single implementation: use the OpenRouter image generation API (modalities=["image","text"])
   base_url: "https://openrouter.ai/api/v1"
-  model: "google/gemini-3-pro-image-preview"
+  model: "google/gemini-2.0-flash-exp"
   default_image_count: 3
-  timeout_seconds: 90
-  download_timeout_seconds: 30
-  # API key is read from llm.openrouter.api_key
-  max_retries: 2
-  max_tokens: 2048
-  temperature: 0.7
-  http_referrer: "https://openrouter.ai"
-  x_title: "Hone-Financial"
+  # API key prefers llm.providers.openrouter.api_key/api_keys; legacy
+  # llm.openrouter.api_key/api_keys is still readable during migration.
+  # Request timeout, max_tokens, temperature, HTTP referrer, and title currently use fixed client defaults.
   download_dir: "gen_images"
-  extra_params: {}
 
 # Financial Modeling Prep API config
 fmp:
-  # Financial Modeling Prep API key
+  # Legacy single-key fallback; prefer api_keys for new configs
   api_key: ""
+  # Financial Modeling Prep API key pool with failover support
+  api_keys: []
   base_url: "https://financialmodelingprep.com/api"
   timeout: 60
 
@@ -176,11 +138,12 @@ fmp:
 event_engine:
   # Master switch. Default off — enable only when you want proactive pushes.
   enabled: false
-  # v0.1.46 破坏性简化: poll_intervals 只保留 news / price 两个真正时效敏感的 poller。
+  # poll_intervals 只保留 news / price 两个真正时效敏感的 poller。
   # earnings / corp_action / macro / analyst_grade / earnings_surprise 原本 5 个 24h 节奏
-  # 的 poller 改为 **cron-aligned** —— 在 digest.pre_market / post_market 前
-  # `prefetch_offset_mins` 分钟各跑一次,保证 flush 推送的数据永远是刚拉的,不受用户重启
-  # 时机漂移。冷启动时每个 poller 立即跑一次。旧 YAML 里残留的 earnings_secs /
+  # 的 poller 已改为 **cron-aligned**；后来拆出的 sec_filings 也走同一调度方式 ——
+  # 在 digest.default_slots 各 slot 前 `prefetch_offset_mins` 分钟跑一次,
+  # 保证 flush 推送的数据永远是刚拉的,不受用户重启时机漂移。
+  # 冷启动时每个 poller 立即跑一次。旧 YAML 里残留的 earnings_secs /
   # corp_action_secs / macro_secs / analyst_grade_secs / earnings_surprise_secs 会被 serde
   # 悄悄忽略,不用删也能继续启动(但已经无效,建议清理)。
   poll_intervals:
@@ -192,22 +155,22 @@ event_engine:
     # 非交易时段 poller 会自动 skip，不必担心夜里空烧。
     price_secs: 300 # 5 min
   digest:
-    # Pre/post-market digests fire at these local times in the configured timezone.
-    # Defaults target CN users: pre_market rolls the overnight queue into a morning
-    # briefing; post_market is deliberately delayed to 09:00 Beijing (instead of
-    # US-close 16:00 ET / 04:00 Beijing) so the US overnight summary arrives after
-    # users wake up.
+    # 管理员视角默认槽位时刻 —— 在 actor 没有自定义 prefs.digest_slots 时,
+    # UnifiedDigestScheduler 用这组时刻作为默认 slot 触发推送。每个 slot 可配
+    # `time`(本地 HH:MM)和可选 `label`(渲染 header 用)。
+    # Defaults target CN users: 08:30 卷起夜里队列成早间摘要;09:00 把美股盘后(BJ 凌晨)
+    # 隔夜汇总延后到醒来后,避免半夜打扰。
     timezone: Asia/Shanghai
-    pre_market: "08:30"
-    post_market: "09:00"
+    default_slots:
+      - {time: "08:30", label: "盘前摘要"}
+      - {time: "09:00", label: "晨间摘要"}
     # Max items rendered per digest flush. Events beyond this (sorted by severity
     # desc, occurred_at desc) are dropped with a "…… 另 N 条已省略" footer so a
     # Low-severity storm can't bury the user. 0 disables the cap.
     max_items_per_batch: 20
-    # v0.1.46 新增:cron-aligned poller 在 flush 窗口前多少分钟执行拉取。
-    # earnings / corp_action / macro / analyst_grade / earnings_surprise 5 个 24h 节奏
-    # 的 poller 不再按固定 interval 轮询,而是在 pre_market - offset / post_market - offset
-    # 各跑一次,保证推送数据永远是 flush 前刚拉的。
+    # cron-aligned poller 在每个 default slot 时刻前多少分钟执行拉取。
+    # 日频来源不再按固定 24h interval 轮询,而是在 default_slots 各 slot 前 offset 跑一次,
+    # 保证推送数据永远是 flush 前刚拉的。
     # 默认 30:数值越小数据越新,但留给 EventStore/Router 的缓冲越紧;低于 5 不推荐。
     prefetch_offset_mins: 30
     # 同一用户两次 digest 的最小间隔。用户配置多个窗口时，避免 09:00/12:00/16:00
@@ -235,12 +198,11 @@ event_engine:
     # 价格异动跨档再提醒步长。high=6, step=2 时,盘中跨 +6/+8/+10
     # 或 -6/-8/-10 会形成独立事件；未跨新档只更新摘要最新态。
     price_realert_step_pct: 2.0
-    # 同一用户、同一 ticker、同一方向的价格 band 即时推最小间隔。
-    # 价格 band 不再走通用 same_symbol_cooldown,避免 +6 后把 +8 误挡住。
-    price_intraday_min_gap_minutes: 30
-    # 同一用户、同一 ticker、同一方向每日最多即时推几个价格 band。
-    # 默认 2:例如 +6/+8 推送,+10 只更新摘要。
-    price_symbol_direction_daily_cap: 2
+    # 价格 band 单一推送规则(v0.5.2 起替代旧 cap+gap 双保险):新档 pct 必须比
+    # 当日已 sink-sent 的最大档高出本字段值,否则降级 digest。0 = 关闭(无脑全推)。
+    # 默认 2.0 与 price_realert_step_pct 一致,意为「每跨一个新 band 必推」 ——
+    # 避免大行情长尾失声(POC 实证 AAOI 6→16 序列 cap=2 仅 6/8,advance=2 全 6 档)。
+    price_band_min_advance_pct: 2.0
     # 收盘 price_close 默认只进摘要,避免美股收盘在北京时间凌晨即时打扰。
     price_close_direct_enabled: false
     large_position_weight_pct: 20.0
@@ -249,8 +211,9 @@ event_engine:
     macro_immediate_grace_hours: 2
   renderer:
     # Severity list that goes through LLM polish. Empty list = pure template.
-    # Requires llm.openrouter to be configured.
+    # polish_llm names an llm.profiles entry; empty falls back to legacy llm.openrouter.sub_model/model.
     llm_polish_for: []
+    polish_llm: aux
     template_dir: "./data/event_templates"
 
   # 财报 poller 参数。
@@ -258,47 +221,101 @@ event_engine:
   #   这决定 Hone 从多早开始"关注"一家公司的财报 —— 默认 14 天:启动时你会一次看到
   #   未来 14 天内所有持仓的财报预告(Medium 级,进 digest)。
   #   **v0.1.46 起**,poller 只产出稳定 id 的 `earnings:{SYM}:{DATE}` teaser 事件
-  #   (Medium 入 digest);T-3/T-2/T-1 倒计时由 DigestScheduler 在每次 flush 时刻
-  #   从 EventStore 现算 —— 这样 poller cron 漂移不会让倒计时 off-by-one,
+  #   (Medium 入 digest);T-3/T-2/T-1 倒计时由 UnifiedDigestScheduler 在每个 slot
+  #   触发时从 EventStore 现算 —— 这样 poller cron 漂移不会让倒计时 off-by-one,
   #   T-1 也由早 8:30 的 pre-market 窗口天然覆盖,不再单独升 High。整条 lifecycle
   #   共享 `earnings_upcoming` kind,把它加进 `blocked_kinds` 即全程静音。
   #   典型取值:7(仅本周)、14(两周,默认)、21(三周,但信号老化)。小于 3 会让 T-3
   #   倒计时失效(因为 poller 看不到 T-3 的财报)。
+  # quality_review: EarningsSurprisePoller 原始数据只有 EPS actual vs estimate。
+  #   对亏损公司或 EPS 接近 0 的公司,百分比 surprise 会非常误导。开启后,若近期
+  #   SEC 8-K 财报新闻稿可抓取且 OpenRouter 可用,会用 LLM 综合收入、指引、backlog、
+  #   GAAP/non-GAAP 利润、EBIT/EBITA/EBITDA、现金流与风险来判断 immediate / digest。
+  #   失败、缺少上下文或低置信时直接跳过 candidate,不再产出 EPS-only 推送。
   earnings:
     window_days: 14
+    quality_review:
+      enabled: true
+      llm: earnings_quality
+      model: x-ai/grok-4.1-fast
+      max_review_tokens: 1800
+      min_review_confidence: 0.65
+      min_immediate_confidence: 0.9
+      sec_recent_hours: 72
+      context_max_chars: 9000
 
-  # 全局 digest —— LLM 精读后每天 N 次推送的"今日全球要闻"。
-  # 与 ticker 命中的 per-actor digest 完全独立:
+  # SEC filings poller 配置。
+  # forms: 每 tick 对每只 watchlist ticker 拉哪些 form 类型。FMP 的 /v3/sec_filings
+  #   必须按 type 过滤,不支持一次取多 type;每个 form 一次 HTTP。
+  #   Severity 由 form 决定(代码硬映射,不在 config 里):
+  #     8-K / S-1            → High(突发披露 / 增发,稀释信号)
+  #     10-Q / 10-K          → Medium(季报 / 年报)
+  #     DEF 14A              → Low(委托书 / 治理薪酬)
+  #   想关掉某 form 直接从这里删掉它,不需要改代码。空数组等于关闭整个 poller。
+  # enrichment: 是否给 SEC filing 调 LLM 生成 ~200 字业务摘要(长期主线投资者
+  #   视角:跳过 GAAP 数字,抓 backlog / 资本配置 / 风险因子新增)。
+  #   POC 实证 grok-4.1-fast 在 11 持仓 × 一年 ~70 条 filing 上 ≈ $0.82/年,质量、
+  #   成本、延迟均第一。失败 fallback 走原始 form/link body,不阻塞推送。
+  sec_filings:
+    forms:
+      - 8-K
+      - 10-Q
+      - 10-K
+      - S-1
+      - DEF 14A
+    enrichment:
+      enabled: true
+      llm: filing_summary
+      model: x-ai/grok-4.1-fast
+      max_summary_tokens: 800
+      # SEC EDGAR 强制要求 User-Agent 包含联系邮箱,否则会被限流或拒绝。
+      # 部署方应改成自己的真实联系邮箱(SEC 不强制可达,但需有公司 / 产品名 + 邮箱)。
+      user_agent: "honeclaw event-engine ops@honeclaw.local"
+
+  # 全局 digest LLM 子配置 —— UnifiedDigestScheduler 在每个 slot 触发时把这一节
+  # 作为 GlobalNewsSource 的旋钮使用。触发完全由 per-actor `prefs.digest_slots` 驱动,
+  # 这里不再有调度时刻。
+  # 候选池流水:
   # - 候选池 = trusted-source High/Medium news + 临近 high macro_event(不挂 ticker 也算)
-  # - Pass 1 (pass1_model) 廉价模型批量打分 + cluster + 一句话 takeaway
-  # - Pass 2 (pass2_model) 抓原文(若 fetch_full_text=true) + 强模型精读 + 短评 + 排序
-  # - 渲染单条 broadcast 给所有 prefs.global_digest_enabled=true 的 direct actor
-  # 默认 enabled=false。需要先填 schedules 才会触发。
+  # - Pass 1 (pass1_llm/pass1_model) 批量打分 + cluster + 一句话 takeaway
+  # - Pass 2 (pass2_llm/pass2_model) 抓原文(若 fetch_full_text=true) + 精读 + 短评 + 排序
+  # 输出经 unified scheduler per-actor fan-out,与 buffer/synth 候选合流后渲染。
+  # 默认 enabled=false。`enabled=false` 时 GlobalNewsSource 直接返回空池,
+  # unified pipeline 仍按 buffer/synth 候选推送 actor。
   global_digest:
     enabled: false
     timezone: Asia/Shanghai
-    schedules: [] # 例如 ["07:30", "21:00"] —— 一天 N 次,按 timezone 解释
-    lookback_hours: 24 # 候选池回看窗口,以及"距上次成功推送"的兜底
-    pass1_model: amazon/nova-lite-v1 # 便宜模型,~$0.06/M input
+    lookback_hours: 24 # 候选池回看窗口
+    # *_llm fields name llm.profiles entries; matching *_model fields are legacy OpenRouter fallbacks.
+    pass1_llm: digest_fast
+    pass1_model: x-ai/grok-4.1-fast
+    pass2_llm: digest_strong
     pass2_model: x-ai/grok-4.1-fast # 价格 $0.20/$0.50 per M,2M context,带 reasoning
     pass2_top_n: 15 # Pass 1 排序后送 Pass 2 精读的候选数上限
     final_pick_n: 8 # 单次推送最终保留的条数上限
     fetch_full_text: true # Pass 2 是否 GET 原文 → html2text;失败 fallback FMP text
-    # 事件级去重(POC 验证 2026-04-26 加):collector 之后 / Pass1 之前,用强 LLM
+    # Jina Reader API key,用于 Pass 2 抓不到原文时(reuters / wsj / barrons / nyt 等
+    # 付费墙站点)走 r.jina.ai 二次抓取。免费层 1M tokens/月,jina.ai 注册即得。
+    # 留空则跳过 Jina fallback,直接落到 FMP text。
+    jina_api_key: ""
+    # 事件级去重(POC 验证 2026-04-26):collector 之后 / Pass1 之前,用强 LLM
     # 把同事件多源报道合并成 1 条代表,避免 picks 被 5 条 Hormuz 这种重复挤满。
     # 必须用强模型,nova-lite 这种会过度归类成 theme(把不同事件合到大筐里)。
     event_dedupe_enabled: true
+    event_dedupe_llm: digest_strong
+    mainline_distill_llm: mainline_short
     event_dedupe_model: x-ai/grok-4.1-fast
 
-  # Per-poller 开关。每个字段对应 hone-event-engine 内一个 spawn_*_poller 调用,
-  # 设成 false 即直接 skip 该 poller 的 tick(最省 FMP 配额)。
+  # Per-source 开关。每个字段对应 hone-event-engine 内一个 EventSource,
+  # 设成 false 即不 spawn 该 source(最省 FMP 配额)。
   # 想要"poller 仍跑、只是 router 丢弃某 kind"的兜底关法,改用下方 disabled_kinds。
   sources:
     news: true # /v3/stock_news → NewsCritical
-    price: true # /v3/quote 按 watch pool 拉 → PriceAlert / 52W / VolumeSpike
+    price: true # /v3/quote 按 watch pool 拉 → PriceAlert / Weekly52High / Weekly52Low
+    extended_hours: true # /v3/historical-chart/1min?extended=true → pre/post-market PriceAlert
     earnings_calendar: true # /v3/earning_calendar → EarningsUpcoming
     corp_action: true # 拆股 / 分红日历 → Split / Dividend
-    sec_filings: true # SEC 8-K per-ticker → SecFiling
+    sec_filings: true # SEC filings per-ticker → SecFiling(form whitelist 见上方 sec_filings.forms)
     macro_calendar: true # /v3/economic_calendar → MacroEvent
     analyst_grade: true # 按 watch pool 拉 → AnalystGrade
     earnings_surprise: true # 按 watch pool 拉 → EarningsReleased
@@ -315,64 +332,139 @@ event_engine:
       - handle: stat_news
         url: https://www.statnews.com/feed/
         interval_secs: 3600
+    # Telegram 公开频道监听(web preview `t.me/s/<handle>`),产出 social_post。
+    # 空数组表示不启用;开启时每条配置会启动一个独立 poller loop。
+    telegram_channels: []
   # 全局 event kind 黑名单。router 在 per-user NotificationPrefs 之前先过一遍;
   # 入库仍然发生(便于日报 / 统计),只是不再分发给任何 actor。即使用户把某个
   # kind 放进 allow_kinds,在这里禁用后仍然不会推。合法 tag:
   #   earnings_upcoming, earnings_released, earnings_call_transcript,
-  #   news_critical, press_release,
-  #   price_alert, weekly52_high, weekly52_low, volume_spike,
-  #   dividend, split, buyback, sec_filing, analyst_grade,
-  #   macro_event, portfolio_pre_market, portfolio_post_market, social_post
+  #   news_critical,
+  #   price_alert, weekly52_high, weekly52_low,
+  #   dividend, split, sec_filing, analyst_grade,
+  #   macro_event, social_post
   disabled_kinds: []
-  # OpenRouter model used by the uncertain-source news classifier. Empty falls
-  # back to the code default. Keep CI/tests mocked; use real API only for manual
-  # live-quality checks.
-  news_classifier_model: "amazon/nova-lite-v1"
+  # news_classifier_llm names an llm.profiles entry; news_classifier_model is the
+  # legacy OpenRouter fallback when that profile is empty. Keep CI/tests mocked;
+  # use real API only for manual live-quality checks.
+  news_classifier_llm: news_classifier
+  news_classifier_model: "x-ai/grok-4.1-fast"
+  # Global default phrase for judging whether uncertain-source news is important.
+  # Per-actor notif_prefs news_importance_prompt overrides this value.
+  news_importance_prompt: "公司或潜在影响公司长期逻辑和宏观叙事的重大事件"
 
 llm:
   provider: openrouter
+  default_profile: main
+  auxiliary_profile: aux
   openrouter:
-    # OpenRouter API key
-    api_key: ""
+    # Legacy config-only fallback. Prefer llm.providers.openrouter.api_key/api_keys.
     model: "moonshotai/kimi-k2.5"
-    # Cheap auxiliary model for heartbeats / session compression / other background checks
+    # Legacy auxiliary fallback model for heartbeats / session compression / other background checks.
+    # This example uses llm.auxiliary_profile instead.
     sub_model: "moonshotai/kimi-k2.5"
     timeout: 120
     max_retries: 3
     max_tokens: 32768
+  providers:
+    openrouter:
+      kind: openrouter
+      base_url: "https://openrouter.ai/api/v1"
+      api_key: ""
+      api_keys: []
+      timeout: 120
+      max_retries: 3
+  profiles:
+    main:
+      provider: openrouter
+      model: "moonshotai/kimi-k2.5"
+      params:
+        max_tokens: 32768
+    aux:
+      provider: openrouter
+      model: "moonshotai/kimi-k2.5"
+      params:
+        max_tokens: 4096
+    news_classifier:
+      provider: openrouter
+      model: "x-ai/grok-4.1-fast"
+      params:
+        max_tokens: 64
+        temperature: 0
+    filing_summary:
+      provider: openrouter
+      model: "x-ai/grok-4.1-fast"
+      params:
+        max_tokens: 800
+        temperature: 0.2
+        response_format:
+          type: json_object
+    earnings_quality:
+      provider: openrouter
+      model: "x-ai/grok-4.1-fast"
+      params:
+        max_tokens: 1800
+        temperature: 0.2
+        response_format:
+          type: json_object
+    digest_fast:
+      provider: openrouter
+      model: "x-ai/grok-4.1-fast"
+      params:
+        max_tokens: 1200
+        temperature: 0.2
+    digest_strong:
+      provider: openrouter
+      model: "x-ai/grok-4.1-fast"
+      params:
+        max_tokens: 1600
+        temperature: 0.2
+        reasoning:
+          effort: low
+    mainline_short:
+      provider: openrouter
+      model: "x-ai/grok-4.1-fast"
+      params:
+        max_tokens: 1200
+        temperature: 0.2
   auxiliary:
-    # Optional OpenAI-compatible auxiliary path for heartbeats / session compression.
-    # When configured, it overrides the legacy openrouter.sub_model route.
+    # Optional legacy OpenAI-compatible auxiliary path for heartbeats / session compression.
+    # Used only when llm.auxiliary_profile is empty; then it overrides openrouter.sub_model.
     base_url: ""
     api_key: ""
-    api_key_env: "MINIMAX_API_KEY"
     model: ""
     timeout: 120
     max_retries: 3
     max_tokens: 32768
 
 storage:
-  base_path: "./data"
+  # JSON session files remain the default runtime read path.
   sessions_dir: "./data/sessions"
+  # SQLite session index / optional runtime backend. Keep this under data/ so
+  # startup backfill and rollback tooling can find the same local session store.
   session_sqlite_db_path: "./data/sessions.sqlite3"
+  # Keep JSON -> SQLite mirror writes enabled during the rollout, even when
+  # session_runtime_backend stays "json".
   session_sqlite_shadow_write_enabled: true
+  # Runtime session read backend: "json" (default) or "sqlite".
   session_runtime_backend: "json"
+  # Per-actor daily conversation quota files. Legacy conversation_quota_db_path
+  # is still accepted as an alias, but new configs should use this directory key.
   conversation_quota_dir: "./data/conversation_quota"
   llm_audit_db_path: "./data/llm_audit.sqlite3"
   llm_audit_retention_days: 30
   llm_audit_enabled: true
   portfolio_dir: "./data/portfolio"
   cron_jobs_dir: "./data/cron_jobs"
+  gen_images_dir: "./data/gen_images"
+  notif_prefs_dir: "./data/notif_prefs"
 
 logging:
   level: "INFO"
   console: true
-  colorize: true
-  enqueue: true
   file: "./data/logs/hone.log"
-  rotation: "20 MB"
-  retention: "14 days"
-  compression: "zip"
+  # Optional UDP log sink port; null disables it.
+  udp_port: null
 
 admins:
   # iMessage admin handle list (phone number or Apple ID)
@@ -412,6 +504,22 @@ web:
   local_workflow_validate_code: ""
   # Env var name used when local_workflow_validate_code is empty
   local_workflow_validate_code_env: "HONE_REPORT_VALIDATE_CODE"
+  # Public SMS login uses Aliyun PNVS VerifyCode APIs and is configured by env:
+  # - ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET (required)
+  #   Compat aliases: ALIYUN_ACCESS_KEY_* or HONE_ALIYUN_ACCESS_KEY_*
+  # - HONE_ALIYUN_SMS_ENDPOINT (default: dypnsapi.aliyuncs.com)
+  # - HONE_ALIYUN_SMS_COUNTRY_CODE (default: 86; backend sends local CN numbers)
+  # - HONE_ALIYUN_SMS_SIGN_NAME (default: 速通互联验证码)
+  # - HONE_ALIYUN_SMS_TEMPLATE_CODE (default: 100001)
+  # - HONE_ALIYUN_SMS_TEMPLATE_PARAM (default: {"code":"##code##","min":"5"})
+  # - HONE_PUBLIC_SECURE_COOKIE=true/false may force the public session cookie Secure flag.
+  # Existing admin-created Web invite users are treated as the public login whitelist.
+  # Optional Aliyun Captcha 2.0 guard for public SMS sends is configured by env:
+  # - ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET (same AccessKey env as SMS)
+  # - HONE_ALIYUN_CAPTCHA_PREFIX / HONE_ALIYUN_CAPTCHA_SCENE_ID (required to enable)
+  # - HONE_ALIYUN_CAPTCHA_REGION (default: cn; use sgp for Singapore)
+  # - HONE_ALIYUN_CAPTCHA_ENDPOINT (optional override)
+  # - HONE_ALIYUN_CAPTCHA_ENABLED=false disables the guard even when prefix/scene are set.
 
 security:
   # Whether KB queries are isolated by actor/session (recommended to avoid cross-user retrieval)
@@ -448,10 +556,12 @@ security:
       - "wget | sh"
 
 agent:
-  # Recommended: multi-agent | codex_acp | opencode_acp. Legacy: function_calling | gemini_cli | codex_cli.
+  # Recommended: hone_cloud | codex_acp | opencode_acp.
+  # Other supported runners: multi-agent | function_calling | gemini_cli | codex_cli.
+  # This example seeds hone_cloud for first-time installs; switch to codex_acp/opencode_acp when you want local runners.
   # gemini_acp is disabled at runtime and kept below only for migration/reference.
-  runner: "multi-agent"
-  # Only used when provider=codex_cli; empty means use the codex-cli default model
+  runner: "hone_cloud"
+  # Only used when runner=codex_cli; empty means use the codex-cli default model
   codex_model: "gpt-5.3-codex"
   max_iterations: 100
   # Daily successful-reply quota for user conversations. Set to 0 to disable the limit.
@@ -460,44 +570,61 @@ agent:
   step_timeout_seconds: 180
   # Full-run timeout used for one complete answer round
   overall_timeout_seconds: 1200
-  # Verbose logging: print the model name, each iteration, and redacted summaries of tool-call inputs / outputs
-  debug_log: false
+  # Verbose runner debug logging is controlled by HONE_AGENT_DEBUG, not by a config field.
 
   system_prompt_path: "./soul.md"
   gemini_acp:
+    # Deserializable legacy config only; do not set agent.runner=gemini_acp.
     command: "gemini"
     args: [ "--experimental-acp", "--sandbox", "--approval-mode", "plan" ]
     # Optional; if unset, reuse the local gemini-cli login state
-    api_key_env: "GEMINI_API_KEY"
+    api_key: ""
     # Optional; empty uses the gemini CLI default model
     model: "gemini-2.5-pro"
   codex_acp:
     command: "codex-acp"
     args: []
-    # Startup checks: codex >= 0.115.0 and codex-acp == 0.9.5; otherwise fail with an upgrade or switch-version hint
+    # Startup checks: codex >= 0.125.0 and codex-acp >= 0.12.0; update both CLIs before using gpt-5.5
     codex_command: "codex"
     # Explicit ACP session model; empty uses the codex-acp default model
     model: "gpt-5.5"
     # Reasoning effort passed to Codex as model_reasoning_effort; for example low|medium|high|xhigh
-    variant: "medium"
+    variant: "high"
     # Recommended: keep workspace-write + never, and let Hone run inside the actor sandbox
     sandbox_mode: "workspace-write"
     approval_policy: "never"
     dangerously_bypass_approvals_and_sandbox: false
-    sandbox_permissions: []
+    # Open network inside the workspace-write sandbox; without this, curl/git inside
+    # the actor sandbox will hit DNS timeouts (codex defaults network_access=false).
+    # NOTE: must use the legacy sandbox_permissions array, not
+    # `extra_config_overrides: ["sandbox_workspace_write.network_access=true"]`,
+    # because codex 0.128's `-c` does not merge dotted keys into the profile table
+    # and silently keeps network closed.
+    sandbox_permissions: ["network-full-access"]
     extra_config_overrides: []
   opencode:
     command: "opencode"
     args: [ "acp" ]
     # Leave empty to inherit your local opencode global config (~/.config/opencode/opencode.json/jsonc)
     model: ""
-    # Optional; only used when Hone explicitly overrides the opencode model
+    # Optional; only used together with a Hone-side model override
     variant: ""
     # Optional Hone-side provider/base URL override; leave empty to inherit local opencode config
     api_base_url: ""
     # Optional Hone-side API key override; leave empty to inherit local opencode auth/provider config
     api_key: ""
+  hone_cloud:
+    # Default user-facing service; runtime appends /api/public/v1/chat/completions when needed.
+    base_url: "https://hone-claw.com"
+    # Per-user Hone Cloud API key. Contact bm@hone-claw.com for an invite and key.
+    api_key: ""
+    # OpenAI-compatible model id placeholder used by the client request.
+    model: "hone-cloud"
   multi_agent:
+    # Two-stage runner: direct OpenAI-compatible search, then opencode ACP answer.
+    # Search uses agent.multi_agent.search.api_key, with legacy llm.auxiliary.api_key
+    # as the only fallback when the search key is empty.
+    # The answer stage can inherit llm.providers.openrouter.api_key/api_keys when answer.api_key is empty.
     search:
       base_url: "https://api.minimaxi.com/v1"
       api_key: ""
@@ -518,14 +645,3 @@ search:
   search_depth: "basic"
   topic: "general"
   max_results: 5
-
-tools:
-  web_search:
-    enabled: true
-
-  portfolio:
-    enabled: true
-
-server:
-  host: "127.0.0.1"
-  port: 8000

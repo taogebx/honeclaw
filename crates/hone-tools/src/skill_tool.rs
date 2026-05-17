@@ -11,6 +11,7 @@ use crate::skill_runtime::{SkillRuntime, SkillStageConstraints};
 
 const INVOKED_SKILLS_METADATA_KEY: &str = "skill_runtime.invoked_skills";
 const SUPPORTED_IMAGE_ARTIFACT_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
+const SKILL_SCRIPT_STDERR_CHARS: usize = 1000;
 
 pub struct SkillTool {
     system_dir: PathBuf,
@@ -118,11 +119,12 @@ impl SkillTool {
             .map_err(|err| format!("执行 skill script 失败: {err}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stderr_preview = sanitize_skill_script_stderr(&stderr);
         if !output.status.success() {
             return Err(format!(
                 "skill script 退出失败: exit_code={:?}, stderr={}",
                 output.status.code(),
-                stderr.trim()
+                stderr_preview
             ));
         }
 
@@ -148,7 +150,7 @@ impl SkillTool {
             "process_success": true,
             "exit_code": output.status.code(),
             "stdout": stdout,
-            "stderr": stderr,
+            "stderr": stderr_preview,
             "render_success": render_success,
             "structured_output": structured_output,
             "artifacts": artifacts,
@@ -164,6 +166,111 @@ impl SkillTool {
                 .unwrap_or(Value::Null),
         })))
     }
+}
+
+fn sanitize_skill_script_stderr(stderr: &str) -> String {
+    let redacted = redact_skill_script_stderr_secrets(stderr.trim());
+    if redacted.chars().count() <= SKILL_SCRIPT_STDERR_CHARS {
+        return redacted;
+    }
+    redacted
+        .chars()
+        .take(SKILL_SCRIPT_STDERR_CHARS)
+        .collect::<String>()
+        + "..."
+}
+
+fn redact_skill_script_stderr_secrets(text: &str) -> String {
+    let mut output = redact_skill_script_marker_value(text, "Bearer ");
+    for key in [
+        "access_token",
+        "accessToken",
+        "api_key",
+        "apiKey",
+        "apikey",
+        "token",
+        "secret",
+        "password",
+    ] {
+        output = redact_skill_script_marker_value(&output, &format!("{key}="));
+        output = redact_skill_script_marker_value(&output, &format!("{key}:"));
+        output = redact_skill_script_json_string_field(&output, key);
+    }
+    output
+}
+
+fn redact_skill_script_marker_value(text: &str, marker: &str) -> String {
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find(marker) {
+        let value_start = index + marker.len();
+        output.push_str(&remaining[..value_start]);
+        let leading_whitespace = remaining[value_start..]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        output.push_str(&remaining[value_start..value_start + leading_whitespace]);
+        output.push_str("<redacted>");
+        let value_tail = remaining[value_start + leading_whitespace..]
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                (ch == '&'
+                    || ch == ')'
+                    || ch == ','
+                    || ch == '"'
+                    || ch == '\''
+                    || ch == '}'
+                    || ch == ']'
+                    || ch.is_whitespace())
+                .then_some(idx)
+            })
+            .unwrap_or(remaining[value_start + leading_whitespace..].len());
+        remaining = &remaining[value_start + leading_whitespace + value_tail..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn redact_skill_script_json_string_field(text: &str, key: &str) -> String {
+    let key_marker = format!("\"{key}\"");
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find(&key_marker) {
+        let after_key = index + key_marker.len();
+        let tail = &remaining[after_key..];
+        let Some((colon_offset, _)) = tail.char_indices().find(|(_, ch)| !ch.is_whitespace())
+        else {
+            break;
+        };
+        if !tail[colon_offset..].starts_with(':') {
+            output.push_str(&remaining[..after_key]);
+            remaining = &remaining[after_key..];
+            continue;
+        }
+        let after_colon = &tail[colon_offset + 1..];
+        let Some((quote_offset, _)) = after_colon
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+        else {
+            break;
+        };
+        if !after_colon[quote_offset..].starts_with('"') {
+            output.push_str(&remaining[..after_key]);
+            remaining = &remaining[after_key..];
+            continue;
+        }
+        let value_start = after_key + colon_offset + 1 + quote_offset + 1;
+        output.push_str(&remaining[..value_start]);
+        output.push_str("<redacted>");
+        let value_tail = remaining[value_start..]
+            .char_indices()
+            .find_map(|(idx, ch)| (ch == '"').then_some(idx))
+            .unwrap_or(remaining[value_start..].len());
+        remaining = &remaining[value_start + value_tail..];
+    }
+    output.push_str(remaining);
+    output
 }
 
 #[cfg(test)]
@@ -201,6 +308,23 @@ mod tests {
             std::env::remove_var("HONE_CONFIG_PATH");
             std::env::remove_var("HONE_GEN_IMAGES_DIR");
         }
+    }
+
+    #[test]
+    fn skill_script_stderr_preview_redacts_common_credentials() {
+        let stderr = r#"failed https://api.test/path?api_key=abc&token=tok auth=Bearer xyz apiKey: header-secret {"secret": "json-secret"}"#;
+        let detail = sanitize_skill_script_stderr(stderr);
+
+        assert!(detail.contains("api_key=<redacted>"));
+        assert!(detail.contains("token=<redacted>"));
+        assert!(detail.contains("Bearer <redacted>"));
+        assert!(detail.contains("apiKey: <redacted>"));
+        assert!(detail.contains("\"secret\": \"<redacted>\""));
+        assert!(!detail.contains("abc"));
+        assert!(!detail.contains("=tok"));
+        assert!(!detail.contains("xyz"));
+        assert!(!detail.contains("header-secret"));
+        assert!(!detail.contains("json-secret"));
     }
 
     #[tokio::test]
@@ -301,6 +425,62 @@ mod tests {
                 Value::String("5".to_string()),
             ])
         );
+        clear_test_env();
+    }
+
+    #[tokio::test]
+    async fn execute_failed_skill_script_redacts_stderr() {
+        let _guard = env_lock();
+        clear_test_env();
+        let root = make_temp_dir("hone_skill_tool_script_failure");
+        let system = root.join("system");
+        let custom = root.join("custom");
+        let skill_dir = system.join("alpha");
+        let scripts_dir = skill_dir.join("scripts");
+        fs::create_dir_all(&scripts_dir).expect("scripts dir");
+        fs::create_dir_all(&custom).expect("custom dir");
+
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            concat!(
+                "---\n",
+                "name: Alpha\n",
+                "description: fails script\n",
+                "script: scripts/run.sh\n",
+                "shell: bash\n",
+                "---\n\n",
+                "body"
+            ),
+        )
+        .expect("skill");
+        fs::write(
+            scripts_dir.join("run.sh"),
+            "printf 'token=tok api_key=abc auth=Bearer xyz' >&2\nexit 2\n",
+        )
+        .expect("script");
+
+        let tool = SkillTool::new(
+            system,
+            custom,
+            root.join("runtime").join("skill_registry.json"),
+        );
+        let result = tool
+            .execute(serde_json::json!({
+                "skill_name": "alpha",
+                "execute_script": true
+            }))
+            .await
+            .expect("script failure should return structured tool error");
+
+        assert_eq!(result["success"], Value::Bool(false));
+        let error = result["error"].as_str().expect("error message");
+        assert!(error.contains("exit_code=Some(2)"));
+        assert!(error.contains("token=<redacted>"));
+        assert!(error.contains("api_key=<redacted>"));
+        assert!(error.contains("Bearer <redacted>"));
+        assert!(!error.contains("token=tok"));
+        assert!(!error.contains("api_key=abc"));
+        assert!(!error.contains("xyz"));
         clear_test_env();
     }
 

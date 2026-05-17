@@ -23,13 +23,14 @@ import {
   disableWebInvite,
   enableWebInvite,
   getWebInvites,
+  getWebInviteApiKey,
   resetWebInvite,
+  resetWebInviteApiKey,
 } from "@/lib/api";
 import { NotificationPreferencesCard } from "@/components/notification-preferences-card";
 import type {
   AgentProvider,
   AgentSettings,
-  BackendConfig,
   DesktopChannelSettingsInput,
   FmpSettings,
   TavilySettings,
@@ -37,38 +38,156 @@ import type {
 } from "@/lib/types";
 import {
   appendApiKey,
-  appendMaskedKey,
+  appendApiKeyVisibility,
   canSelectRunner,
+  canShowSettingsTab,
+  CHANNEL_CHAT_SCOPES,
   defaultAgentSettings,
   defaultChannelDraft,
   defaultFmpSettings,
+  defaultLanguageDraft,
   defaultTavilySettings,
-  hiddenApiKeys,
+  formatCsv,
+  initialApiKeyVisibility,
+  inviteActionKey as buildInviteActionKey,
   isAgentSettingsRuntimeMismatch,
+  isInviteActionRunning as isInviteActionKeyRunning,
+  mergeAuxiliaryDraft,
   mergeAgentSettings,
+  mergeHoneCloudDraft,
+  normalizePhoneNumber,
   normalizeApiKeys,
+  optionalNumber,
+  parseCsv,
   removeApiKey,
-  removeMaskedKey,
+  removeApiKeyVisibility,
+  resolveSettingsTab,
+  resolveHoneCloudOpenAiBaseUrl,
+  SETTINGS_TAB_KEYS,
   toChannelDraft,
-  toggleMaskedKey,
+  toggleApiKeyVisibility,
   updateApiKeyList,
+  updateLlmProfileBinding as updateLlmProfileBindingDraft,
+  updateLlmProfileEntry as updateLlmProfileEntryDraft,
+  type InviteAction,
+  type LanguageDraft,
+  type LlmProfileBindingKey,
+  type SettingsTabKey,
 } from "@/pages/settings-model";
+import { SETTINGS } from "@/lib/admin-content/settings";
+import { tpl } from "@/lib/i18n";
 
-function normalizePhoneNumber(value: string) {
-  const trimmed = value.trim();
-  const hasLeadingPlus = trimmed.startsWith("+");
-  const digits = trimmed.replace(/\D+/g, "");
-  return hasLeadingPlus ? `+${digits}` : digits;
+type LlmProfileSettingsDraft = NonNullable<AgentSettings["llmProfiles"]>;
+type LlmProfileEntryDraft = LlmProfileSettingsDraft["profiles"][number];
+type LlmProfileBindingRow = { key: LlmProfileBindingKey; label: string };
+type CheckStatus = "idle" | "checking" | "ok" | "error";
+type CheckProbeResult = { ok: boolean; message: string };
+
+async function runCheckState(
+  setStatus: (value: CheckStatus) => void,
+  setMessage: (value: string) => void,
+  probe: () => Promise<CheckProbeResult>,
+) {
+  setStatus("checking");
+  setMessage("");
+  try {
+    const result = await probe();
+    setStatus(result.ok ? "ok" : "error");
+    setMessage(result.message);
+  } catch (e) {
+    setStatus("error");
+    setMessage(e instanceof Error ? e.message : String(e));
+  }
+}
+
+function createCheckState() {
+  const [status, setStatus] = createSignal<CheckStatus>("idle");
+  const [message, setMessage] = createSignal("");
+  const run = (probe: () => Promise<CheckProbeResult>) =>
+    runCheckState(setStatus, setMessage, probe);
+  return { status, message, run };
+}
+
+function checkFeedbackClass(status: CheckStatus) {
+  return [
+    "flex items-center gap-2 rounded-lg border px-3 py-2 text-xs",
+    status === "checking"
+      ? "border-amber-300/40 bg-amber-500/10 text-amber-300"
+      : status === "ok"
+        ? "border-emerald-300/40 bg-emerald-500/10 text-emerald-300"
+        : "border-rose-300/40 bg-rose-500/10 text-rose-300",
+  ].join(" ");
+}
+
+function CheckStatusBanner(props: {
+  status: CheckStatus;
+  checkingMessage: string;
+  message: string;
+  showIcon?: boolean;
+}) {
+  return (
+    <div class={checkFeedbackClass(props.status)}>
+      <Show when={props.showIcon && props.status === "checking"}>
+        <svg
+          class="h-3.5 w-3.5 shrink-0 animate-spin"
+          viewBox="0 0 24 24"
+          fill="none"
+        >
+          <circle
+            class="opacity-25"
+            cx="12"
+            cy="12"
+            r="10"
+            stroke="currentColor"
+            stroke-width="4"
+          />
+          <path
+            class="opacity-75"
+            fill="currentColor"
+            d="M4 12a8 8 0 018-8V0C5.373 0 22 6.477 22 12h-4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+          />
+        </svg>
+      </Show>
+      <Show when={props.showIcon && props.status === "ok"}>
+        <svg
+          class="h-3.5 w-3.5 shrink-0"
+          viewBox="0 0 20 20"
+          fill="currentColor"
+        >
+          <path
+            fill-rule="evenodd"
+            d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
+            clip-rule="evenodd"
+          />
+        </svg>
+      </Show>
+      <Show when={props.showIcon && props.status === "error"}>
+        <svg
+          class="h-3.5 w-3.5 shrink-0"
+          viewBox="0 0 20 20"
+          fill="currentColor"
+        >
+          <path
+            fill-rule="evenodd"
+            d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z"
+            clip-rule="evenodd"
+          />
+        </svg>
+      </Show>
+      <span>
+        {props.status === "checking" ? props.checkingMessage : props.message}
+      </span>
+    </div>
+  );
 }
 
 export default function SettingsPage() {
   const backend = useBackend();
-  const [draft, setDraft] = createSignal<BackendConfig>(backend.state.config);
   const [channelDraft, setChannelDraft] =
     createSignal<DesktopChannelSettingsInput>(defaultChannelDraft());
-  const [channelMessage, setChannelMessage] = createSignal("");
-  const [channelError, setChannelError] = createSignal("");
-  const capabilities = createMemo(() => backend.state.meta?.capabilities ?? []);
+  const updateChannelDraft = (patch: Partial<DesktopChannelSettingsInput>) => {
+    setChannelDraft((prev) => ({ ...prev, ...patch }));
+  };
   const [
     desktopChannelSettings,
     {
@@ -76,34 +195,110 @@ export default function SettingsPage() {
       mutate: setDesktopChannelSettings,
     },
   ] = createResource(
-    () => backend.state.isDesktop,
-    async (isDesktop) => {
-      if (!isDesktop) return undefined;
+    () => backend.state.connected,
+    async (connected) => {
+      if (!connected) return undefined;
       return backend.loadChannelSettings();
     },
   );
+
+  // ── 界面语言 ────────────────────────────────────────────────────────────────
+  const [languageDraft, setLanguageDraft] = createSignal<LanguageDraft>(
+    defaultLanguageDraft(backend.state.meta),
+  );
+  const [languageSaving, setLanguageSaving] = createSignal(false);
+  const [languageMessage, setLanguageMessage] = createSignal("");
+  const [languageError, setLanguageError] = createSignal("");
+  createEffect(() => {
+    // Re-sync draft whenever the canonical meta language changes (e.g. after
+    // a save round-trip or another device pushed an update on reconnect).
+    setLanguageDraft(defaultLanguageDraft(backend.state.meta));
+  });
+  const languageDirty = createMemo(
+    () => languageDraft() !== defaultLanguageDraft(backend.state.meta),
+  );
+  const submitLanguage = async (event: Event) => {
+    event.preventDefault();
+    setLanguageSaving(true);
+    setLanguageMessage("");
+    setLanguageError("");
+    try {
+      await backend.saveLanguage(languageDraft());
+      setLanguageMessage(SETTINGS.language.saved);
+    } catch (e) {
+      setLanguageError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLanguageSaving(false);
+    }
+  };
 
   // ── Agent 基础设置 ──────────────────────────────────────────────────────────
   const [agentDraft, setAgentDraft] = createSignal<AgentSettings>(
     defaultAgentSettings(),
   );
+  const updateAgentDraft = (patch: Partial<AgentSettings>) => {
+    setAgentDraft((prev) => ({ ...prev, ...patch }));
+  };
   const [agentSaving, setAgentSaving] = createSignal(false);
   const [agentMessage, setAgentMessage] = createSignal("");
   const [agentError, setAgentError] = createSignal("");
 
-  // OpenAI 协议渠道测试状态
-  const [openaiTestStatus, setOpenaiTestStatus] = createSignal<
-    "idle" | "checking" | "ok" | "error"
-  >("idle");
-  const [openaiTestMessage, setOpenaiTestMessage] = createSignal("");
+  const openaiCheck = createCheckState();
+  const honeCloudCheck = createCheckState();
+  const auxiliaryCheck = createCheckState();
+  const geminiCheck = createCheckState();
+  const codexAcpCheck = createCheckState();
+  const [showHoneCloudKey, setShowHoneCloudKey] = createSignal(false);
   const [showOpenaiKey, setShowOpenaiKey] = createSignal(false);
-  const [auxiliaryTestStatus, setAuxiliaryTestStatus] = createSignal<
-    "idle" | "checking" | "ok" | "error"
-  >("idle");
-  const [auxiliaryTestMessage, setAuxiliaryTestMessage] = createSignal("");
   const [showAuxiliaryKey, setShowAuxiliaryKey] = createSignal(false);
-  const [showSearchKey, setShowSearchKey] = createSignal(false);
-  const [showAnswerKey, setShowAnswerKey] = createSignal(false);
+  const profileIdOptions = createMemo(
+    () =>
+      agentDraft()
+        .llmProfiles?.profiles.map((profile) => profile.id.trim())
+        .filter(Boolean) ?? [],
+  );
+  const llmProfileBindingRows: LlmProfileBindingRow[] = [
+    {
+      key: "defaultProfile",
+      label: SETTINGS.agent.openai.profiles_default_label,
+    },
+    {
+      key: "auxiliaryProfile",
+      label: SETTINGS.agent.openai.profiles_auxiliary_label,
+    },
+    {
+      key: "polishProfile",
+      label: SETTINGS.agent.openai.profiles_polish_label,
+    },
+    {
+      key: "newsClassifierProfile",
+      label: SETTINGS.agent.openai.profiles_news_label,
+    },
+    {
+      key: "filingSummaryProfile",
+      label: SETTINGS.agent.openai.profiles_filing_label,
+    },
+    {
+      key: "earningsQualityProfile",
+      label: SETTINGS.agent.openai.profiles_earnings_label,
+    },
+    {
+      key: "digestPass1Profile",
+      label: SETTINGS.agent.openai.profiles_digest_pass1_label,
+    },
+    {
+      key: "digestPass2Profile",
+      label: SETTINGS.agent.openai.profiles_digest_pass2_label,
+    },
+    {
+      key: "digestEventDedupeProfile",
+      label: SETTINGS.agent.openai.profiles_digest_dedupe_label,
+    },
+    {
+      key: "mainlineDistillProfile",
+      label: SETTINGS.agent.openai.profiles_mainline_label,
+    },
+  ];
   const [showFeishuSecret, setShowFeishuSecret] = createSignal(false);
   const [showTelegramToken, setShowTelegramToken] = createSignal(false);
   const [showDiscordToken, setShowDiscordToken] = createSignal(false);
@@ -112,6 +307,10 @@ export default function SettingsPage() {
   const [inviteCreating, setInviteCreating] = createSignal(false);
   const [inviteActionKey, setInviteActionKey] = createSignal("");
   const [invitePhoneNumber, setInvitePhoneNumber] = createSignal("");
+  const clearInviteFeedback = () => {
+    setInviteMessage("");
+    setInviteError("");
+  };
 
   const [webInvites, { refetch: refetchWebInvites, mutate: setWebInvites }] =
     createResource(
@@ -121,34 +320,6 @@ export default function SettingsPage() {
         return getWebInvites();
       },
     );
-
-  // Gemini CLI 检测状态
-  const [geminiCheckStatus, setGeminiCheckStatus] = createSignal<
-    "idle" | "checking" | "ok" | "error"
-  >("idle");
-  const [geminiCheckMessage, setGeminiCheckMessage] = createSignal("");
-
-  // Codex CLI 检测状态
-  const [codexCheckStatus, setCodexCheckStatus] = createSignal<
-    "idle" | "checking" | "ok" | "error"
-  >("idle");
-  const [codexCheckMessage, setCodexCheckMessage] = createSignal("");
-  const [codexAcpCheckStatus, setCodexAcpCheckStatus] = createSignal<
-    "idle" | "checking" | "ok" | "error"
-  >("idle");
-  const [codexAcpCheckMessage, setCodexAcpCheckMessage] = createSignal("");
-  const [opencodeCheckStatus, setOpencodeCheckStatus] = createSignal<
-    "idle" | "checking" | "ok" | "error"
-  >("idle");
-  const [opencodeCheckMessage, setOpencodeCheckMessage] = createSignal("");
-  const [searchTestStatus, setSearchTestStatus] = createSignal<
-    "idle" | "checking" | "ok" | "error"
-  >("idle");
-  const [searchTestMessage, setSearchTestMessage] = createSignal("");
-  const [answerTestStatus, setAnswerTestStatus] = createSignal<
-    "idle" | "checking" | "ok" | "error"
-  >("idle");
-  const [answerTestMessage, setAnswerTestMessage] = createSignal("");
 
   const [agentSettingsRes] = createResource(
     () => backend.state.isDesktop,
@@ -169,8 +340,6 @@ export default function SettingsPage() {
   const [fmpDraft, setFmpDraft] =
     createSignal<FmpSettings>(defaultFmpSettings());
   const [fmpSaving, setFmpSaving] = createSignal(false);
-  const [fmpMessage, setFmpMessage] = createSignal("");
-  const [fmpError, setFmpError] = createSignal("");
   const [showFmpKeys, setShowFmpKeys] = createSignal<boolean[]>([false]);
 
   const [fmpSettingsRes] = createResource(
@@ -186,20 +355,16 @@ export default function SettingsPage() {
     if (s) {
       const keys = normalizeApiKeys(s.apiKeys);
       setFmpDraft({ apiKeys: keys });
-      setShowFmpKeys(hiddenApiKeys(keys));
+      setShowFmpKeys(initialApiKeyVisibility(keys));
     }
   });
 
   const submitFmpSettings = async (event: Event) => {
     event.preventDefault();
     setFmpSaving(true);
-    setFmpMessage("");
-    setFmpError("");
     try {
       await saveDesktopFmpSettings(fmpDraft());
-      setFmpMessage("已保存 FMP API Keys，内置后端已重启生效");
-    } catch (e) {
-      setFmpError(e instanceof Error ? e.message : String(e));
+    } catch {
     } finally {
       setFmpSaving(false);
     }
@@ -210,8 +375,6 @@ export default function SettingsPage() {
     defaultTavilySettings(),
   );
   const [tavilySaving, setTavilySaving] = createSignal(false);
-  const [tavilyMessage, setTavilyMessage] = createSignal("");
-  const [tavilyError, setTavilyError] = createSignal("");
   const [showTavilyKeys, setShowTavilyKeys] = createSignal<boolean[]>([false]);
 
   const [tavilySettingsRes] = createResource(
@@ -227,20 +390,16 @@ export default function SettingsPage() {
     if (s) {
       const keys = normalizeApiKeys(s.apiKeys);
       setTavilyDraft({ apiKeys: keys });
-      setShowTavilyKeys(hiddenApiKeys(keys));
+      setShowTavilyKeys(initialApiKeyVisibility(keys));
     }
   });
 
   const submitTavilySettings = async (event: Event) => {
     event.preventDefault();
     setTavilySaving(true);
-    setTavilyMessage("");
-    setTavilyError("");
     try {
       await saveDesktopTavilySettings(tavilyDraft());
-      setTavilyMessage("已保存 Tavily API Keys，内置后端已重启生效");
-    } catch (e) {
-      setTavilyError(e instanceof Error ? e.message : String(e));
+    } catch {
     } finally {
       setTavilySaving(false);
     }
@@ -248,7 +407,7 @@ export default function SettingsPage() {
 
   // ── 多 Key 输入辅助函数 ──────────────────────────────────────────────────────
   /** 更新指定索引的 key 值 */
-  function updateKey<T extends { apiKeys: string[] }>(
+  function updateApiKeyDraft<T extends { apiKeys: string[] }>(
     setter: (fn: (prev: T) => T) => void,
     index: number,
     value: string,
@@ -257,157 +416,89 @@ export default function SettingsPage() {
   }
 
   /** 追加一个空 key 输入行 */
-  function addKey<T extends { apiKeys: string[] }>(
+  function addApiKeyDraftRow<T extends { apiKeys: string[] }>(
     setter: (fn: (prev: T) => T) => void,
     showSetter: (fn: (prev: boolean[]) => boolean[]) => void,
   ) {
     setter((prev) => appendApiKey(prev));
-    showSetter((prev) => appendMaskedKey(prev));
+    showSetter((prev) => appendApiKeyVisibility(prev));
   }
 
   /** 删除指定索引的 key */
-  function removeKey<T extends { apiKeys: string[] }>(
+  function removeApiKeyDraftRow<T extends { apiKeys: string[] }>(
     setter: (fn: (prev: T) => T) => void,
     showSetter: (fn: (prev: boolean[]) => boolean[]) => void,
     index: number,
   ) {
     setter((prev) => removeApiKey(prev, index));
-    showSetter((prev) => removeMaskedKey(prev, index));
+    showSetter((prev) => removeApiKeyVisibility(prev, index));
   }
 
   /** 切换指定索引的 key 显示/隐藏 */
-  function toggleShowKey(
+  function toggleApiKeyDraftVisibility(
     showSetter: (fn: (prev: boolean[]) => boolean[]) => void,
     index: number,
   ) {
-    showSetter((prev) => toggleMaskedKey(prev, index));
+    showSetter((prev) => toggleApiKeyVisibility(prev, index));
   }
 
-  // ── OpenAI 协议渠道测试 ──────────────────────────────────────────────────────
+  const updateHoneCloudDraft = (
+    patch: Partial<NonNullable<AgentSettings["honeCloud"]>>,
+  ) => {
+    setAgentDraft((prev) => mergeHoneCloudDraft(prev, patch));
+  };
+
+  const updateAuxiliaryDraft = (
+    patch: Partial<NonNullable<AgentSettings["auxiliary"]>>,
+  ) => {
+    setAgentDraft((prev) => mergeAuxiliaryDraft(prev, patch));
+  };
+
+  // ── OpenAI-compatible endpoint tests ───────────────────────────────────────
   const handleTestOpenAi = async () => {
-    setOpenaiTestStatus("checking");
-    setOpenaiTestMessage("");
-    try {
+    await openaiCheck.run(async () => {
       const d = agentDraft();
-      const result = await testDesktopOpenAiChannel(
+      return testDesktopOpenAiChannel(
         d.openaiUrl,
         d.openaiModel,
         d.openaiApiKey,
       );
-      setOpenaiTestStatus(result.ok ? "ok" : "error");
-      setOpenaiTestMessage(result.message);
-    } catch (e) {
-      setOpenaiTestStatus("error");
-      setOpenaiTestMessage(e instanceof Error ? e.message : String(e));
-    }
+    });
+  };
+
+  const handleTestHoneCloud = async () => {
+    await honeCloudCheck.run(
+      async () => {
+        const d = agentDraft().honeCloud;
+        return testDesktopOpenAiChannel(
+          resolveHoneCloudOpenAiBaseUrl(d?.baseUrl),
+          d?.model || "hone-cloud",
+          d?.apiKey ?? "",
+        );
+      },
+    );
   };
 
   const handleTestAuxiliary = async () => {
-    setAuxiliaryTestStatus("checking");
-    setAuxiliaryTestMessage("");
-    try {
-      const auxiliary = agentDraft().auxiliary;
-      const result = await testDesktopOpenAiChannel(
-        auxiliary?.baseUrl ?? "",
-        auxiliary?.model ?? "",
-        auxiliary?.apiKey ?? "",
-      );
-      setAuxiliaryTestStatus(result.ok ? "ok" : "error");
-      setAuxiliaryTestMessage(result.message);
-    } catch (e) {
-      setAuxiliaryTestStatus("error");
-      setAuxiliaryTestMessage(e instanceof Error ? e.message : String(e));
-    }
+    await auxiliaryCheck.run(
+      async () => {
+        const auxiliary = agentDraft().auxiliary;
+        return testDesktopOpenAiChannel(
+          auxiliary?.baseUrl ?? "",
+          auxiliary?.model ?? "",
+          auxiliary?.apiKey ?? "",
+        );
+      },
+    );
   };
 
-  // ── Gemini CLI 检测 ──────────────────────────────────────────────────────────
+  // ── CLI / ACP checks ───────────────────────────────────────────────────────
   const handleCheckGemini = async () => {
-    setGeminiCheckStatus("checking");
-    setGeminiCheckMessage("");
-    try {
-      const result = await checkDesktopAgentCli("gemini_cli");
-      setGeminiCheckStatus(result.ok ? "ok" : "error");
-      setGeminiCheckMessage(result.message);
-    } catch (e) {
-      setGeminiCheckStatus("error");
-      setGeminiCheckMessage(e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  // ── Codex CLI 检测 ──────────────────────────────────────────────────────────
-  const handleCheckCodex = async () => {
-    setCodexCheckStatus("checking");
-    setCodexCheckMessage("");
-    try {
-      const result = await checkDesktopAgentCli("codex_cli");
-      setCodexCheckStatus(result.ok ? "ok" : "error");
-      setCodexCheckMessage(result.message);
-    } catch (e) {
-      setCodexCheckStatus("error");
-      setCodexCheckMessage(e instanceof Error ? e.message : String(e));
-    }
+    await geminiCheck.run(() => checkDesktopAgentCli("gemini_cli"));
   };
 
   const handleCheckCodexAcp = async () => {
-    setCodexAcpCheckStatus("checking");
-    setCodexAcpCheckMessage("");
-    try {
-      const result = await checkDesktopAgentCli("codex_acp");
-      setCodexAcpCheckStatus(result.ok ? "ok" : "error");
-      setCodexAcpCheckMessage(result.message);
-    } catch (e) {
-      setCodexAcpCheckStatus("error");
-      setCodexAcpCheckMessage(e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  const handleCheckOpencode = async () => {
-    setOpencodeCheckStatus("checking");
-    setOpencodeCheckMessage("");
-    try {
-      const result = await checkDesktopAgentCli("opencode_acp");
-      setOpencodeCheckStatus(result.ok ? "ok" : "error");
-      setOpencodeCheckMessage(result.message);
-    } catch (e) {
-      setOpencodeCheckStatus("error");
-      setOpencodeCheckMessage(e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  const handleTestMultiAgentSearch = async () => {
-    setSearchTestStatus("checking");
-    setSearchTestMessage("");
-    try {
-      const search = agentDraft().multiAgent?.search;
-      const result = await testDesktopOpenAiChannel(
-        search?.baseUrl ?? "",
-        search?.model ?? "",
-        search?.apiKey ?? "",
-      );
-      setSearchTestStatus(result.ok ? "ok" : "error");
-      setSearchTestMessage(result.message);
-    } catch (e) {
-      setSearchTestStatus("error");
-      setSearchTestMessage(e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  const handleTestMultiAgentAnswer = async () => {
-    setAnswerTestStatus("checking");
-    setAnswerTestMessage("");
-    try {
-      const answer = agentDraft().multiAgent?.answer;
-      const result = await testDesktopOpenAiChannel(
-        answer?.baseUrl ?? "",
-        answer?.model ?? "",
-        answer?.apiKey ?? "",
-      );
-      setAnswerTestStatus(result.ok ? "ok" : "error");
-      setAnswerTestMessage(result.message);
-    } catch (e) {
-      setAnswerTestStatus("error");
-      setAnswerTestMessage(e instanceof Error ? e.message : String(e));
-    }
+    await codexAcpCheck.run(() => checkDesktopAgentCli("codex_acp"));
   };
 
   // ── 选中某个 runner 并立即保存 ───────────────────────────────────────────────
@@ -453,9 +544,32 @@ export default function SettingsPage() {
     }
   };
 
-  createEffect(() => {
-    setDraft(backend.state.config);
-  });
+  const updateLlmProfiles = (
+    updater: (current: LlmProfileSettingsDraft) => LlmProfileSettingsDraft,
+  ) => {
+    setAgentDraft((prev) => ({
+      ...prev,
+      llmProfiles: updater(prev.llmProfiles ?? defaultAgentSettings().llmProfiles!),
+    }));
+  };
+
+  const updateLlmProfileBinding = (
+    key: LlmProfileBindingKey,
+    value: string,
+  ) => {
+    updateLlmProfiles((current) =>
+      updateLlmProfileBindingDraft(current, key, value),
+    );
+  };
+
+  const updateLlmProfileEntry = (
+    index: number,
+    patch: Partial<LlmProfileEntryDraft>,
+  ) => {
+    updateLlmProfiles((current) =>
+      updateLlmProfileEntryDraft(current, index, patch),
+    );
+  };
 
   createEffect(() => {
     const settings = desktopChannelSettings();
@@ -463,21 +577,12 @@ export default function SettingsPage() {
     setChannelDraft(toChannelDraft(settings));
   });
 
-  const submit = async (event: Event) => {
-    event.preventDefault();
-    await backend.saveConfig(draft());
-  };
-
   const submitChannels = async (event: Event) => {
     event.preventDefault();
-    setChannelMessage("");
-    setChannelError("");
     try {
       const result = await backend.saveChannelSettings(channelDraft());
       setDesktopChannelSettings(result.settings);
-      setChannelMessage(result.message);
-    } catch (error) {
-      setChannelError(error instanceof Error ? error.message : String(error));
+    } catch {
     }
   };
 
@@ -485,23 +590,39 @@ export default function SettingsPage() {
     const phoneNumber = normalizePhoneNumber(invitePhoneNumber());
     if (!phoneNumber) {
       setInviteMessage("");
-      setInviteError("请输入手机号");
+      setInviteError(SETTINGS.invite.phone_required);
       return;
     }
     setInviteCreating(true);
-    setInviteMessage("");
-    setInviteError("");
+    clearInviteFeedback();
     try {
       const created = await createWebInvite(phoneNumber);
       setWebInvites((current = []) => [created, ...current]);
       setInvitePhoneNumber("");
       setInviteMessage(
-        `已为 ${created.phone_number} 生成邀请码 ${created.invite_code}`,
+        tpl(created.api_key ? SETTINGS.invite.created_with_api_key : SETTINGS.invite.created, {
+          phone: created.phone_number,
+          code: created.invite_code,
+          apiKey: created.api_key ?? "",
+        }),
       );
       if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(created.invite_code);
+        await navigator.clipboard.writeText(
+          created.api_key
+            ? `Invite: ${created.invite_code}\nAPI Key: ${created.api_key}`
+            : created.invite_code,
+        );
         setInviteMessage(
-          `已为 ${created.phone_number} 生成并复制邀请码 ${created.invite_code}`,
+          tpl(
+            created.api_key
+              ? SETTINGS.invite.created_with_api_key_copied
+              : SETTINGS.invite.created_copied,
+            {
+            phone: created.phone_number,
+            code: created.invite_code,
+              apiKey: created.api_key ?? "",
+            },
+          ),
         );
       }
     } catch (error) {
@@ -512,14 +633,13 @@ export default function SettingsPage() {
   };
 
   const copyInviteCode = async (code: string) => {
-    setInviteMessage("");
-    setInviteError("");
+    clearInviteFeedback();
     try {
       if (!navigator.clipboard?.writeText) {
-        throw new Error("当前环境不支持复制");
+        throw new Error(SETTINGS.invite.copy_unsupported);
       }
       await navigator.clipboard.writeText(code);
-      setInviteMessage(`已复制邀请码 ${code}`);
+      setInviteMessage(tpl(SETTINGS.invite.copied, { code }));
     } catch (error) {
       setInviteError(error instanceof Error ? error.message : String(error));
     }
@@ -535,19 +655,18 @@ export default function SettingsPage() {
 
   const isInviteActionRunning = (
     userId: string,
-    action: "disable" | "enable" | "reset",
-  ) => inviteActionKey() === `${userId}:${action}`;
+    action: InviteAction,
+  ) => isInviteActionKeyRunning(inviteActionKey(), userId, action);
 
   const handleDisableInvite = async (invite: WebInviteInfo) => {
     if (typeof window !== "undefined") {
       const confirmed = window.confirm(
-        `停用 ${invite.user_id} 的邀请码后，现有 Web 登录态会立即失效。继续吗？`,
+        tpl(SETTINGS.invite.disable_confirm, { userId: invite.user_id }),
       );
       if (!confirmed) return;
     }
-    setInviteMessage("");
-    setInviteError("");
-    setInviteActionKey(`${invite.user_id}:disable`);
+    clearInviteFeedback();
+    setInviteActionKey(buildInviteActionKey(invite.user_id, "disable"));
     try {
       const result = await disableWebInvite(invite.user_id);
       replaceInvite(result.invite);
@@ -560,9 +679,8 @@ export default function SettingsPage() {
   };
 
   const handleEnableInvite = async (invite: WebInviteInfo) => {
-    setInviteMessage("");
-    setInviteError("");
-    setInviteActionKey(`${invite.user_id}:enable`);
+    clearInviteFeedback();
+    setInviteActionKey(buildInviteActionKey(invite.user_id, "enable"));
     try {
       const result = await enableWebInvite(invite.user_id);
       replaceInvite(result.invite);
@@ -577,20 +695,21 @@ export default function SettingsPage() {
   const handleResetInvite = async (invite: WebInviteInfo) => {
     if (typeof window !== "undefined") {
       const confirmed = window.confirm(
-        `将为 ${invite.user_id} 生成新邀请码，并让旧邀请码和现有 Web 登录态立即失效。继续吗？`,
+        tpl(SETTINGS.invite.reset_confirm, { userId: invite.user_id }),
       );
       if (!confirmed) return;
     }
-    setInviteMessage("");
-    setInviteError("");
-    setInviteActionKey(`${invite.user_id}:reset`);
+    clearInviteFeedback();
+    setInviteActionKey(buildInviteActionKey(invite.user_id, "reset"));
     try {
       const result = await resetWebInvite(invite.user_id);
       replaceInvite(result.invite);
       setInviteMessage(result.message);
       if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(result.invite.invite_code);
-        setInviteMessage(`${result.message}，新邀请码已复制`);
+        setInviteMessage(
+          tpl(SETTINGS.invite.reset_copied_suffix, { message: result.message }),
+        );
       }
     } catch (error) {
       setInviteError(error instanceof Error ? error.message : String(error));
@@ -599,38 +718,144 @@ export default function SettingsPage() {
     }
   };
 
-  type TabKey = "agent" | "data" | "notify" | "channel" | "invite";
-  const TAB_KEYS: TabKey[] = ["agent", "data", "notify", "channel", "invite"];
-  const TAB_LABELS: Record<TabKey, string> = {
-    agent: "Agent",
-    data: "数据源",
-    notify: "通知",
-    channel: "渠道",
-    invite: "邀请码",
+  const copyInviteApiKey = async (apiKey: string) => {
+    clearInviteFeedback();
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error(SETTINGS.invite.copy_unsupported);
+      }
+      await navigator.clipboard.writeText(apiKey);
+      setInviteMessage(SETTINGS.invite.api_key_copied);
+    } catch (error) {
+      setInviteError(error instanceof Error ? error.message : String(error));
+    }
   };
+
+  const handleGetInviteApiKey = async (invite: WebInviteInfo) => {
+    clearInviteFeedback();
+    setInviteActionKey(buildInviteActionKey(invite.user_id, "api-key"));
+    try {
+      const result = await getWebInviteApiKey(invite.user_id);
+      replaceInvite(result.invite);
+      setInviteMessage(result.message);
+      if (result.invite.api_key) {
+        await copyInviteApiKey(result.invite.api_key);
+      }
+    } catch (error) {
+      setInviteError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setInviteActionKey("");
+    }
+  };
+
+  const handleResetInviteApiKey = async (invite: WebInviteInfo) => {
+    if (typeof window !== "undefined") {
+      const confirmed = window.confirm(
+        tpl(SETTINGS.invite.api_key_reset_confirm, { userId: invite.user_id }),
+      );
+      if (!confirmed) return;
+    }
+    clearInviteFeedback();
+    setInviteActionKey(buildInviteActionKey(invite.user_id, "api-key-reset"));
+    try {
+      const result = await resetWebInviteApiKey(invite.user_id);
+      replaceInvite(result.invite);
+      setInviteMessage(result.message);
+      if (result.invite.api_key) {
+        await copyInviteApiKey(result.invite.api_key);
+      }
+    } catch (error) {
+      setInviteError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setInviteActionKey("");
+    }
+  };
+
+  const tabLabel = (key: SettingsTabKey): string => SETTINGS.tabs[key];
   const [searchParams, setSearchParams] = useSearchParams<{ tab?: string }>();
-  const activeTab = (): TabKey => {
-    const raw = searchParams.tab;
-    return (TAB_KEYS as string[]).includes(raw ?? "")
-      ? (raw as TabKey)
-      : "agent";
-  };
-  const selectTab = (key: TabKey) => setSearchParams({ tab: key });
+  const activeTab = (): SettingsTabKey => resolveSettingsTab(searchParams.tab);
+  const selectTab = (key: SettingsTabKey) => setSearchParams({ tab: key });
   let contentRef: HTMLDivElement | undefined;
   createEffect(() => {
     // track active tab and reset scroll on change
     activeTab();
     if (contentRef) contentRef.scrollTop = 0;
   });
-  const isTab = (key: TabKey) => activeTab() === key;
+  const isTab = (key: SettingsTabKey) => activeTab() === key;
 
   return (
     <div class="mx-auto flex h-full max-w-4xl flex-col">
+      <form
+        onSubmit={submitLanguage}
+        class="mb-3 rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] p-5 shadow-sm"
+      >
+        <div class="flex items-start justify-between gap-4">
+          <div class="min-w-0">
+            <h2 class="text-base font-semibold text-[color:var(--text-primary)]">
+              {SETTINGS.language.title}
+            </h2>
+            <p class="mt-1 text-xs text-[color:var(--text-secondary)]">
+              {SETTINGS.language.subtitle}
+            </p>
+          </div>
+          <button
+            type="submit"
+            disabled={!languageDirty() || languageSaving()}
+            class="shrink-0 rounded-md border border-[color:var(--accent)] bg-[color:var(--accent)] px-3 py-1.5 text-xs font-medium text-white transition disabled:cursor-not-allowed disabled:border-[color:var(--border)] disabled:bg-transparent disabled:text-[color:var(--text-muted)]"
+          >
+            {languageSaving()
+              ? SETTINGS.language.saving
+              : SETTINGS.language.save}
+          </button>
+        </div>
+        <div class="mt-3 flex flex-wrap gap-3">
+          <For each={["zh", "en"] as const}>
+            {(code) => (
+              <label
+                class={[
+                  "flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm cursor-pointer",
+                  languageDraft() === code
+                    ? "border-[color:var(--accent)] bg-[color:var(--accent-soft)] text-[color:var(--text-primary)]"
+                    : "border-[color:var(--border)] bg-[color:var(--panel)] text-[color:var(--text-secondary)] hover:border-[color:var(--accent)]/50",
+                ].join(" ")}
+              >
+                <input
+                  type="radio"
+                  name="settings-language"
+                  value={code}
+                  checked={languageDraft() === code}
+                  onChange={() => setLanguageDraft(code)}
+                  class="h-3.5 w-3.5"
+                />
+                {code === "zh"
+                  ? SETTINGS.language.option_zh
+                  : SETTINGS.language.option_en}
+              </label>
+            )}
+          </For>
+        </div>
+        <p class="mt-2 text-[11px] text-[color:var(--text-muted)]">
+          {SETTINGS.language.note}
+        </p>
+        <Show when={languageMessage()}>
+          <p class="mt-2 text-xs text-[color:var(--accent)]">
+            {languageMessage()}
+          </p>
+        </Show>
+        <Show when={languageError()}>
+          <p class="mt-2 text-xs text-red-500">
+            {SETTINGS.language.save_failed}: {languageError()}
+          </p>
+        </Show>
+      </form>
       <nav class="sticky top-0 z-10 -mx-1 flex gap-1 overflow-x-auto border-b border-[color:var(--border)] bg-[color:var(--surface)]/95 px-1 py-2 backdrop-blur">
-        <For each={TAB_KEYS}>
+        <For each={SETTINGS_TAB_KEYS}>
           {(key) => (
             <Show
-              when={key !== "invite" || backend.hasCapability("web_invites")}
+              when={canShowSettingsTab(
+                key,
+                backend.hasCapability("web_invites"),
+              )}
             >
               <button
                 type="button"
@@ -642,7 +867,7 @@ export default function SettingsPage() {
                     : "text-[color:var(--text-secondary)] hover:bg-black/5 hover:text-[color:var(--text-primary)]",
                 ].join(" ")}
               >
-                {TAB_LABELS[key]}
+                {tabLabel(key)}
               </button>
             </Show>
           )}
@@ -659,10 +884,10 @@ export default function SettingsPage() {
         class="rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] p-6 shadow-sm"
       >
         <h1 class="text-xl font-semibold text-[color:var(--text-primary)]">
-          基础设置
+          {SETTINGS.agent.title}
         </h1>
         <p class="mt-2 text-sm text-[color:var(--text-secondary)]">
-          选择 Agent 引擎并配置相关参数，保存后立即写入运行时配置。
+          {SETTINGS.agent.subtitle}
         </p>
 
         <fieldset
@@ -673,274 +898,131 @@ export default function SettingsPage() {
           }
           class="mt-6 space-y-4 disabled:opacity-60"
         >
-          {/* ── 卡片 0：Multi-Agent ── */}
+          {/* ── 卡片 0：Hone Cloud ── */}
           <div
             class={[
               "rounded-xl border p-5 transition cursor-pointer",
-              agentDraft().runner === "multi-agent"
+              agentDraft().runner === "hone_cloud"
                 ? "border-[color:var(--accent)] bg-[color:var(--accent-soft)]"
                 : "border-[color:var(--border)] bg-[color:var(--panel)] hover:border-[color:var(--accent)]/50",
             ].join(" ")}
-            onClick={() => void selectRunner("multi-agent")}
+            onClick={() => void selectRunner("hone_cloud")}
           >
             <div class="flex items-start justify-between gap-3">
               <div>
                 <div class="text-sm font-semibold text-[color:var(--text-primary)]">
-                  Multi-Agent
+                  {SETTINGS.agent.hone_cloud.name}
                 </div>
                 <div class="mt-0.5 text-xs text-[color:var(--text-secondary)]">
-                  Search Agent 使用 MiniMax function calling，Answer Agent 使用
-                  opencode ACP 收束回复
+                  {SETTINGS.agent.hone_cloud.description}
                 </div>
               </div>
-              <Show when={agentDraft().runner === "multi-agent"}>
+              <Show when={agentDraft().runner === "hone_cloud"}>
                 <span class="shrink-0 rounded-full border border-[color:var(--accent)] px-2 py-0.5 text-[10px] font-medium text-[color:var(--accent)]">
-                  当前
+                  {SETTINGS.agent.current_badge}
                 </span>
               </Show>
             </div>
 
-            <div
-              class="mt-4 grid gap-4 md:grid-cols-2"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div class="space-y-3 rounded-lg border border-[color:var(--border)] bg-[color:var(--surface)] p-4">
-                <div class="text-xs font-semibold text-[color:var(--text-primary)]">
-                  Search Agent (MiniMax / OpenAI-compatible)
-                </div>
+            <div class="mt-4 space-y-3" onClick={(e) => e.stopPropagation()}>
+              <div>
+                <label
+                  class="mb-1 block text-xs font-medium text-[color:var(--text-primary)]"
+                  for="hone-cloud-url"
+                >
+                  {SETTINGS.agent.hone_cloud.base_url_label}
+                </label>
                 <input
+                  id="hone-cloud-url"
                   type="url"
-                  placeholder="https://api.minimaxi.com/v1"
-                  class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 text-sm"
-                  value={agentDraft().multiAgent?.search.baseUrl ?? ""}
+                  placeholder="https://hone-claw.com"
+                  class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 text-sm text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                  value={agentDraft().honeCloud?.baseUrl ?? ""}
                   onInput={(e) =>
-                    setAgentDraft((prev) => ({
-                      ...prev,
-                      multiAgent: {
-                        ...prev.multiAgent!,
-                        search: {
-                          ...prev.multiAgent!.search,
-                          baseUrl: e.currentTarget.value,
-                        },
-                      },
-                    }))
+                    updateHoneCloudDraft({ baseUrl: e.currentTarget.value })
                   }
                 />
+              </div>
+              <div>
+                <label
+                  class="mb-1 block text-xs font-medium text-[color:var(--text-primary)]"
+                  for="hone-cloud-model"
+                >
+                  {SETTINGS.agent.hone_cloud.model_label}
+                </label>
                 <input
+                  id="hone-cloud-model"
                   type="text"
-                  placeholder="MiniMax-M2.7-highspeed"
-                  class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 text-sm"
-                  value={agentDraft().multiAgent?.search.model ?? ""}
+                  placeholder="hone-cloud"
+                  class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 text-sm text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                  value={agentDraft().honeCloud?.model ?? ""}
                   onInput={(e) =>
-                    setAgentDraft((prev) => ({
-                      ...prev,
-                      multiAgent: {
-                        ...prev.multiAgent!,
-                        search: {
-                          ...prev.multiAgent!.search,
-                          model: e.currentTarget.value,
-                        },
-                      },
-                    }))
+                    updateHoneCloudDraft({ model: e.currentTarget.value })
                   }
                 />
+              </div>
+              <div>
+                <label
+                  class="mb-1 block text-xs font-medium text-[color:var(--text-primary)]"
+                  for="hone-cloud-key"
+                >
+                  {SETTINGS.agent.hone_cloud.api_key_label}
+                </label>
                 <div class="relative">
                   <input
-                    type={showSearchKey() ? "text" : "password"}
-                    placeholder="sk-cp-..."
-                    class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 pr-16 text-sm"
-                    value={agentDraft().multiAgent?.search.apiKey ?? ""}
+                    id="hone-cloud-key"
+                    type={showHoneCloudKey() ? "text" : "password"}
+                    placeholder="hck_..."
+                    class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 pr-16 text-sm text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                    value={agentDraft().honeCloud?.apiKey ?? ""}
                     onInput={(e) =>
-                      setAgentDraft((prev) => ({
-                        ...prev,
-                        multiAgent: {
-                          ...prev.multiAgent!,
-                          search: {
-                            ...prev.multiAgent!.search,
-                            apiKey: e.currentTarget.value,
-                          },
-                        },
-                      }))
+                      updateHoneCloudDraft({ apiKey: e.currentTarget.value })
                     }
                   />
                   <button
                     type="button"
                     class="absolute right-2 top-1/2 -translate-y-1/2 rounded px-2 py-0.5 text-xs text-[color:var(--text-secondary)] hover:text-[color:var(--text-primary)]"
-                    onClick={() => setShowSearchKey((v) => !v)}
+                    onClick={() => setShowHoneCloudKey((v) => !v)}
                   >
-                    {showSearchKey() ? "隐藏" : "显示"}
+                    {showHoneCloudKey()
+                      ? SETTINGS.agent.hone_cloud.hide
+                      : SETTINGS.agent.hone_cloud.show}
                   </button>
                 </div>
-                <input
-                  type="number"
-                  min="1"
-                  class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 text-sm"
-                  value={agentDraft().multiAgent?.search.maxIterations ?? 8}
-                  onInput={(e) =>
-                    setAgentDraft((prev) => ({
-                      ...prev,
-                      multiAgent: {
-                        ...prev.multiAgent!,
-                        search: {
-                          ...prev.multiAgent!.search,
-                          maxIterations: Number(e.currentTarget.value || 0),
-                        },
-                      },
-                    }))
+              </div>
+              <div class="rounded-lg border border-[color:var(--border)] bg-[color:var(--surface-soft)] p-3 text-xs text-[color:var(--text-secondary)]">
+                {SETTINGS.agent.hone_cloud.contact_note}
+              </div>
+              <Show when={honeCloudCheck.status() !== "idle"}>
+                <CheckStatusBanner
+                  status={honeCloudCheck.status()}
+                  checkingMessage={
+                    SETTINGS.agent.hone_cloud.connection_testing_status
                   }
+                  message={honeCloudCheck.message()}
                 />
+              </Show>
+              <div class="flex gap-2 pt-1">
                 <button
                   type="button"
-                  class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-1.5 text-xs"
-                  disabled={searchTestStatus() === "checking"}
-                  onClick={() => void handleTestMultiAgentSearch()}
+                  class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-1.5 text-xs text-[color:var(--text-primary)] transition hover:border-[color:var(--accent)]/60 disabled:opacity-50"
+                  disabled={honeCloudCheck.status() === "checking"}
+                  onClick={() => void handleTestHoneCloud()}
                 >
-                  {searchTestStatus() === "checking"
-                    ? "测试中…"
-                    : "测试 Search Agent"}
+                  {honeCloudCheck.status() === "checking"
+                    ? SETTINGS.agent.hone_cloud.testing
+                    : SETTINGS.agent.hone_cloud.test_connection}
                 </button>
-                <Show when={searchTestStatus() !== "idle"}>
-                  <div class="text-xs text-[color:var(--text-secondary)]">
-                    {searchTestMessage()}
-                  </div>
-                </Show>
-              </div>
-
-              <div class="space-y-3 rounded-lg border border-[color:var(--border)] bg-[color:var(--surface)] p-4">
-                <div class="text-xs font-semibold text-[color:var(--text-primary)]">
-                  Answer Agent (OpenAI-compatible via opencode ACP)
-                </div>
-                <input
-                  type="url"
-                  placeholder="https://openrouter.ai/api/v1"
-                  class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 text-sm"
-                  value={agentDraft().multiAgent?.answer.baseUrl ?? ""}
-                  onInput={(e) =>
-                    setAgentDraft((prev) => ({
-                      ...prev,
-                      multiAgent: {
-                        ...prev.multiAgent!,
-                        answer: {
-                          ...prev.multiAgent!.answer,
-                          baseUrl: e.currentTarget.value,
-                        },
-                      },
-                    }))
-                  }
-                />
-                <input
-                  type="text"
-                  placeholder="google/gemini-3.1-pro-preview"
-                  class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 text-sm"
-                  value={agentDraft().multiAgent?.answer.model ?? ""}
-                  onInput={(e) =>
-                    setAgentDraft((prev) => ({
-                      ...prev,
-                      multiAgent: {
-                        ...prev.multiAgent!,
-                        answer: {
-                          ...prev.multiAgent!.answer,
-                          model: e.currentTarget.value,
-                        },
-                      },
-                    }))
-                  }
-                />
-                <input
-                  type="text"
-                  placeholder="high"
-                  class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 text-sm"
-                  value={agentDraft().multiAgent?.answer.variant ?? ""}
-                  onInput={(e) =>
-                    setAgentDraft((prev) => ({
-                      ...prev,
-                      multiAgent: {
-                        ...prev.multiAgent!,
-                        answer: {
-                          ...prev.multiAgent!.answer,
-                          variant: e.currentTarget.value,
-                        },
-                      },
-                    }))
-                  }
-                />
-                <div class="relative">
-                  <input
-                    type={showAnswerKey() ? "text" : "password"}
-                    placeholder="sk-or-..."
-                    class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 pr-16 text-sm"
-                    value={agentDraft().multiAgent?.answer.apiKey ?? ""}
-                    onInput={(e) =>
-                      setAgentDraft((prev) => ({
-                        ...prev,
-                        multiAgent: {
-                          ...prev.multiAgent!,
-                          answer: {
-                            ...prev.multiAgent!.answer,
-                            apiKey: e.currentTarget.value,
-                          },
-                        },
-                      }))
-                    }
-                  />
-                  <button
-                    type="button"
-                    class="absolute right-2 top-1/2 -translate-y-1/2 rounded px-2 py-0.5 text-xs text-[color:var(--text-secondary)] hover:text-[color:var(--text-primary)]"
-                    onClick={() => setShowAnswerKey((v) => !v)}
-                  >
-                    {showAnswerKey() ? "隐藏" : "显示"}
-                  </button>
-                </div>
-                <input
-                  type="number"
-                  min="0"
-                  class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 text-sm"
-                  value={agentDraft().multiAgent?.answer.maxToolCalls ?? 3}
-                  onInput={(e) =>
-                    setAgentDraft((prev) => ({
-                      ...prev,
-                      multiAgent: {
-                        ...prev.multiAgent!,
-                        answer: {
-                          ...prev.multiAgent!.answer,
-                          maxToolCalls: Number(e.currentTarget.value || 0),
-                        },
-                      },
-                    }))
-                  }
-                />
-                <div class="flex gap-2">
-                  <button
-                    type="button"
-                    class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-1.5 text-xs"
-                    disabled={answerTestStatus() === "checking"}
-                    onClick={() => void handleTestMultiAgentAnswer()}
-                  >
-                    {answerTestStatus() === "checking"
-                      ? "测试中…"
-                      : "测试 Answer Agent"}
-                  </button>
-                  <button
-                    type="button"
-                    class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-1.5 text-xs"
-                    disabled={opencodeCheckStatus() === "checking"}
-                    onClick={() => void handleCheckOpencode()}
-                  >
-                    {opencodeCheckStatus() === "checking"
-                      ? "检测中…"
-                      : "检查 opencode"}
-                  </button>
-                </div>
-                <Show when={answerTestStatus() !== "idle"}>
-                  <div class="text-xs text-[color:var(--text-secondary)]">
-                    {answerTestMessage()}
-                  </div>
-                </Show>
-                <Show when={opencodeCheckStatus() !== "idle"}>
-                  <div class="text-xs text-[color:var(--text-secondary)]">
-                    {opencodeCheckMessage()}
-                  </div>
-                </Show>
+                <button
+                  type="button"
+                  class="rounded-md border border-[color:var(--accent)] bg-[color:var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[color:var(--text-primary)] transition hover:opacity-90 disabled:opacity-50"
+                  disabled={agentSaving()}
+                  onClick={(e) => void submitAgentSettings(e)}
+                >
+                  {agentSaving()
+                    ? SETTINGS.agent.hone_cloud.saving
+                    : SETTINGS.agent.hone_cloud.save}
+                </button>
               </div>
             </div>
           </div>
@@ -958,16 +1040,15 @@ export default function SettingsPage() {
             <div class="flex items-start justify-between gap-3">
               <div>
                 <div class="text-sm font-semibold text-[color:var(--text-primary)]">
-                  OpenAI 协议渠道
+                  {SETTINGS.agent.openai.name}
                 </div>
                 <div class="mt-0.5 text-xs text-[color:var(--text-secondary)]">
-                  兼容 OpenRouter、OpenAI 及任意 OpenAI-compatible 端点（通过
-                  opencode acp 驱动）
+                  {SETTINGS.agent.openai.description}
                 </div>
               </div>
               <Show when={agentDraft().runner === "opencode_acp"}>
                 <span class="shrink-0 rounded-full border border-[color:var(--accent)] px-2 py-0.5 text-[10px] font-medium text-[color:var(--accent)]">
-                  当前
+                  {SETTINGS.agent.current_badge}
                 </span>
               </Show>
             </div>
@@ -980,7 +1061,7 @@ export default function SettingsPage() {
                   class="mb-1 block text-xs font-medium text-[color:var(--text-primary)]"
                   for="openai-url"
                 >
-                  Base URL
+                  {SETTINGS.agent.openai.base_url_label}
                 </label>
                 <input
                   id="openai-url"
@@ -989,10 +1070,7 @@ export default function SettingsPage() {
                   class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 text-sm text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
                   value={agentDraft().openaiUrl}
                   onInput={(e) =>
-                    setAgentDraft((prev) => ({
-                      ...prev,
-                      openaiUrl: e.currentTarget.value,
-                    }))
+                    updateAgentDraft({ openaiUrl: e.currentTarget.value })
                   }
                 />
               </div>
@@ -1003,7 +1081,7 @@ export default function SettingsPage() {
                   class="mb-1 block text-xs font-medium text-[color:var(--text-primary)]"
                   for="openai-model"
                 >
-                  主模型
+                  {SETTINGS.agent.openai.model_label}
                 </label>
                 <input
                   id="openai-model"
@@ -1012,21 +1090,17 @@ export default function SettingsPage() {
                   class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 text-sm text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
                   value={agentDraft().openaiModel}
                   onInput={(e) =>
-                    setAgentDraft((prev) => ({
-                      ...prev,
-                      openaiModel: e.currentTarget.value,
-                    }))
+                    updateAgentDraft({ openaiModel: e.currentTarget.value })
                   }
                 />
               </div>
 
               <div class="rounded-lg border border-[color:var(--border)] bg-[color:var(--surface-soft)] p-3">
                 <p class="text-xs font-medium text-[color:var(--text-primary)]">
-                  Auxiliary 子模型链路
+                  {SETTINGS.agent.openai.auxiliary_title}
                 </p>
                 <p class="mt-1 text-[11px] text-[color:var(--text-muted)]">
-                  用于心跳检测、会话压缩等后台辅助任务，支持独立的
-                  OpenAI-compatible Base URL / API Key / Model。
+                  {SETTINGS.agent.openai.auxiliary_subtitle}
                 </p>
                 <div class="mt-3 space-y-3">
                   <div>
@@ -1034,7 +1108,7 @@ export default function SettingsPage() {
                       class="mb-1 block text-xs font-medium text-[color:var(--text-primary)]"
                       for="auxiliary-url"
                     >
-                      Auxiliary Base URL
+                      {SETTINGS.agent.openai.auxiliary_url_label}
                     </label>
                     <input
                       id="auxiliary-url"
@@ -1043,17 +1117,7 @@ export default function SettingsPage() {
                       class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 text-sm text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
                       value={agentDraft().auxiliary?.baseUrl ?? ""}
                       onInput={(e) =>
-                        setAgentDraft((prev) => ({
-                          ...prev,
-                          auxiliary: {
-                            ...(prev.auxiliary ?? {
-                              baseUrl: "",
-                              apiKey: "",
-                              model: "",
-                            }),
-                            baseUrl: e.currentTarget.value,
-                          },
-                        }))
+                        updateAuxiliaryDraft({ baseUrl: e.currentTarget.value })
                       }
                     />
                   </div>
@@ -1062,7 +1126,7 @@ export default function SettingsPage() {
                       class="mb-1 block text-xs font-medium text-[color:var(--text-primary)]"
                       for="auxiliary-model"
                     >
-                      Auxiliary Model
+                      {SETTINGS.agent.openai.auxiliary_model_label}
                     </label>
                     <input
                       id="auxiliary-model"
@@ -1071,17 +1135,7 @@ export default function SettingsPage() {
                       class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 text-sm text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
                       value={agentDraft().auxiliary?.model ?? ""}
                       onInput={(e) =>
-                        setAgentDraft((prev) => ({
-                          ...prev,
-                          auxiliary: {
-                            ...(prev.auxiliary ?? {
-                              baseUrl: "",
-                              apiKey: "",
-                              model: "",
-                            }),
-                            model: e.currentTarget.value,
-                          },
-                        }))
+                        updateAuxiliaryDraft({ model: e.currentTarget.value })
                       }
                     />
                   </div>
@@ -1090,7 +1144,7 @@ export default function SettingsPage() {
                       class="mb-1 block text-xs font-medium text-[color:var(--text-primary)]"
                       for="auxiliary-apikey"
                     >
-                      Auxiliary API Key
+                      {SETTINGS.agent.openai.auxiliary_apikey_label}
                     </label>
                     <div class="relative">
                       <input
@@ -1100,17 +1154,9 @@ export default function SettingsPage() {
                         class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 pr-16 text-sm text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
                         value={agentDraft().auxiliary?.apiKey ?? ""}
                         onInput={(e) =>
-                          setAgentDraft((prev) => ({
-                            ...prev,
-                            auxiliary: {
-                              ...(prev.auxiliary ?? {
-                                baseUrl: "",
-                                apiKey: "",
-                                model: "",
-                              }),
-                              apiKey: e.currentTarget.value,
-                            },
-                          }))
+                          updateAuxiliaryDraft({
+                            apiKey: e.currentTarget.value,
+                          })
                         }
                       />
                       <button
@@ -1118,10 +1164,207 @@ export default function SettingsPage() {
                         class="absolute right-2 top-1/2 -translate-y-1/2 rounded px-2 py-0.5 text-xs text-[color:var(--text-secondary)] hover:text-[color:var(--text-primary)]"
                         onClick={() => setShowAuxiliaryKey((v) => !v)}
                       >
-                        {showAuxiliaryKey() ? "隐藏" : "显示"}
+                        {showAuxiliaryKey()
+                          ? SETTINGS.agent.openai.hide
+                          : SETTINGS.agent.openai.show}
                       </button>
                     </div>
                   </div>
+                </div>
+              </div>
+
+              <div class="border-t border-[color:var(--border)] pt-4">
+                <p class="text-xs font-medium text-[color:var(--text-primary)]">
+                  {SETTINGS.agent.openai.profiles_title}
+                </p>
+                <p class="mt-1 text-[11px] text-[color:var(--text-muted)]">
+                  {SETTINGS.agent.openai.profiles_subtitle}
+                </p>
+
+                <div class="mt-3 grid gap-2 md:grid-cols-2">
+                  <For each={llmProfileBindingRows}>
+                    {(row) => (
+                      <label class="block">
+                        <span class="mb-1 block text-[11px] font-medium text-[color:var(--text-secondary)]">
+                          {row.label}
+                        </span>
+                        <select
+                          class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                          value={agentDraft().llmProfiles?.[row.key] ?? ""}
+                          onChange={(e) =>
+                            updateLlmProfileBinding(
+                              row.key,
+                              e.currentTarget.value,
+                            )
+                          }
+                        >
+                          <For each={profileIdOptions()}>
+                            {(profileId) => (
+                              <option value={profileId}>{profileId}</option>
+                            )}
+                          </For>
+                        </select>
+                      </label>
+                    )}
+                  </For>
+                </div>
+
+                <div class="mt-4 space-y-3">
+                  <For each={agentDraft().llmProfiles?.profiles ?? []}>
+                    {(profile, index) => (
+                      <div class="rounded-lg border border-[color:var(--border)] bg-[color:var(--surface-soft)] p-3">
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                          <div class="font-mono text-xs font-semibold text-[color:var(--text-primary)]">
+                            {profile.id}
+                          </div>
+                          <label class="inline-flex items-center gap-1.5 text-[11px] text-[color:var(--text-secondary)]">
+                            <input
+                              type="checkbox"
+                              class="h-3.5 w-3.5 rounded border-[color:var(--border)]"
+                              checked={profile.responseFormatJson}
+                              onChange={(e) =>
+                                updateLlmProfileEntry(index(), {
+                                  responseFormatJson: e.currentTarget.checked,
+                                })
+                              }
+                            />
+                            {SETTINGS.agent.openai.profiles_json_label}
+                          </label>
+                        </div>
+
+                        <div class="mt-3 grid gap-2 md:grid-cols-2">
+                          <label class="block">
+                            <span class="mb-1 block text-[11px] font-medium text-[color:var(--text-secondary)]">
+                              {SETTINGS.agent.openai.profiles_provider_label}
+                            </span>
+                            <input
+                              type="text"
+                              class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                              value={profile.provider}
+                              onInput={(e) =>
+                                updateLlmProfileEntry(index(), {
+                                  provider: e.currentTarget.value,
+                                })
+                              }
+                            />
+                          </label>
+                          <label class="block">
+                            <span class="mb-1 block text-[11px] font-medium text-[color:var(--text-secondary)]">
+                              {SETTINGS.agent.openai.profiles_model_label}
+                            </span>
+                            <input
+                              type="text"
+                              class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                              value={profile.model}
+                              onInput={(e) =>
+                                updateLlmProfileEntry(index(), {
+                                  model: e.currentTarget.value,
+                                })
+                              }
+                            />
+                          </label>
+                          <label class="block">
+                            <span class="mb-1 block text-[11px] font-medium text-[color:var(--text-secondary)]">
+                              {SETTINGS.agent.openai.profiles_max_tokens_label}
+                            </span>
+                            <input
+                              type="number"
+                              min="1"
+                              class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                              value={profile.maxTokens ?? ""}
+                              onInput={(e) =>
+                                updateLlmProfileEntry(index(), {
+                                  maxTokens: optionalNumber(
+                                    e.currentTarget.value,
+                                  ),
+                                })
+                              }
+                            />
+                          </label>
+                          <label class="block">
+                            <span class="mb-1 block text-[11px] font-medium text-[color:var(--text-secondary)]">
+                              {SETTINGS.agent.openai.profiles_temperature_label}
+                            </span>
+                            <input
+                              type="number"
+                              min="0"
+                              max="2"
+                              step="0.1"
+                              class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                              value={profile.temperature ?? ""}
+                              onInput={(e) =>
+                                updateLlmProfileEntry(index(), {
+                                  temperature: optionalNumber(
+                                    e.currentTarget.value,
+                                  ),
+                                })
+                              }
+                            />
+                          </label>
+                          <label class="block">
+                            <span class="mb-1 block text-[11px] font-medium text-[color:var(--text-secondary)]">
+                              {SETTINGS.agent.openai.profiles_top_p_label}
+                            </span>
+                            <input
+                              type="number"
+                              min="0"
+                              max="1"
+                              step="0.05"
+                              class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                              value={profile.topP ?? ""}
+                              onInput={(e) =>
+                                updateLlmProfileEntry(index(), {
+                                  topP: optionalNumber(e.currentTarget.value),
+                                })
+                              }
+                            />
+                          </label>
+                          <label class="block">
+                            <span class="mb-1 block text-[11px] font-medium text-[color:var(--text-secondary)]">
+                              {SETTINGS.agent.openai.profiles_reasoning_label}
+                            </span>
+                            <select
+                              class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                              value={profile.reasoningEffort ?? ""}
+                              onChange={(e) =>
+                                updateLlmProfileEntry(index(), {
+                                  reasoningEffort:
+                                    e.currentTarget.value || undefined,
+                                })
+                              }
+                            >
+                              <option value="">default</option>
+                              <option value="low">low</option>
+                              <option value="medium">medium</option>
+                              <option value="high">high</option>
+                              <option value="xhigh">xhigh</option>
+                            </select>
+                          </label>
+                          <label class="block md:col-span-2">
+                            <span class="mb-1 block text-[11px] font-medium text-[color:var(--text-secondary)]">
+                              {
+                                SETTINGS.agent.openai
+                                  .profiles_reasoning_tokens_label
+                              }
+                            </span>
+                            <input
+                              type="number"
+                              min="1"
+                              class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-2 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                              value={profile.reasoningMaxTokens ?? ""}
+                              onInput={(e) =>
+                                updateLlmProfileEntry(index(), {
+                                  reasoningMaxTokens: optionalNumber(
+                                    e.currentTarget.value,
+                                  ),
+                                })
+                              }
+                            />
+                          </label>
+                        </div>
+                      </div>
+                    )}
+                  </For>
                 </div>
               </div>
 
@@ -1131,7 +1374,7 @@ export default function SettingsPage() {
                   class="mb-1 block text-xs font-medium text-[color:var(--text-primary)]"
                   for="openai-apikey"
                 >
-                  API Key
+                  {SETTINGS.agent.openai.api_key_label}
                 </label>
                 <div class="relative">
                   <input
@@ -1141,10 +1384,7 @@ export default function SettingsPage() {
                     class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 pr-16 text-sm text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
                     value={agentDraft().openaiApiKey}
                     onInput={(e) =>
-                      setAgentDraft((prev) => ({
-                        ...prev,
-                        openaiApiKey: e.currentTarget.value,
-                      }))
+                      updateAgentDraft({ openaiApiKey: e.currentTarget.value })
                     }
                   />
                   <button
@@ -1152,95 +1392,31 @@ export default function SettingsPage() {
                     class="absolute right-2 top-1/2 -translate-y-1/2 rounded px-2 py-0.5 text-xs text-[color:var(--text-secondary)] hover:text-[color:var(--text-primary)]"
                     onClick={() => setShowOpenaiKey((v) => !v)}
                   >
-                    {showOpenaiKey() ? "隐藏" : "显示"}
+                    {showOpenaiKey()
+                      ? SETTINGS.agent.openai.hide
+                      : SETTINGS.agent.openai.show}
                   </button>
                 </div>
               </div>
 
               {/* 测试联通状态 */}
-              <Show when={openaiTestStatus() !== "idle"}>
-                <div
-                  class={[
-                    "flex items-center gap-2 rounded-lg border px-3 py-2 text-xs",
-                    openaiTestStatus() === "checking"
-                      ? "border-amber-300/40 bg-amber-500/10 text-amber-300"
-                      : openaiTestStatus() === "ok"
-                        ? "border-emerald-300/40 bg-emerald-500/10 text-emerald-300"
-                        : "border-rose-300/40 bg-rose-500/10 text-rose-300",
-                  ].join(" ")}
-                >
-                  <Show when={openaiTestStatus() === "checking"}>
-                    <svg
-                      class="h-3.5 w-3.5 shrink-0 animate-spin"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                    >
-                      <circle
-                        class="opacity-25"
-                        cx="12"
-                        cy="12"
-                        r="10"
-                        stroke="currentColor"
-                        stroke-width="4"
-                      />
-                      <path
-                        class="opacity-75"
-                        fill="currentColor"
-                        d="M4 12a8 8 0 018-8V0C5.373 0 22 6.477 22 12h-4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                      />
-                    </svg>
-                  </Show>
-                  <Show when={openaiTestStatus() === "ok"}>
-                    <svg
-                      class="h-3.5 w-3.5 shrink-0"
-                      viewBox="0 0 20 20"
-                      fill="currentColor"
-                    >
-                      <path
-                        fill-rule="evenodd"
-                        d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
-                        clip-rule="evenodd"
-                      />
-                    </svg>
-                  </Show>
-                  <Show when={openaiTestStatus() === "error"}>
-                    <svg
-                      class="h-3.5 w-3.5 shrink-0"
-                      viewBox="0 0 20 20"
-                      fill="currentColor"
-                    >
-                      <path
-                        fill-rule="evenodd"
-                        d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z"
-                        clip-rule="evenodd"
-                      />
-                    </svg>
-                  </Show>
-                  <span>
-                    {openaiTestStatus() === "checking"
-                      ? "连通测试中，请稍候…"
-                      : openaiTestMessage()}
-                  </span>
-                </div>
+              <Show when={openaiCheck.status() !== "idle"}>
+                <CheckStatusBanner
+                  status={openaiCheck.status()}
+                  checkingMessage={
+                    SETTINGS.agent.openai.connection_testing_status
+                  }
+                  message={openaiCheck.message()}
+                  showIcon
+                />
               </Show>
 
-              <Show when={auxiliaryTestStatus() !== "idle"}>
-                <div
-                  class={[
-                    "flex items-center gap-2 rounded-lg border px-3 py-2 text-xs",
-                    auxiliaryTestStatus() === "checking"
-                      ? "border-amber-300/40 bg-amber-500/10 text-amber-300"
-                      : auxiliaryTestStatus() === "ok"
-                        ? "border-emerald-300/40 bg-emerald-500/10 text-emerald-300"
-                        : "border-rose-300/40 bg-rose-500/10 text-rose-300",
-                  ].join(" ")}
-                >
-                  <span>
-                    {auxiliaryTestStatus() === "checking"
-                      ? "Auxiliary 连通测试中，请稍候…"
-                      : auxiliaryTestMessage()}
-                  </span>
-                </div>
+              <Show when={auxiliaryCheck.status() !== "idle"}>
+                <CheckStatusBanner
+                  status={auxiliaryCheck.status()}
+                  checkingMessage={SETTINGS.agent.openai.auxiliary_testing_status}
+                  message={auxiliaryCheck.message()}
+                />
               </Show>
 
               {/* 反馈 */}
@@ -1260,20 +1436,22 @@ export default function SettingsPage() {
                 <button
                   type="button"
                   class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-1.5 text-xs text-[color:var(--text-primary)] transition hover:border-[color:var(--accent)]/60 disabled:opacity-50"
-                  disabled={openaiTestStatus() === "checking"}
+                  disabled={openaiCheck.status() === "checking"}
                   onClick={() => void handleTestOpenAi()}
                 >
-                  {openaiTestStatus() === "checking" ? "测试中…" : "测试联通"}
+                  {openaiCheck.status() === "checking"
+                    ? SETTINGS.agent.openai.testing
+                    : SETTINGS.agent.openai.test_connection}
                 </button>
                 <button
                   type="button"
                   class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-1.5 text-xs text-[color:var(--text-primary)] transition hover:border-[color:var(--accent)]/60 disabled:opacity-50"
-                  disabled={auxiliaryTestStatus() === "checking"}
+                  disabled={auxiliaryCheck.status() === "checking"}
                   onClick={() => void handleTestAuxiliary()}
                 >
-                  {auxiliaryTestStatus() === "checking"
-                    ? "测试中…"
-                    : "测试 Auxiliary"}
+                  {auxiliaryCheck.status() === "checking"
+                    ? SETTINGS.agent.openai.testing
+                    : SETTINGS.agent.openai.test_auxiliary}
                 </button>
                 <button
                   type="button"
@@ -1281,7 +1459,9 @@ export default function SettingsPage() {
                   disabled={agentSaving()}
                   onClick={(e) => void submitAgentSettings(e)}
                 >
-                  {agentSaving() ? "保存中…" : "保存"}
+                  {agentSaving()
+                    ? SETTINGS.agent.openai.saving
+                    : SETTINGS.agent.openai.save}
                 </button>
               </div>
             </div>
@@ -1300,103 +1480,47 @@ export default function SettingsPage() {
             <div class="flex items-start justify-between gap-3">
               <div>
                 <div class="text-sm font-semibold text-[color:var(--text-primary)]">
-                  Codex ACP
+                  {SETTINGS.agent.codex_acp.name}
                 </div>
                 <div class="mt-0.5 text-xs text-[color:var(--text-secondary)]">
-                  使用 <code class="rounded bg-black/20 px-1">codex-acp</code>{" "}
-                  驱动当前 Agent，会话实际走 ACP 链路而不是 multi-agent。
+                  {SETTINGS.agent.codex_acp.description_prefix}
+                  <code class="rounded bg-black/20 px-1">
+                    {SETTINGS.agent.codex_acp.description_code}
+                  </code>
+                  {SETTINGS.agent.codex_acp.description_suffix}
                 </div>
               </div>
               <Show when={agentDraft().runner === "codex_acp"}>
                 <span class="shrink-0 rounded-full border border-[color:var(--accent)] px-2 py-0.5 text-[10px] font-medium text-[color:var(--accent)]">
-                  当前
+                  {SETTINGS.agent.current_badge}
                 </span>
               </Show>
             </div>
 
             <div class="mt-4 space-y-3" onClick={(e) => e.stopPropagation()}>
-              <Show when={codexAcpCheckStatus() !== "idle"}>
-                <div
-                  class={[
-                    "flex items-center gap-2 rounded-lg border px-3 py-2 text-xs",
-                    codexAcpCheckStatus() === "checking"
-                      ? "border-amber-300/40 bg-amber-500/10 text-amber-300"
-                      : codexAcpCheckStatus() === "ok"
-                        ? "border-emerald-300/40 bg-emerald-500/10 text-emerald-300"
-                        : "border-rose-300/40 bg-rose-500/10 text-rose-300",
-                  ].join(" ")}
-                >
-                  <Show when={codexAcpCheckStatus() === "checking"}>
-                    <svg
-                      class="h-3.5 w-3.5 shrink-0 animate-spin"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                    >
-                      <circle
-                        class="opacity-25"
-                        cx="12"
-                        cy="12"
-                        r="10"
-                        stroke="currentColor"
-                        stroke-width="4"
-                      />
-                      <path
-                        class="opacity-75"
-                        fill="currentColor"
-                        d="M4 12a8 8 0 018-8V0C5.373 0 22 6.477 22 12h-4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                      />
-                    </svg>
-                  </Show>
-                  <Show when={codexAcpCheckStatus() === "ok"}>
-                    <svg
-                      class="h-3.5 w-3.5 shrink-0"
-                      viewBox="0 0 20 20"
-                      fill="currentColor"
-                    >
-                      <path
-                        fill-rule="evenodd"
-                        d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
-                        clip-rule="evenodd"
-                      />
-                    </svg>
-                  </Show>
-                  <Show when={codexAcpCheckStatus() === "error"}>
-                    <svg
-                      class="h-3.5 w-3.5 shrink-0"
-                      viewBox="0 0 20 20"
-                      fill="currentColor"
-                    >
-                      <path
-                        fill-rule="evenodd"
-                        d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z"
-                        clip-rule="evenodd"
-                      />
-                    </svg>
-                  </Show>
-                  <span>
-                    {codexAcpCheckStatus() === "checking"
-                      ? "检测中，请稍候…"
-                      : codexAcpCheckMessage()}
-                  </span>
-                </div>
+              <Show when={codexAcpCheck.status() !== "idle"}>
+                <CheckStatusBanner
+                  status={codexAcpCheck.status()}
+                  checkingMessage={SETTINGS.agent.codex_acp.checking_status}
+                  message={codexAcpCheck.message()}
+                  showIcon
+                />
               </Show>
 
               <div class="rounded-lg border border-[color:var(--border)] bg-[color:var(--surface)] p-3 text-xs text-[color:var(--text-secondary)]">
-                运行时配置当前来自 desktop canonical / effective config；如果
-                live listener 仍显示旧 runner，应继续核对 release sidecar
-                是否已按新配置重启。
+                {SETTINGS.agent.codex_acp.runtime_note}
               </div>
 
               <div class="flex gap-2 pt-1">
                 <button
                   type="button"
                   class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-1.5 text-xs text-[color:var(--text-primary)] transition hover:border-[color:var(--accent)]/60 disabled:opacity-50"
-                  disabled={codexAcpCheckStatus() === "checking"}
+                  disabled={codexAcpCheck.status() === "checking"}
                   onClick={() => void handleCheckCodexAcp()}
                 >
-                  {codexAcpCheckStatus() === "checking"
-                    ? "检测中…"
-                    : "测试联通"}
+                  {codexAcpCheck.status() === "checking"
+                    ? SETTINGS.agent.codex_acp.checking
+                    : SETTINGS.agent.codex_acp.test_connection}
                 </button>
               </div>
             </div>
@@ -1415,206 +1539,44 @@ export default function SettingsPage() {
             <div class="flex items-start justify-between gap-3">
               <div>
                 <div class="text-sm font-semibold text-[color:var(--text-primary)]">
-                  Gemini CLI
+                  {SETTINGS.agent.gemini_cli.name}
                 </div>
                 <div class="mt-0.5 text-xs text-[color:var(--text-secondary)]">
-                  使用本机安装的{" "}
-                  <code class="rounded bg-black/20 px-1">gemini</code> 命令行
-                  Agent
+                  {SETTINGS.agent.gemini_cli.description_prefix}
+                  <code class="rounded bg-black/20 px-1">
+                    {SETTINGS.agent.gemini_cli.description_code}
+                  </code>
+                  {SETTINGS.agent.gemini_cli.description_suffix}
                 </div>
               </div>
               <Show when={agentDraft().runner === "gemini_cli"}>
                 <span class="shrink-0 rounded-full border border-[color:var(--accent)] px-2 py-0.5 text-[10px] font-medium text-[color:var(--accent)]">
-                  当前
+                  {SETTINGS.agent.current_badge}
                 </span>
               </Show>
             </div>
 
             <div class="mt-4 space-y-3" onClick={(e) => e.stopPropagation()}>
               {/* 检测状态 */}
-              <Show when={geminiCheckStatus() !== "idle"}>
-                <div
-                  class={[
-                    "flex items-center gap-2 rounded-lg border px-3 py-2 text-xs",
-                    geminiCheckStatus() === "checking"
-                      ? "border-amber-300/40 bg-amber-500/10 text-amber-300"
-                      : geminiCheckStatus() === "ok"
-                        ? "border-emerald-300/40 bg-emerald-500/10 text-emerald-300"
-                        : "border-rose-300/40 bg-rose-500/10 text-rose-300",
-                  ].join(" ")}
-                >
-                  <Show when={geminiCheckStatus() === "checking"}>
-                    <svg
-                      class="h-3.5 w-3.5 shrink-0 animate-spin"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                    >
-                      <circle
-                        class="opacity-25"
-                        cx="12"
-                        cy="12"
-                        r="10"
-                        stroke="currentColor"
-                        stroke-width="4"
-                      />
-                      <path
-                        class="opacity-75"
-                        fill="currentColor"
-                        d="M4 12a8 8 0 018-8V0C5.373 0 22 6.477 22 12h-4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                      />
-                    </svg>
-                  </Show>
-                  <Show when={geminiCheckStatus() === "ok"}>
-                    <svg
-                      class="h-3.5 w-3.5 shrink-0"
-                      viewBox="0 0 20 20"
-                      fill="currentColor"
-                    >
-                      <path
-                        fill-rule="evenodd"
-                        d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
-                        clip-rule="evenodd"
-                      />
-                    </svg>
-                  </Show>
-                  <Show when={geminiCheckStatus() === "error"}>
-                    <svg
-                      class="h-3.5 w-3.5 shrink-0"
-                      viewBox="0 0 20 20"
-                      fill="currentColor"
-                    >
-                      <path
-                        fill-rule="evenodd"
-                        d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z"
-                        clip-rule="evenodd"
-                      />
-                    </svg>
-                  </Show>
-                  <span>
-                    {geminiCheckStatus() === "checking"
-                      ? "检测中，请稍候…"
-                      : geminiCheckMessage()}
-                  </span>
-                </div>
+              <Show when={geminiCheck.status() !== "idle"}>
+                <CheckStatusBanner
+                  status={geminiCheck.status()}
+                  checkingMessage={SETTINGS.agent.gemini_cli.checking_status}
+                  message={geminiCheck.message()}
+                  showIcon
+                />
               </Show>
 
               <div class="flex gap-2 pt-1">
                 <button
                   type="button"
                   class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-1.5 text-xs text-[color:var(--text-primary)] transition hover:border-[color:var(--accent)]/60 disabled:opacity-50"
-                  disabled={geminiCheckStatus() === "checking"}
+                  disabled={geminiCheck.status() === "checking"}
                   onClick={() => void handleCheckGemini()}
                 >
-                  {geminiCheckStatus() === "checking" ? "检测中…" : "测试联通"}
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* ── 卡片 4：Codex CLI ── */}
-          <div
-            class={[
-              "rounded-xl border p-5 transition cursor-pointer",
-              agentDraft().runner === "codex_cli"
-                ? "border-[color:var(--accent)] bg-[color:var(--accent-soft)]"
-                : "border-[color:var(--border)] bg-[color:var(--panel)] hover:border-[color:var(--accent)]/50",
-            ].join(" ")}
-            onClick={() => void selectRunner("codex_cli")}
-          >
-            <div class="flex items-start justify-between gap-3">
-              <div>
-                <div class="text-sm font-semibold text-[color:var(--text-primary)]">
-                  Codex
-                </div>
-                <div class="mt-0.5 text-xs text-[color:var(--text-secondary)]">
-                  使用本机安装的{" "}
-                  <code class="rounded bg-black/20 px-1">codex</code> 命令行
-                  Agent
-                </div>
-              </div>
-              <Show when={agentDraft().runner === "codex_cli"}>
-                <span class="shrink-0 rounded-full border border-[color:var(--accent)] px-2 py-0.5 text-[10px] font-medium text-[color:var(--accent)]">
-                  当前
-                </span>
-              </Show>
-            </div>
-
-            <div class="mt-4 space-y-3" onClick={(e) => e.stopPropagation()}>
-              {/* 检测状态 */}
-              <Show when={codexCheckStatus() !== "idle"}>
-                <div
-                  class={[
-                    "flex items-center gap-2 rounded-lg border px-3 py-2 text-xs",
-                    codexCheckStatus() === "checking"
-                      ? "border-amber-300/40 bg-amber-500/10 text-amber-300"
-                      : codexCheckStatus() === "ok"
-                        ? "border-emerald-300/40 bg-emerald-500/10 text-emerald-300"
-                        : "border-rose-300/40 bg-rose-500/10 text-rose-300",
-                  ].join(" ")}
-                >
-                  <Show when={codexCheckStatus() === "checking"}>
-                    <svg
-                      class="h-3.5 w-3.5 shrink-0 animate-spin"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                    >
-                      <circle
-                        class="opacity-25"
-                        cx="12"
-                        cy="12"
-                        r="10"
-                        stroke="currentColor"
-                        stroke-width="4"
-                      />
-                      <path
-                        class="opacity-75"
-                        fill="currentColor"
-                        d="M4 12a8 8 0 018-8V0C5.373 0 22 6.477 22 12h-4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                      />
-                    </svg>
-                  </Show>
-                  <Show when={codexCheckStatus() === "ok"}>
-                    <svg
-                      class="h-3.5 w-3.5 shrink-0"
-                      viewBox="0 0 20 20"
-                      fill="currentColor"
-                    >
-                      <path
-                        fill-rule="evenodd"
-                        d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
-                        clip-rule="evenodd"
-                      />
-                    </svg>
-                  </Show>
-                  <Show when={codexCheckStatus() === "error"}>
-                    <svg
-                      class="h-3.5 w-3.5 shrink-0"
-                      viewBox="0 0 20 20"
-                      fill="currentColor"
-                    >
-                      <path
-                        fill-rule="evenodd"
-                        d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z"
-                        clip-rule="evenodd"
-                      />
-                    </svg>
-                  </Show>
-                  <span>
-                    {codexCheckStatus() === "checking"
-                      ? "检测中，请稍候…"
-                      : codexCheckMessage()}
-                  </span>
-                </div>
-              </Show>
-
-              <div class="flex gap-2 pt-1">
-                <button
-                  type="button"
-                  class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-1.5 text-xs text-[color:var(--text-primary)] transition hover:border-[color:var(--accent)]/60 disabled:opacity-50"
-                  disabled={codexCheckStatus() === "checking"}
-                  onClick={() => void handleCheckCodex()}
-                >
-                  {codexCheckStatus() === "checking" ? "检测中…" : "测试联通"}
+                  {geminiCheck.status() === "checking"
+                    ? SETTINGS.agent.gemini_cli.checking
+                    : SETTINGS.agent.gemini_cli.test_connection}
                 </button>
               </div>
             </div>
@@ -1631,12 +1593,10 @@ export default function SettingsPage() {
           <div class="flex items-start justify-between gap-4">
             <div>
               <h1 class="text-xl font-semibold text-[color:var(--text-primary)]">
-                Web 用户邀请码
+                {SETTINGS.invite.title}
               </h1>
               <p class="mt-2 text-sm text-[color:var(--text-secondary)]">
-                生成邀请码时会同步创建一个 `web`
-                用户，并将邀请码与手机号强绑定。用户通过 `/chat`
-                输入邀请码和手机号登录后，复用现有 12 次对话额度限制。
+                {SETTINGS.invite.subtitle}
               </p>
             </div>
             <div class="flex gap-2">
@@ -1645,7 +1605,7 @@ export default function SettingsPage() {
                 class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-1.5 text-xs text-[color:var(--text-primary)] transition hover:bg-black/5"
                 onClick={() => void refetchWebInvites()}
               >
-                刷新
+                {SETTINGS.invite.refresh}
               </button>
             </div>
           </div>
@@ -1653,7 +1613,7 @@ export default function SettingsPage() {
           <div class="mt-4 flex flex-col gap-3 rounded-xl border border-[color:var(--border)] bg-[color:var(--panel)] p-4 lg:flex-row lg:items-end">
             <label class="flex-1">
               <div class="text-xs font-medium uppercase tracking-[0.14em] text-[color:var(--text-muted)]">
-                手机号
+                {SETTINGS.invite.phone_label}
               </div>
               <input
                 type="tel"
@@ -1663,7 +1623,7 @@ export default function SettingsPage() {
                     normalizePhoneNumber(event.currentTarget.value),
                   )
                 }
-                placeholder="生成邀请码前先输入手机号"
+                placeholder={SETTINGS.invite.phone_placeholder}
                 autocomplete="tel"
                 class="mt-2 w-full rounded-lg border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-2 text-sm text-[color:var(--text-primary)] outline-none transition focus:border-[color:var(--accent)]"
               />
@@ -1674,7 +1634,7 @@ export default function SettingsPage() {
               disabled={inviteCreating() || !invitePhoneNumber().trim()}
               onClick={() => void handleCreateInvite()}
             >
-              {inviteCreating() ? "生成中…" : "生成邀请码"}
+              {inviteCreating() ? SETTINGS.invite.creating : SETTINGS.invite.create}
             </button>
           </div>
 
@@ -1690,33 +1650,34 @@ export default function SettingsPage() {
           </Show>
 
           <div class="mt-6 overflow-hidden rounded-xl border border-[color:var(--border)]">
-            <div class="grid grid-cols-[1.2fr_1fr_1.1fr_0.8fr_0.7fr_0.9fr_1fr_auto] gap-3 bg-[color:var(--panel)] px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-[color:var(--text-muted)]">
-              <div>邀请码</div>
-              <div>手机号</div>
-              <div>Web 用户</div>
-              <div>状态</div>
-              <div>登录态</div>
-              <div>剩余次数</div>
-              <div>最近登录</div>
-              <div>操作</div>
+            <div class="grid grid-cols-[1.2fr_1fr_1.1fr_0.8fr_0.8fr_0.7fr_0.9fr_1fr_auto] gap-3 bg-[color:var(--panel)] px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-[color:var(--text-muted)]">
+              <div>{SETTINGS.invite.table.code}</div>
+              <div>{SETTINGS.invite.table.phone}</div>
+              <div>{SETTINGS.invite.table.web_user}</div>
+              <div>{SETTINGS.invite.table.status}</div>
+              <div>{SETTINGS.invite.table.api_key}</div>
+              <div>{SETTINGS.invite.table.sessions}</div>
+              <div>{SETTINGS.invite.table.remaining}</div>
+              <div>{SETTINGS.invite.table.last_login}</div>
+              <div>{SETTINGS.invite.table.actions}</div>
             </div>
             <Show
               when={(webInvites() ?? []).length > 0}
               fallback={
                 <div class="px-4 py-8 text-sm text-[color:var(--text-secondary)]">
-                  还没有生成任何邀请码。
+                  {SETTINGS.invite.table.empty}
                 </div>
               }
             >
               <div class="divide-y divide-[color:var(--border)]">
                 <For each={webInvites() ?? []}>
                   {(invite) => (
-                    <div class="grid grid-cols-[1.2fr_1fr_1.1fr_0.8fr_0.7fr_0.9fr_1fr_auto] items-center gap-3 px-4 py-3 text-sm">
+                    <div class="grid grid-cols-[1.2fr_1fr_1.1fr_0.8fr_0.8fr_0.7fr_0.9fr_1fr_auto] items-center gap-3 px-4 py-3 text-sm">
                       <div class="font-mono text-[color:var(--text-primary)]">
                         {invite.invite_code}
                       </div>
                       <div class="font-mono text-[color:var(--text-secondary)]">
-                        {invite.phone_number || "未绑定"}
+                        {invite.phone_number || SETTINGS.invite.table.phone_unbound}
                       </div>
                       <div class="text-[color:var(--text-secondary)]">
                         {invite.user_id}
@@ -1730,21 +1691,26 @@ export default function SettingsPage() {
                               : "bg-rose-500/10 text-rose-300",
                           ].join(" ")}
                         >
-                          {invite.enabled ? "已启用" : "已停用"}
+                          {invite.enabled
+                            ? SETTINGS.invite.table.enabled
+                            : SETTINGS.invite.table.disabled}
                         </span>
+                      </div>
+                      <div class="font-mono text-xs text-[color:var(--text-secondary)]">
+                        {invite.api_key_prefix || SETTINGS.invite.table.api_key_missing}
                       </div>
                       <div class="text-[color:var(--text-secondary)]">
                         {invite.active_session_count}
                       </div>
                       <div class="text-[color:var(--text-secondary)]">
                         {invite.daily_limit === 0
-                          ? "不限"
+                          ? SETTINGS.invite.table.unlimited
                           : `${invite.remaining_today}/${invite.daily_limit}`}
                       </div>
                       <div class="text-[color:var(--text-secondary)]">
                         {invite.last_login_at
                           ? new Date(invite.last_login_at).toLocaleString()
-                          : "未登录"}
+                          : SETTINGS.invite.table.never_logged_in}
                       </div>
                       <div class="flex flex-wrap justify-end gap-2">
                         <button
@@ -1754,7 +1720,7 @@ export default function SettingsPage() {
                             void copyInviteCode(invite.invite_code)
                           }
                         >
-                          复制
+                          {SETTINGS.invite.table.copy}
                         </button>
                         <button
                           type="button"
@@ -1766,8 +1732,34 @@ export default function SettingsPage() {
                           onClick={() => void handleResetInvite(invite)}
                         >
                           {isInviteActionRunning(invite.user_id, "reset")
-                            ? "重置中…"
-                            : "重置"}
+                            ? SETTINGS.invite.table.resetting
+                            : SETTINGS.invite.table.reset}
+                        </button>
+                        <button
+                          type="button"
+                          class="rounded-md border border-[color:var(--border)] px-2.5 py-1 text-xs text-[color:var(--text-primary)] transition hover:border-[color:var(--accent)]/60 disabled:opacity-50"
+                          disabled={isInviteActionRunning(
+                            invite.user_id,
+                            "api-key",
+                          )}
+                          onClick={() => void handleGetInviteApiKey(invite)}
+                        >
+                          {isInviteActionRunning(invite.user_id, "api-key")
+                            ? SETTINGS.invite.table.api_key_getting
+                            : SETTINGS.invite.table.api_key_get}
+                        </button>
+                        <button
+                          type="button"
+                          class="rounded-md border border-[color:var(--border)] px-2.5 py-1 text-xs text-[color:var(--text-primary)] transition hover:border-[color:var(--accent)]/60 disabled:opacity-50"
+                          disabled={isInviteActionRunning(
+                            invite.user_id,
+                            "api-key-reset",
+                          )}
+                          onClick={() => void handleResetInviteApiKey(invite)}
+                        >
+                          {isInviteActionRunning(invite.user_id, "api-key-reset")
+                            ? SETTINGS.invite.table.api_key_resetting
+                            : SETTINGS.invite.table.api_key_reset}
                         </button>
                         <Show
                           when={invite.enabled}
@@ -1782,8 +1774,8 @@ export default function SettingsPage() {
                               onClick={() => void handleEnableInvite(invite)}
                             >
                               {isInviteActionRunning(invite.user_id, "enable")
-                                ? "启用中…"
-                                : "启用"}
+                                ? SETTINGS.invite.table.enabling
+                                : SETTINGS.invite.table.enable}
                             </button>
                           }
                         >
@@ -1797,8 +1789,8 @@ export default function SettingsPage() {
                             onClick={() => void handleDisableInvite(invite)}
                           >
                             {isInviteActionRunning(invite.user_id, "disable")
-                              ? "停用中…"
-                              : "停用"}
+                              ? SETTINGS.invite.table.disabling
+                              : SETTINGS.invite.table.disable}
                           </button>
                         </Show>
                       </div>
@@ -1832,11 +1824,11 @@ export default function SettingsPage() {
             </svg>
           </div>
           <h1 class="text-xl font-bold text-[color:var(--text-primary)]">
-            API 配置
+            {SETTINGS.data.title}
           </h1>
         </div>
         <p class="mt-2 text-sm text-[color:var(--text-secondary)]">
-          配置各类数据源和搜索服务的密钥。支持多 Key 轮换及自动重试。
+          {SETTINGS.data.subtitle}
         </p>
 
         <div class="mt-8 space-y-6">
@@ -1849,10 +1841,10 @@ export default function SettingsPage() {
                 </div>
                 <div>
                   <div class="text-sm font-bold text-[color:var(--text-primary)]">
-                    金融数据 API (Financial Modeling Prep)
+                    {SETTINGS.data.fmp.name}
                   </div>
                   <div class="mt-0.5 text-[10px] text-[color:var(--text-secondary)]">
-                    用于获取实时股票、报表等金融核心数据
+                    {SETTINGS.data.fmp.description}
                   </div>
                 </div>
               </div>
@@ -1877,17 +1869,23 @@ export default function SettingsPage() {
                       <div class="relative flex-1">
                         <input
                           type={showFmpKeys()[index] ? "text" : "password"}
-                          placeholder="FMP API Key"
+                          placeholder={SETTINGS.data.fmp.key_placeholder}
                           class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-1.5 text-sm text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
                           value={key()}
                           onInput={(e) =>
-                            updateKey(setFmpDraft, index, e.currentTarget.value)
+                            updateApiKeyDraft(
+                              setFmpDraft,
+                              index,
+                              e.currentTarget.value,
+                            )
                           }
                         />
                         <button
                           type="button"
                           class="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-[color:var(--text-secondary)] hover:text-[color:var(--text-primary)]"
-                          onClick={() => toggleShowKey(setShowFmpKeys, index)}
+                          onClick={() =>
+                            toggleApiKeyDraftVisibility(setShowFmpKeys, index)
+                          }
                         >
                           <Show
                             when={showFmpKeys()[index]}
@@ -1934,10 +1932,14 @@ export default function SettingsPage() {
                           type="button"
                           class="text-xs text-rose-500 px-2 font-medium"
                           onClick={() =>
-                            removeKey(setFmpDraft, setShowFmpKeys, index)
+                            removeApiKeyDraftRow(
+                              setFmpDraft,
+                              setShowFmpKeys,
+                              index,
+                            )
                           }
                         >
-                          删除
+                          {SETTINGS.data.fmp.remove}
                         </button>
                       </Show>
                     </div>
@@ -1947,16 +1949,18 @@ export default function SettingsPage() {
                   <button
                     type="button"
                     class="text-[10px] font-bold text-[color:var(--accent)]"
-                    onClick={() => addKey(setFmpDraft, setShowFmpKeys)}
+                    onClick={() =>
+                      addApiKeyDraftRow(setFmpDraft, setShowFmpKeys)
+                    }
                   >
-                    + 添加 Key
+                    {SETTINGS.data.fmp.add_key}
                   </button>
                   <button
                     type="submit"
                     class="rounded bg-[color:var(--accent)] px-3 py-1 text-xs font-bold text-white shadow-sm"
                     disabled={fmpSaving()}
                   >
-                    {fmpSaving() ? "保存中..." : "保存 FMP"}
+                    {fmpSaving() ? SETTINGS.data.fmp.saving : SETTINGS.data.fmp.save}
                   </button>
                 </div>
               </fieldset>
@@ -1972,10 +1976,10 @@ export default function SettingsPage() {
                 </div>
                 <div>
                   <div class="text-sm font-bold text-[color:var(--text-primary)]">
-                    搜索 API (Tavily)
+                    {SETTINGS.data.tavily.name}
                   </div>
                   <div class="mt-0.5 text-[10px] text-[color:var(--text-secondary)]">
-                    用于联网获取最新信息、文章、网页内容
+                    {SETTINGS.data.tavily.description}
                   </div>
                 </div>
               </div>
@@ -2004,7 +2008,7 @@ export default function SettingsPage() {
                           class="w-full rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-1.5 text-sm text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
                           value={key()}
                           onInput={(e) =>
-                            updateKey(
+                            updateApiKeyDraft(
                               setTavilyDraft,
                               index,
                               e.currentTarget.value,
@@ -2015,7 +2019,10 @@ export default function SettingsPage() {
                           type="button"
                           class="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-[color:var(--text-secondary)] hover:text-[color:var(--text-primary)]"
                           onClick={() =>
-                            toggleShowKey(setShowTavilyKeys, index)
+                            toggleApiKeyDraftVisibility(
+                              setShowTavilyKeys,
+                              index,
+                            )
                           }
                         >
                           <Show
@@ -2063,10 +2070,14 @@ export default function SettingsPage() {
                           type="button"
                           class="text-xs text-rose-500 px-2 font-medium"
                           onClick={() =>
-                            removeKey(setTavilyDraft, setShowTavilyKeys, index)
+                            removeApiKeyDraftRow(
+                              setTavilyDraft,
+                              setShowTavilyKeys,
+                              index,
+                            )
                           }
                         >
-                          删除
+                          {SETTINGS.data.tavily.remove}
                         </button>
                       </Show>
                     </div>
@@ -2076,16 +2087,20 @@ export default function SettingsPage() {
                   <button
                     type="button"
                     class="text-[10px] font-bold text-[color:var(--accent)]"
-                    onClick={() => addKey(setTavilyDraft, setShowTavilyKeys)}
+                    onClick={() =>
+                      addApiKeyDraftRow(setTavilyDraft, setShowTavilyKeys)
+                    }
                   >
-                    + 添加 Key
+                    {SETTINGS.data.tavily.add_key}
                   </button>
                   <button
                     type="submit"
                     class="rounded bg-[color:var(--accent)] px-3 py-1 text-xs font-bold text-white shadow-sm"
                     disabled={tavilySaving()}
                   >
-                    {tavilySaving() ? "保存中..." : "保存 Tavily"}
+                    {tavilySaving()
+                      ? SETTINGS.data.tavily.saving
+                      : SETTINGS.data.tavily.save}
                   </button>
                 </div>
               </fieldset>
@@ -2115,10 +2130,10 @@ export default function SettingsPage() {
           </div>
           <div>
             <h1 class="text-xl font-bold text-[color:var(--text-primary)]">
-              通知推送偏好
+              {SETTINGS.notify.title}
             </h1>
             <p class="mt-1 text-sm text-[color:var(--text-secondary)]">
-              代任意 actor 调整事件推送策略。终端用户自己也可以在渠道里用自然语言调整。
+              {SETTINGS.notify.subtitle}
             </p>
           </div>
         </div>
@@ -2136,7 +2151,7 @@ export default function SettingsPage() {
         <form onSubmit={(event) => void submitChannels(event)}>
           <fieldset
             disabled={
-              !backend.state.isDesktop || desktopChannelSettings.loading
+              !backend.state.connected || desktopChannelSettings.loading
             }
             class="space-y-6 disabled:opacity-60"
           >
@@ -2155,10 +2170,10 @@ export default function SettingsPage() {
                 </div>
                 <div>
                   <h1 class="text-xl font-bold text-[color:var(--text-primary)]">
-                    渠道设置
+                    {SETTINGS.channel.title}
                   </h1>
                   <p class="mt-1 text-sm text-[color:var(--text-secondary)]">
-                    开启后 Hone 会通过对应渠道监听消息并进行 Agent 响应。
+                    {SETTINGS.channel.subtitle}
                   </p>
                 </div>
               </div>
@@ -2167,7 +2182,7 @@ export default function SettingsPage() {
                 class="rounded-md border border-[color:var(--border)] bg-[color:var(--surface)] px-3 py-1.5 text-xs text-[color:var(--text-primary)] transition hover:bg-black/5"
                 onClick={() => void refetchDesktopChannelSettings()}
               >
-                刷新配置
+                {SETTINGS.channel.refresh}
               </button>
             </div>
 
@@ -2186,7 +2201,7 @@ export default function SettingsPage() {
                       </svg>
                     </div>
                     <div class="font-bold text-[color:var(--text-primary)]">
-                      飞书 (Feishu)
+                      {SETTINGS.channel.feishu.name}
                     </div>
                   </div>
                   <label class="relative inline-flex cursor-pointer items-center">
@@ -2195,10 +2210,9 @@ export default function SettingsPage() {
                       class="peer sr-only"
                       checked={channelDraft().feishuEnabled}
                       onChange={(e) =>
-                        setChannelDraft((p) => ({
-                          ...p,
+                        updateChannelDraft({
                           feishuEnabled: e.currentTarget.checked,
-                        }))
+                        })
                       }
                     />
                     <div class="peer h-5 w-9 rounded-full bg-gray-200 after:absolute after:left-[2px] after:top-[2px] after:h-4 after:w-4 after:rounded-full after:bg-white after:transition-all after:content-[''] peer-checked:bg-[color:var(--accent)] peer-checked:after:translate-x-full dark:bg-gray-700"></div>
@@ -2208,36 +2222,34 @@ export default function SettingsPage() {
                   <div class="space-y-3 pt-2">
                     <div class="space-y-1">
                       <label class="text-[10px] font-bold uppercase tracking-wider text-[color:var(--text-secondary)]">
-                        App ID
+                        {SETTINGS.channel.feishu.app_id_label}
                       </label>
                       <input
                         type="text"
-                        placeholder="cli_..."
+                        placeholder={SETTINGS.channel.feishu.app_id_placeholder}
                         class="w-full rounded border border-[color:var(--border)] bg-[color:var(--surface)] px-2.5 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
                         value={channelDraft().feishuAppId || ""}
                         onInput={(e) =>
-                          setChannelDraft((p) => ({
-                            ...p,
+                          updateChannelDraft({
                             feishuAppId: e.currentTarget.value,
-                          }))
+                          })
                         }
                       />
                     </div>
                     <div class="space-y-1">
                       <label class="text-[10px] font-bold uppercase tracking-wider text-[color:var(--text-secondary)]">
-                        App Secret
+                        {SETTINGS.channel.feishu.app_secret_label}
                       </label>
                       <div class="relative">
                         <input
                           type={showFeishuSecret() ? "text" : "password"}
-                          placeholder="Secret"
+                          placeholder={SETTINGS.channel.feishu.app_secret_placeholder}
                           class="w-full rounded border border-[color:var(--border)] bg-[color:var(--surface)] px-2.5 py-1.5 pr-14 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
                           value={channelDraft().feishuAppSecret || ""}
                           onInput={(e) =>
-                            setChannelDraft((p) => ({
-                              ...p,
+                            updateChannelDraft({
                               feishuAppSecret: e.currentTarget.value,
-                            }))
+                            })
                           }
                         />
                         <button
@@ -2245,12 +2257,86 @@ export default function SettingsPage() {
                           class="absolute right-2 top-1/2 -translate-y-1/2 rounded px-1.5 py-0.5 text-[10px] text-[color:var(--text-secondary)] hover:text-[color:var(--text-primary)]"
                           onClick={() => setShowFeishuSecret((v) => !v)}
                         >
-                          {showFeishuSecret() ? "隐藏" : "显示"}
+                          {showFeishuSecret()
+                            ? SETTINGS.channel.feishu.hide
+                            : SETTINGS.channel.feishu.show}
                         </button>
                       </div>
                     </div>
-                  </div>
-                </Show>
+                      <div class="grid gap-3 md:grid-cols-2">
+                        <div class="space-y-1">
+                          <label class="text-[10px] font-bold uppercase tracking-wider text-[color:var(--text-secondary)]">
+                            {SETTINGS.channel.common.chat_scope_label}
+                          </label>
+                          <select
+                            class="w-full rounded border border-[color:var(--border)] bg-[color:var(--surface)] px-2.5 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                            value={channelDraft().feishuChatScope || "DM_ONLY"}
+                            onChange={(e) =>
+                              updateChannelDraft({
+                                feishuChatScope: e.currentTarget.value,
+                              })
+                            }
+                          >
+                            <For each={CHANNEL_CHAT_SCOPES}>
+                              {(scope) => <option value={scope}>{scope}</option>}
+                            </For>
+                          </select>
+                        </div>
+                      </div>
+                      <div class="grid gap-3 md:grid-cols-2">
+                        <div class="space-y-1">
+                          <label class="text-[10px] font-bold uppercase tracking-wider text-[color:var(--text-secondary)]">
+                            {SETTINGS.channel.common.allow_emails_label}
+                          </label>
+                          <input
+                            type="text"
+                            placeholder={SETTINGS.channel.common.csv_placeholder}
+                            class="w-full rounded border border-[color:var(--border)] bg-[color:var(--surface)] px-2.5 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                            value={formatCsv(channelDraft().feishuAllowEmails)}
+                            onChange={(e) =>
+                              updateChannelDraft({
+                                feishuAllowEmails: parseCsv(e.currentTarget.value),
+                              })
+                            }
+                          />
+                        </div>
+                        <div class="space-y-1">
+                          <label class="text-[10px] font-bold uppercase tracking-wider text-[color:var(--text-secondary)]">
+                            {SETTINGS.channel.common.allow_open_ids_label}
+                          </label>
+                          <input
+                            type="text"
+                            placeholder={SETTINGS.channel.common.csv_placeholder}
+                            class="w-full rounded border border-[color:var(--border)] bg-[color:var(--surface)] px-2.5 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                            value={formatCsv(channelDraft().feishuAllowOpenIds)}
+                            onChange={(e) =>
+                              updateChannelDraft({
+                                feishuAllowOpenIds: parseCsv(e.currentTarget.value),
+                              })
+                            }
+                          />
+                        </div>
+                      </div>
+                      <div class="grid gap-3 md:grid-cols-2">
+                        <div class="space-y-1">
+                          <label class="text-[10px] font-bold uppercase tracking-wider text-[color:var(--text-secondary)]">
+                            {SETTINGS.channel.common.allow_mobiles_label}
+                          </label>
+                          <input
+                            type="text"
+                            placeholder={SETTINGS.channel.common.csv_placeholder}
+                            class="w-full rounded border border-[color:var(--border)] bg-[color:var(--surface)] px-2.5 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                            value={formatCsv(channelDraft().feishuAllowMobiles)}
+                            onChange={(e) =>
+                              updateChannelDraft({
+                                feishuAllowMobiles: parseCsv(e.currentTarget.value),
+                              })
+                            }
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </Show>
               </div>
 
               {/* Discord */}
@@ -2267,7 +2353,7 @@ export default function SettingsPage() {
                       </svg>
                     </div>
                     <div class="font-bold text-[color:var(--text-primary)]">
-                      Discord
+                      {SETTINGS.channel.discord.name}
                     </div>
                   </div>
                   <label class="relative inline-flex cursor-pointer items-center">
@@ -2276,10 +2362,9 @@ export default function SettingsPage() {
                       class="peer sr-only"
                       checked={channelDraft().discordEnabled}
                       onChange={(e) =>
-                        setChannelDraft((p) => ({
-                          ...p,
+                        updateChannelDraft({
                           discordEnabled: e.currentTarget.checked,
-                        }))
+                        })
                       }
                     />
                     <div class="peer h-5 w-9 rounded-full bg-gray-200 after:absolute after:left-[2px] after:top-[2px] after:h-4 after:w-4 after:rounded-full after:bg-white after:transition-all after:content-[''] peer-checked:bg-[color:var(--accent)] peer-checked:after:translate-x-full dark:bg-gray-700"></div>
@@ -2288,19 +2373,18 @@ export default function SettingsPage() {
                 <Show when={channelDraft().discordEnabled}>
                   <div class="space-y-1 pt-2">
                     <label class="text-[10px] font-bold uppercase tracking-wider text-[color:var(--text-secondary)]">
-                      Bot Token
+                      {SETTINGS.channel.discord.bot_token_label}
                     </label>
                     <div class="relative">
                       <input
                         type={showDiscordToken() ? "text" : "password"}
-                        placeholder="Discord Bot Token"
+                        placeholder={SETTINGS.channel.discord.bot_token_placeholder}
                         class="w-full rounded border border-[color:var(--border)] bg-[color:var(--surface)] px-2.5 py-1.5 pr-14 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
                         value={channelDraft().discordBotToken || ""}
                         onInput={(e) =>
-                          setChannelDraft((p) => ({
-                            ...p,
+                          updateChannelDraft({
                             discordBotToken: e.currentTarget.value,
-                          }))
+                          })
                         }
                       />
                       <button
@@ -2308,11 +2392,51 @@ export default function SettingsPage() {
                         class="absolute right-2 top-1/2 -translate-y-1/2 rounded px-1.5 py-0.5 text-[10px] text-[color:var(--text-secondary)] hover:text-[color:var(--text-primary)]"
                         onClick={() => setShowDiscordToken((v) => !v)}
                       >
-                        {showDiscordToken() ? "隐藏" : "显示"}
+                        {showDiscordToken()
+                          ? SETTINGS.channel.discord.hide
+                          : SETTINGS.channel.discord.show}
                       </button>
                     </div>
-                  </div>
-                </Show>
+                      <div class="grid gap-3 md:grid-cols-2">
+                        <div class="space-y-1">
+                          <label class="text-[10px] font-bold uppercase tracking-wider text-[color:var(--text-secondary)]">
+                            {SETTINGS.channel.common.chat_scope_label}
+                          </label>
+                          <select
+                            class="w-full rounded border border-[color:var(--border)] bg-[color:var(--surface)] px-2.5 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                            value={channelDraft().discordChatScope || "DM_ONLY"}
+                            onChange={(e) =>
+                              updateChannelDraft({
+                                discordChatScope: e.currentTarget.value,
+                              })
+                            }
+                          >
+                            <For each={CHANNEL_CHAT_SCOPES}>
+                              {(scope) => <option value={scope}>{scope}</option>}
+                            </For>
+                          </select>
+                        </div>
+                      </div>
+                      <div class="grid gap-3 md:grid-cols-2">
+                        <div class="space-y-1">
+                          <label class="text-[10px] font-bold uppercase tracking-wider text-[color:var(--text-secondary)]">
+                            {SETTINGS.channel.common.allow_from_label}
+                          </label>
+                          <input
+                            type="text"
+                            placeholder={SETTINGS.channel.common.csv_placeholder}
+                            class="w-full rounded border border-[color:var(--border)] bg-[color:var(--surface)] px-2.5 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                            value={formatCsv(channelDraft().discordAllowFrom)}
+                            onChange={(e) =>
+                              updateChannelDraft({
+                                discordAllowFrom: parseCsv(e.currentTarget.value),
+                              })
+                            }
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </Show>
               </div>
 
               {/* Telegram */}
@@ -2329,7 +2453,7 @@ export default function SettingsPage() {
                       </svg>
                     </div>
                     <div class="font-bold text-[color:var(--text-primary)]">
-                      Telegram
+                      {SETTINGS.channel.telegram.name}
                     </div>
                   </div>
                   <label class="relative inline-flex cursor-pointer items-center">
@@ -2338,10 +2462,9 @@ export default function SettingsPage() {
                       class="peer sr-only"
                       checked={channelDraft().telegramEnabled}
                       onChange={(e) =>
-                        setChannelDraft((p) => ({
-                          ...p,
+                        updateChannelDraft({
                           telegramEnabled: e.currentTarget.checked,
-                        }))
+                        })
                       }
                     />
                     <div class="peer h-5 w-9 rounded-full bg-gray-200 after:absolute after:left-[2px] after:top-[2px] after:h-4 after:w-4 after:rounded-full after:bg-white after:transition-all after:content-[''] peer-checked:bg-[color:var(--accent)] peer-checked:after:translate-x-full dark:bg-gray-700"></div>
@@ -2350,19 +2473,18 @@ export default function SettingsPage() {
                 <Show when={channelDraft().telegramEnabled}>
                   <div class="space-y-1 pt-2">
                     <label class="text-[10px] font-bold uppercase tracking-wider text-[color:var(--text-secondary)]">
-                      Bot Token
+                      {SETTINGS.channel.telegram.bot_token_label}
                     </label>
                     <div class="relative">
                       <input
                         type={showTelegramToken() ? "text" : "password"}
-                        placeholder="Token"
+                        placeholder={SETTINGS.channel.telegram.bot_token_placeholder}
                         class="w-full rounded border border-[color:var(--border)] bg-[color:var(--surface)] px-2.5 py-1.5 pr-14 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
                         value={channelDraft().telegramBotToken || ""}
                         onInput={(e) =>
-                          setChannelDraft((p) => ({
-                            ...p,
+                          updateChannelDraft({
                             telegramBotToken: e.currentTarget.value,
-                          }))
+                          })
                         }
                       />
                       <button
@@ -2370,11 +2492,51 @@ export default function SettingsPage() {
                         class="absolute right-2 top-1/2 -translate-y-1/2 rounded px-1.5 py-0.5 text-[10px] text-[color:var(--text-secondary)] hover:text-[color:var(--text-primary)]"
                         onClick={() => setShowTelegramToken((v) => !v)}
                       >
-                        {showTelegramToken() ? "隐藏" : "显示"}
+                        {showTelegramToken()
+                          ? SETTINGS.channel.telegram.hide
+                          : SETTINGS.channel.telegram.show}
                       </button>
                     </div>
-                  </div>
-                </Show>
+                      <div class="grid gap-3 md:grid-cols-2">
+                        <div class="space-y-1">
+                          <label class="text-[10px] font-bold uppercase tracking-wider text-[color:var(--text-secondary)]">
+                            {SETTINGS.channel.common.chat_scope_label}
+                          </label>
+                          <select
+                            class="w-full rounded border border-[color:var(--border)] bg-[color:var(--surface)] px-2.5 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                            value={channelDraft().telegramChatScope || "DM_ONLY"}
+                            onChange={(e) =>
+                              updateChannelDraft({
+                                telegramChatScope: e.currentTarget.value,
+                              })
+                            }
+                          >
+                            <For each={CHANNEL_CHAT_SCOPES}>
+                              {(scope) => <option value={scope}>{scope}</option>}
+                            </For>
+                          </select>
+                        </div>
+                      </div>
+                      <div class="grid gap-3 md:grid-cols-2">
+                        <div class="space-y-1">
+                          <label class="text-[10px] font-bold uppercase tracking-wider text-[color:var(--text-secondary)]">
+                            {SETTINGS.channel.common.allow_from_label}
+                          </label>
+                          <input
+                            type="text"
+                            placeholder={SETTINGS.channel.common.csv_placeholder}
+                            class="w-full rounded border border-[color:var(--border)] bg-[color:var(--surface)] px-2.5 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                            value={formatCsv(channelDraft().telegramAllowFrom)}
+                            onChange={(e) =>
+                              updateChannelDraft({
+                                telegramAllowFrom: parseCsv(e.currentTarget.value),
+                              })
+                            }
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </Show>
               </div>
 
               {/* iMessage */}
@@ -2392,10 +2554,10 @@ export default function SettingsPage() {
                     </div>
                     <div>
                       <div class="font-bold text-[color:var(--text-primary)]">
-                        iMessage
+                        {SETTINGS.channel.imessage.name}
                       </div>
                       <div class="text-[10px] font-bold text-amber-600">
-                        ⚠️ Needs Full Disk Access
+                        {SETTINGS.channel.imessage.warning}
                       </div>
                     </div>
                   </div>
@@ -2405,28 +2567,49 @@ export default function SettingsPage() {
                       class="peer sr-only"
                       checked={channelDraft().imessageEnabled}
                       onChange={(e) =>
-                        setChannelDraft((p) => ({
-                          ...p,
+                        updateChannelDraft({
                           imessageEnabled: e.currentTarget.checked,
-                        }))
+                        })
                       }
                     />
                     <div class="peer h-5 w-9 rounded-full bg-gray-200 after:absolute after:left-[2px] after:top-[2px] after:h-4 after:w-4 after:rounded-full after:bg-white after:transition-all after:content-[''] peer-checked:bg-[color:var(--accent)] peer-checked:after:translate-x-full dark:bg-gray-700"></div>
                   </label>
                 </div>
+                <Show when={channelDraft().imessageEnabled}>
+                  <div class="mt-4 space-y-3">
+                    <div class="space-y-1">
+                      <label class="text-[10px] font-bold uppercase tracking-wider text-[color:var(--text-secondary)]">
+                        {SETTINGS.channel.common.target_handle_label}
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="+15551234567"
+                        class="w-full rounded border border-[color:var(--border)] bg-[color:var(--surface)] px-2.5 py-1.5 text-xs text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent)]"
+                        value={channelDraft().imessageTargetHandle || ""}
+                        onInput={(e) =>
+                          updateChannelDraft({
+                            imessageTargetHandle: e.currentTarget.value,
+                          })
+                        }
+                      />
+                    </div>
+                  </div>
+                </Show>
               </div>
             </div>
 
             <div class="mt-8 flex items-center justify-between border-t border-[color:var(--border)] pt-6">
               <div class="text-xs text-[color:var(--text-secondary)]">
-                同步设置将立即生效。
+                {SETTINGS.channel.sync_note}
               </div>
               <button
                 type="submit"
                 class="rounded-md bg-[color:var(--accent)] px-6 py-2 text-sm font-bold text-white shadow-sm transition-all hover:opacity-90 active:scale-95 disabled:opacity-50"
                 disabled={backend.state.saving}
               >
-                {backend.state.saving ? "同步中..." : "同步全部渠道"}
+                {backend.state.saving
+                  ? SETTINGS.channel.saving
+                  : SETTINGS.channel.save}
               </button>
             </div>
           </fieldset>

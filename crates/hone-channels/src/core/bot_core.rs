@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use hone_core::config::{AgentRunnerKind, HoneConfig};
 use hone_core::{ActorIdentity, LlmAuditSink};
-use hone_llm::{LlmProvider, OpenAiCompatibleProvider, OpenRouterProvider};
+use hone_llm::{LlmProvider, LlmResolver};
 use hone_memory::{
     CompanyProfileStorage, ConversationQuotaStorage, CronJobStorage, LlmAuditStorage,
     SessionStorage,
@@ -34,7 +34,7 @@ use tokio::sync::mpsc;
 
 use crate::runners::{
     AgentRunner, CodexAcpRunner, CodexCliReasoningRunner, FunctionCallingReasoningRunner,
-    GeminiCliRunner, MultiAgentRunner, OpencodeAcpRunner, RunnerTimeouts,
+    GeminiCliRunner, HoneCloudRunner, MultiAgentRunner, OpencodeAcpRunner, RunnerTimeouts,
 };
 use crate::sandbox::sandbox_base_dir;
 use crate::session_compactor::SessionCompactor;
@@ -51,7 +51,7 @@ pub struct CompactSessionOutcome {
 ///
 /// `pub(super)` 字段(`workflow_runner_http`, `runtime_admin_overrides`)
 /// 留给 `super::intercept` 访问 —— 它们本质是「core 状态」但方法已经搬到
-/// sibling,visibility 卡在 agent_session module 内部。
+/// sibling module,所以可见性收在 `core` module 内部。
 pub struct HoneBotCore {
     pub config: HoneConfig,
     pub llm: Option<Arc<dyn LlmProvider>>,
@@ -104,47 +104,62 @@ impl HoneBotCore {
 
     /// 创建 LLM Provider
     fn create_llm_provider(config: &HoneConfig) -> Option<Arc<dyn LlmProvider>> {
-        match config.llm.provider.as_str() {
-            _ => {
-                // Default to OpenRouter
-                match OpenRouterProvider::from_config(config) {
-                    Ok(provider) => Some(Arc::new(provider)),
-                    Err(e) => {
-                        tracing::warn!("Failed to create OpenRouter provider: {}", e);
-                        None
-                    }
-                }
-            }
-        }
-    }
-
-    fn create_auxiliary_llm_provider(config: &HoneConfig) -> Option<Arc<dyn LlmProvider>> {
-        if config.llm.auxiliary.is_configured() {
-            let api_key = config.llm.auxiliary.resolved_api_key();
-            if api_key.trim().is_empty() {
-                tracing::warn!("Failed to create auxiliary provider: auxiliary API key is empty");
-                return None;
-            }
-
-            return match OpenAiCompatibleProvider::new(
-                &api_key,
-                config.llm.auxiliary.base_url.trim(),
-                config.llm.auxiliary.model.trim(),
-                config.llm.auxiliary.timeout,
-                config.llm.auxiliary.max_tokens as u16,
-            ) {
-                Ok(provider) => Some(Arc::new(provider)),
-                Err(err) => {
-                    tracing::warn!("Failed to create auxiliary provider: {}", err);
+        if !config.llm.default_profile.trim().is_empty() {
+            return match LlmResolver::new(config)
+                .provider_for_profile(&config.llm.default_profile, None)
+            {
+                Ok(created) => Some(created.provider),
+                Err(e) => {
+                    tracing::warn!("Failed to create default LLM profile provider: {}", e);
                     None
                 }
             };
         }
 
-        Self::create_llm_provider(config)
+        match LlmResolver::new(config).provider_for_profile_or_openrouter_model(
+            None,
+            &config.llm.openrouter.model,
+            &config.llm.openrouter.model,
+            None,
+        ) {
+            Ok(created) => Some(created.provider),
+            Err(e) => {
+                tracing::warn!("Failed to create OpenRouter provider: {}", e);
+                None
+            }
+        }
+    }
+
+    fn create_auxiliary_llm_provider(config: &HoneConfig) -> Option<Arc<dyn LlmProvider>> {
+        match LlmResolver::new(config).auxiliary_provider(Some(&config.llm.auxiliary_profile), None)
+        {
+            Ok(created) => Some(created.provider),
+            Err(err) => {
+                tracing::warn!("Failed to create auxiliary provider: {}", err);
+                Self::create_llm_provider(config)
+            }
+        }
+    }
+
+    pub(crate) fn create_auxiliary_llm_provider_with_max_tokens(
+        &self,
+        max_tokens: u16,
+    ) -> Result<Arc<dyn LlmProvider>, String> {
+        LlmResolver::new(&self.config)
+            .auxiliary_provider(Some(&self.config.llm.auxiliary_profile), Some(max_tokens))
+            .map(|created| created.provider)
+            .map_err(|err| format!("execution prepare failed: auxiliary llm unavailable: {err}"))
     }
 
     pub fn auxiliary_model_name(&self) -> String {
+        let auxiliary_profile = self.config.llm.auxiliary_profile.trim();
+        if !auxiliary_profile.is_empty() {
+            if let Some(profile) = self.config.llm.profiles.get(auxiliary_profile) {
+                if !profile.model.trim().is_empty() {
+                    return profile.model.trim().to_string();
+                }
+            }
+        }
         let configured = self.config.llm.auxiliary.model.trim();
         if !configured.is_empty() {
             configured.to_string()
@@ -154,6 +169,12 @@ impl HoneBotCore {
     }
 
     pub fn auxiliary_provider_hint(&self) -> (String, String) {
+        let auxiliary_profile = self.config.llm.auxiliary_profile.trim();
+        if !auxiliary_profile.is_empty() {
+            if let Some(profile) = self.config.llm.profiles.get(auxiliary_profile) {
+                return (profile.provider.clone(), self.auxiliary_model_name());
+            }
+        }
         if self.config.llm.auxiliary.is_configured() {
             ("openai-compatible".to_string(), self.auxiliary_model_name())
         } else {
@@ -169,7 +190,7 @@ impl HoneBotCore {
     ) -> hone_core::config::MultiAgentSearchConfig {
         let mut search_config = self.config.agent.multi_agent.search.clone();
         if search_config.api_key.trim().is_empty() {
-            let fallback_key = self.config.llm.auxiliary.resolved_api_key();
+            let fallback_key = self.config.llm.auxiliary.api_key.trim().to_string();
             if !fallback_key.trim().is_empty() {
                 search_config.api_key = fallback_key;
             }
@@ -308,23 +329,26 @@ impl HoneBotCore {
 
         // 终端用户通过自然语言调推送偏好——构造时硬绑定 actor,只能改自己那份。
         // 目录必须与 event-engine `with_prefs_dir` 使用同一个,否则写进去 router 读不到。
-        // 同时强制注入 overview 上下文(cron_jobs_dir + global digest + portfolio digest 默认时刻),
+        // 同时强制注入 overview 上下文(cron_jobs_dir + unified digest 默认槽位时刻),
         // 让 get_overview action 总能给出完整的「我的推送日程」拍平视图,无 partial 分支。
-        let overview_global = hone_tools::schedule_view::GlobalDigestSlice {
-            enabled: self.config.event_engine.global_digest.enabled,
-            timezone: self.config.event_engine.global_digest.timezone.clone(),
-            schedules: self.config.event_engine.global_digest.schedules.clone(),
-        };
-        let overview_portfolio = hone_tools::schedule_view::PortfolioDigestDefaults {
-            pre_market: self.config.event_engine.digest.pre_market.clone(),
-            post_market: self.config.event_engine.digest.post_market.clone(),
+        let overview_digest_defaults = hone_tools::schedule_view::DigestDefaults {
+            slots: self
+                .config
+                .event_engine
+                .digest
+                .default_slots
+                .iter()
+                .map(|s| hone_tools::schedule_view::DigestDefaultSlot {
+                    time: s.time.clone(),
+                    label: s.label.clone(),
+                })
+                .collect(),
         };
         registry.register(Box::new(hone_tools::NotificationPrefsTool::new(
             &self.config.storage.notif_prefs_dir,
             actor.cloned(),
             &self.config.storage.cron_jobs_dir,
-            overview_global,
-            overview_portfolio,
+            overview_digest_defaults,
         )));
 
         // 让用户通过 `/missed` 或自然语言查回 digest/router 主动筛掉的事件。
@@ -522,7 +546,7 @@ impl HoneBotCore {
                     || !opencode_config.api_base_url.trim().is_empty()
                     || !opencode_config.api_key.trim().is_empty();
                 if hone_manages_opencode_route && opencode_config.api_key.trim().is_empty() {
-                    let pool = self.config.llm.openrouter.effective_key_pool();
+                    let pool = self.config.llm.openrouter_key_pool();
                     if let Some(key) = pool.first() {
                         opencode_config.openrouter_api_key = Some(key.to_string());
                     }
@@ -532,8 +556,12 @@ impl HoneBotCore {
                     runner_timeouts,
                 )))
             }
+            AgentRunnerKind::HoneCloud => Ok(Box::new(HoneCloudRunner::new(
+                self.config.agent.hone_cloud.clone(),
+                runner_timeouts,
+            ))),
             AgentRunnerKind::MultiAgent => {
-                let pool = self.config.llm.openrouter.effective_key_pool();
+                let pool = self.config.llm.openrouter_key_pool();
                 let mut answer_config = self.config.agent.opencode.clone();
                 let multi_answer = &self.config.agent.multi_agent.answer;
                 if !multi_answer.api_base_url.trim().is_empty() {

@@ -61,6 +61,10 @@ export type WebInviteInfo = {
   created_at: string;
   last_login_at?: string;
   revoked_at?: string;
+  api_key_prefix?: string;
+  api_key_created_at?: string;
+  api_key_last_used_at?: string;
+  api_key?: string;
   enabled: boolean;
   active_session_count: number;
   daily_limit: number;
@@ -96,6 +100,8 @@ export type MetaInfo = {
   apiVersion: string;
   capabilities: string[];
   deploymentMode: "local" | "remote";
+  /** Admin/console default UI language. "zh" or "en". Optional for backwards compat with older backends. */
+  language?: "zh" | "en";
 };
 
 export type BackendConfig = {
@@ -122,16 +128,25 @@ export type BackendStatusInfo = {
 export type DesktopChannelSettings = {
   configPath: string;
   imessageEnabled: boolean;
+  imessageTargetHandle?: string;
   feishuEnabled: boolean;
   feishuAppId?: string;
   feishuAppSecret?: string;
+  feishuChatScope?: string;
+  feishuAllowEmails?: string[];
+  feishuAllowMobiles?: string[];
+  feishuAllowOpenIds?: string[];
   telegramEnabled: boolean;
   telegramBotToken?: string;
+  telegramChatScope?: string;
+  telegramAllowFrom?: string[];
   discordEnabled: boolean;
   discordBotToken?: string;
+  discordChatScope?: string;
+  discordAllowFrom?: string[];
 };
 
-/** agent.runner 可选执行器 */
+/** agent.runner values; gemini_acp is legacy/parseable but disabled at runtime. */
 export type AgentProvider =
   | "function_calling"
   | "gemini_cli"
@@ -139,6 +154,7 @@ export type AgentProvider =
   | "codex_cli"
   | "codex_acp"
   | "opencode_acp"
+  | "hone_cloud"
   | "multi-agent";
 
 export type MultiAgentSearchSettings = {
@@ -167,8 +183,40 @@ export type AuxiliarySettings = {
   model: string;
 };
 
+export type HoneCloudSettings = {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+};
+
+export type LlmProfileEntrySettings = {
+  id: string;
+  provider: string;
+  model: string;
+  maxTokens?: number;
+  temperature?: number;
+  topP?: number;
+  reasoningEffort?: string;
+  reasoningMaxTokens?: number;
+  responseFormatJson: boolean;
+};
+
+export type LlmProfileSettings = {
+  defaultProfile: string;
+  auxiliaryProfile: string;
+  polishProfile: string;
+  newsClassifierProfile: string;
+  filingSummaryProfile: string;
+  earningsQualityProfile: string;
+  digestPass1Profile: string;
+  digestPass2Profile: string;
+  digestEventDedupeProfile: string;
+  mainlineDistillProfile: string;
+  profiles: LlmProfileEntrySettings[];
+};
+
 export type AgentSettings = {
-  /** function_calling | gemini_cli | gemini_acp | codex_cli | codex_acp | opencode_acp | multi-agent */
+  /** function_calling | gemini_cli | codex_cli | codex_acp | opencode_acp | multi-agent | hone_cloud; gemini_acp is legacy/disabled */
   runner: AgentProvider;
   /** codex_cli 专用；其他 provider 留空 */
   codexModel: string;
@@ -180,8 +228,12 @@ export type AgentSettings = {
   openaiApiKey: string;
   /** OpenAI-compatible auxiliary 配置，用于心跳/压缩等后台任务 */
   auxiliary?: AuxiliarySettings;
+  /** Hone Cloud 用户端服务配置 */
+  honeCloud?: HoneCloudSettings;
   /** multi-agent 双阶段设置 */
   multiAgent?: MultiAgentSettings;
+  /** Named LLM profiles used by runtime subsystems */
+  llmProfiles?: LlmProfileSettings;
 };
 
 export type AgentSettingsUpdateResult = {
@@ -196,19 +248,13 @@ export type CliCheckResult = {
   message: string;
 };
 
-/** OpenRouter API Key 设置（保存在运行时覆盖层的 llm.openrouter.api_keys，支持多 Key fallback） */
-export type OpenRouterSettings = {
-  /** 多 Key 列表，按顺序 fallback */
-  apiKeys: string[];
-};
-
-/** FMP API Key 设置（保存在运行时覆盖层的 fmp.api_keys，支持多 Key fallback） */
+/** FMP API Key 设置（保存在 canonical config.yaml 的 fmp.api_keys，支持多 Key fallback） */
 export type FmpSettings = {
   /** 多 Key 列表，按顺序 fallback */
   apiKeys: string[];
 };
 
-/** Tavily API Key 设置（保存在运行时覆盖层的 search.api_keys，支持多 Key fallback） */
+/** Tavily API Key 设置（保存在 canonical config.yaml 的 search.api_keys，支持多 Key fallback） */
 export type TavilySettings = {
   /** 多 Key 列表，按顺序 fallback */
   apiKeys: string[];
@@ -293,12 +339,6 @@ export type PendingState = {
   phase: PendingPhase;
   statusText: string; // "正在思考…" / "调用工具: web_search" / 错误原因
   partialContent: string; // 流式累积的 assistant 文本
-};
-
-export type PushScheduledMessageEvent = {
-  text?: string;
-  job_name?: string;
-  job_id?: string;
 };
 
 export type TimelineMessage =
@@ -548,33 +588,6 @@ export type AuditQueryFilter = {
 
 // ── Company Profiles ────────────────────────────────────────────────────────
 
-export type IndustryTemplate =
-  | "general"
-  | "saas"
-  | "semiconductor_hardware"
-  | "consumer"
-  | "industrial_defense"
-  | "financials";
-
-export type ProfileTrackingConfig = {
-  enabled: boolean;
-  cadence: string;
-  focus_metrics: string[];
-};
-
-export type ProfileMetadata = {
-  company_name: string;
-  stock_code: string;
-  aliases: string[];
-  sector: string;
-  industry_template: IndustryTemplate;
-  status: string;
-  tracking: ProfileTrackingConfig;
-  created_at: string;
-  updated_at: string;
-  last_reviewed_at?: string;
-};
-
 export type CompanyProfileEvent = {
   id: string;
   filename: string;
@@ -606,18 +619,6 @@ export type CompanyProfileSpaceSummary = {
   updated_at?: string;
 };
 
-export type CompanyProfileCreateInput = {
-  channel?: string;
-  user_id?: string;
-  channel_scope?: string;
-  company_name: string;
-  stock_code?: string;
-  sector?: string;
-  aliases?: string[];
-  industry_template?: IndustryTemplate;
-  sections?: Record<string, string>;
-};
-
 export type CompanyProfileConflictDecision = "skip" | "replace";
 
 export type CompanyProfileImportMode =
@@ -631,7 +632,7 @@ export type CompanyProfileImportProfileSummary = {
   stock_code: string;
   updated_at: string;
   event_count: number;
-  thesis_excerpt: string;
+  mainline_excerpt: string;
 };
 
 export type CompanyProfileImportConflict = {

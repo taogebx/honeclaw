@@ -10,11 +10,17 @@ import type {
   DesktopChannelSettingsUpdateResult,
   FmpSettings,
   MetaInfo,
-  OpenRouterSettings,
   TavilySettings,
 } from "./types"
 
-export const SUPPORTED_API_VERSION = "desktop-v1"
+const SUPPORTED_API_VERSION = "desktop-v1"
+const TRANSIENT_BACKEND_STATUSES = new Set([408, 502, 503, 504])
+const API_FETCH_MAX_ATTEMPTS = 2
+export const API_FETCH_RETRY_DELAY_MS = 2500
+export const FRIENDLY_BACKEND_UNAVAILABLE_MESSAGE =
+  "服务暂时不可用，已自动重试一次。请稍后再试。"
+
+let apiFetchRetryDelayMs = API_FETCH_RETRY_DELAY_MS
 
 type RuntimeMode = BackendConfig["mode"] | "browser"
 
@@ -93,10 +99,6 @@ export function setBackendRuntime(next: Partial<RuntimeState>) {
   }
 }
 
-export function getBackendRuntime() {
-  return runtimeState
-}
-
 export function hasRuntimeCapability(capability: string) {
   if (!runtimeState.meta) {
     return runtimeState.mode === "browser" && capability === "local_file_proxy"
@@ -126,12 +128,80 @@ export function buildAuthHeaders(headers?: HeadersInit, bearerToken = runtimeSta
   return next
 }
 
+export function setApiFetchRetryDelayForTests(delayMs: number) {
+  apiFetchRetryDelayMs = Math.max(0, delayMs)
+}
+
+export function resetApiFetchRetryDelayForTests() {
+  apiFetchRetryDelayMs = API_FETCH_RETRY_DELAY_MS
+}
+
+export function isTransientBackendStatus(status: number) {
+  return TRANSIENT_BACKEND_STATUSES.has(status)
+}
+
+export function friendlyBackendErrorMessage(status?: number) {
+  if (status == null || isTransientBackendStatus(status)) {
+    return FRIENDLY_BACKEND_UNAVAILABLE_MESSAGE
+  }
+  return null
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === "AbortError"
+}
+
+function waitForRetryDelay(signal: AbortSignal | null | undefined) {
+  if (signal?.aborted) {
+    return Promise.reject(new DOMException("Aborted", "AbortError"))
+  }
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = () => signal?.removeEventListener("abort", handleAbort)
+    const timeout = setTimeout(() => {
+      cleanup()
+      resolve()
+    }, apiFetchRetryDelayMs)
+    const handleAbort = () => {
+      clearTimeout(timeout)
+      cleanup()
+      reject(new DOMException("Aborted", "AbortError"))
+    }
+    signal?.addEventListener("abort", handleAbort, { once: true })
+  })
+}
+
 export async function apiFetch(path: string, init: RequestInit = {}) {
-  return fetch(buildApiUrl(path), {
+  const request = {
     credentials: "include",
     ...init,
     headers: buildAuthHeaders(init.headers),
-  })
+  } satisfies RequestInit
+
+  for (let attempt = 1; attempt <= API_FETCH_MAX_ATTEMPTS; attempt++) {
+    try {
+      const response = await fetch(buildApiUrl(path), request)
+      if (
+        attempt < API_FETCH_MAX_ATTEMPTS &&
+        isTransientBackendStatus(response.status) &&
+        !init.signal?.aborted
+      ) {
+        await waitForRetryDelay(init.signal)
+        continue
+      }
+      return response
+    } catch (error) {
+      if (isAbortError(error) || init.signal?.aborted) {
+        throw error
+      }
+      if (attempt < API_FETCH_MAX_ATTEMPTS) {
+        await waitForRetryDelay(init.signal)
+        continue
+      }
+      throw new Error(FRIENDLY_BACKEND_UNAVAILABLE_MESSAGE)
+    }
+  }
+
+  throw new Error(FRIENDLY_BACKEND_UNAVAILABLE_MESSAGE)
 }
 
 async function parseJson<T>(response: Response): Promise<T> {
@@ -204,7 +274,7 @@ export async function saveDesktopAgentSettings(settings: AgentSettings) {
   return invokeDesktop<AgentSettingsUpdateResult>("set_agent_settings", { settings })
 }
 
-/** 检测本地 CLI/ACP runner 是否可用（运行 --version，超时 8s） */
+/** 检测本地 CLI/ACP runner 是否可用（运行 --version，超时 8s）；gemini_acp 仅兼容旧配置。 */
 export async function checkDesktopAgentCli(
   runner: "gemini_cli" | "gemini_acp" | "codex_cli" | "codex_acp" | "opencode_acp" | "multi-agent",
 ) {
@@ -216,38 +286,26 @@ export async function testDesktopOpenAiChannel(url: string, model: string, apiKe
   return invokeDesktop<CliCheckResult>("test_openai_channel", { url, model, apiKey })
 }
 
-// ── OpenRouter API Key 设置 ─────────────────────────────────────────────────
-
-/** 读取运行时覆盖层中的 OpenRouter API Key */
-export async function loadDesktopOpenRouterSettings() {
-  return invokeDesktop<OpenRouterSettings>("get_openrouter_settings")
-}
-
-/** 保存 OpenRouter API Keys 到运行时覆盖层，内置后端模式下立即重启生效 */
-export async function saveDesktopOpenRouterSettings(settings: OpenRouterSettings) {
-  return invokeDesktop<void>("set_openrouter_settings", { settings })
-}
-
 // ── FMP API Key 设置 ────────────────────────────────────────────────────────
 
-/** 读取运行时覆盖层中的 FMP API Keys */
+/** 读取 canonical config.yaml 中的 FMP API Keys */
 export async function loadDesktopFmpSettings() {
   return invokeDesktop<FmpSettings>("get_fmp_settings")
 }
 
-/** 保存 FMP API Keys 到运行时覆盖层，内置后端模式下立即重启生效 */
+/** 保存 FMP API Keys 到 canonical config.yaml，内置后端模式下立即重启生效 */
 export async function saveDesktopFmpSettings(settings: FmpSettings) {
   return invokeDesktop<void>("set_fmp_settings", { settings })
 }
 
 // ── Tavily API Key 设置 ─────────────────────────────────────────────────────
 
-/** 读取运行时覆盖层中的 Tavily API Keys */
+/** 读取 canonical config.yaml 中的 Tavily API Keys */
 export async function loadDesktopTavilySettings() {
   return invokeDesktop<TavilySettings>("get_tavily_settings")
 }
 
-/** 保存 Tavily API Keys 到运行时覆盖层，内置后端模式下立即重启生效 */
+/** 保存 Tavily API Keys 到 canonical config.yaml，内置后端模式下立即重启生效 */
 export async function saveDesktopTavilySettings(settings: TavilySettings) {
   return invokeDesktop<void>("set_tavily_settings", { settings })
 }

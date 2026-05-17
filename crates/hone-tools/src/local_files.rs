@@ -424,6 +424,10 @@ impl Tool for LocalSearchFilesTool {
             .pattern(args.get("glob").and_then(|v| v.as_str()))?;
         let lower_query = query.to_lowercase();
 
+        let mut skipped_binary_files = 0usize;
+        let mut skipped_non_utf8_files = 0usize;
+        let mut skipped_unreadable_files = 0usize;
+
         let matches = if let Ok((display_path, root, dir)) = self.access.resolve_directory(path) {
             let mut matches = Vec::new();
             'walk: for entry in WalkDir::new(&dir).follow_links(false) {
@@ -443,20 +447,44 @@ impl Tool for LocalSearchFilesTool {
                 if entry.metadata().map(|meta| meta.len()).unwrap_or(0) > MAX_SEARCH_FILE_BYTES {
                     continue;
                 }
-                let file = fs::File::open(entry.path())?;
-                let reader = BufReader::new(file);
-                for (index, line) in reader.lines().enumerate() {
-                    let line = line?;
-                    if line.contains('\0') {
-                        break;
+                let file = match fs::File::open(entry.path()) {
+                    Ok(file) => file,
+                    Err(_) => {
+                        skipped_unreadable_files += 1;
+                        continue;
                     }
+                };
+                let mut reader = BufReader::new(file);
+                let mut line_no = 0usize;
+                loop {
+                    let mut bytes = Vec::new();
+                    match reader.read_until(b'\n', &mut bytes) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => {
+                            skipped_unreadable_files += 1;
+                            continue 'walk;
+                        }
+                    }
+                    line_no += 1;
+                    if bytes.contains(&0) {
+                        skipped_binary_files += 1;
+                        continue 'walk;
+                    }
+                    let line = match String::from_utf8(bytes) {
+                        Ok(line) => line,
+                        Err(_) => {
+                            skipped_non_utf8_files += 1;
+                            continue 'walk;
+                        }
+                    };
                     if !line.to_lowercase().contains(&lower_query) {
                         continue;
                     }
                     let excerpt = truncate_chars(line.trim(), MAX_SEARCH_EXCERPT_CHARS);
                     matches.push(json!({
                         "path": rel,
-                        "line": index + 1,
+                        "line": line_no,
                         "excerpt": excerpt,
                     }));
                     if matches.len() >= max_results {
@@ -517,6 +545,9 @@ impl Tool for LocalSearchFilesTool {
             "matches": matches,
             "count": matches.len(),
             "truncated": matches.len() >= max_results,
+            "skipped_binary_files": skipped_binary_files,
+            "skipped_non_utf8_files": skipped_non_utf8_files,
+            "skipped_unreadable_files": skipped_unreadable_files,
         }))
     }
 }
@@ -838,7 +869,7 @@ mod tests {
         fs::create_dir_all(root.join("uploads")).expect("uploads dir");
         fs::write(
             root.join("company_profiles/aaoi/profile.md"),
-            "# AAOI\n\nTicker: AAOI\n\nThesis: optics vendor\n",
+            "# AAOI\n\nTicker: AAOI\n\n投资主线: optics vendor\n",
         )
         .expect("write profile");
         fs::write(
@@ -936,6 +967,31 @@ mod tests {
     }
 
     #[test]
+    fn directory_search_skips_non_text_files_without_aborting() {
+        let base = setup_sandbox();
+        let root = actor_root(&base);
+        fs::write(root.join("uploads/bad-encoding.txt"), [0xff, b'\n']).expect("bad utf8");
+        fs::write(root.join("uploads/blob.bin"), [0, b'A', b'A', b'O', b'I']).expect("binary");
+        fs::write(
+            root.join("uploads/hit.txt"),
+            "AAOI hit zone is 12-14\nsecond line\n",
+        )
+        .expect("hit");
+        let search_tool = LocalSearchFilesTool::new(base.clone(), actor());
+
+        let search = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(search_tool.execute(json!({"query":"hit zone","path":"uploads"})))
+            .expect("search should skip bad files");
+        assert_eq!(search["matches"][0]["path"], "uploads/hit.txt");
+        assert_eq!(search["matches"][0]["line"], 1);
+        assert_eq!(search["skipped_binary_files"], 1);
+        assert_eq!(search["skipped_non_utf8_files"], 1);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn read_truncates_default_window() {
         let base = setup_sandbox();
         let root = actor_root(&base);
@@ -952,7 +1008,7 @@ mod tests {
             .expect("read");
         assert_eq!(read["start_line"], 1);
         assert_eq!(read["end_line"], 200);
-        assert_eq!(read["truncated"], true);
+        assert_eq!(read["truncated"].as_bool(), Some(true));
 
         let _ = fs::remove_dir_all(base);
     }

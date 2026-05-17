@@ -2,17 +2,24 @@ use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::Json;
 use axum::extract::{Multipart, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response, sse::Event, sse::KeepAlive, sse::Sse};
+use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::warn;
 use uuid::Uuid;
 
-use hone_core::ActorIdentity;
+use hone_channels::agent_session::{
+    AgentRunOptions, AgentRunQuotaMode, AgentSession, AgentSessionEvent, AgentSessionListener,
+};
+use hone_channels::prompt::PromptOptions;
+use hone_channels::run_event::RunEvent;
+use hone_core::{ActorIdentity, HoneError};
 use hone_memory::WebSessionAuthResult;
 
 use crate::public_auth::PublicAuthLimitStatus;
@@ -20,8 +27,8 @@ use crate::routes::chat::build_chat_sse;
 use crate::routes::history::history_from_messages;
 use crate::state::{AppState, PushEvent};
 use crate::types::{
-    PublicAuthUserInfo, PublicChangePasswordRequest, PublicChatRequest, PublicInviteLoginRequest,
-    PublicPasswordLoginRequest, PublicSetPasswordRequest, PublicUploadedAttachment,
+    PublicAuthUserInfo, PublicChatRequest, PublicSmsLoginRequest, PublicSmsSendRequest,
+    PublicUploadedAttachment,
 };
 
 /// Upper bounds enforced when users upload files through the public chat.
@@ -39,128 +46,76 @@ const SESSION_TTL_DAYS_SHORT: i64 = hone_memory::SESSION_TTL_DAYS_SHORT;
 
 /// 当前生效的协议版本。改动 /terms /privacy 文本时手动 bump,
 /// 并让已登录用户重新勾选接受(可后续增强)。
-pub(crate) const TOS_VERSION: &str = "1.0";
+pub(crate) const TOS_VERSION: &str = "2.0";
 
-fn validate_password_strength(value: &str) -> Result<(), &'static str> {
-    if !(8..=128).contains(&value.chars().count()) {
-        return Err("密码长度需在 8-128 之间");
-    }
-    let has_digit = value.chars().any(|ch| ch.is_ascii_digit());
-    let has_letter = value.chars().any(|ch| ch.is_ascii_alphabetic());
-    if !(has_digit && has_letter) {
-        return Err("密码需同时包含字母和数字");
-    }
-    Ok(())
+pub(crate) async fn handle_captcha_config() -> Response {
+    Json(crate::aliyun_captcha::AliyunCaptchaConfig::public_config_from_env()).into_response()
 }
 
-pub(crate) async fn handle_invite_login(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(request): Json<PublicInviteLoginRequest>,
-) -> Response {
-    let invite_code = request
-        .invite_code
-        .as_deref()
-        .map(normalize_invite_code)
-        .filter(|value| !value.is_empty());
-    let Some(invite_code) = invite_code else {
-        return crate::routes::json_error(StatusCode::BAD_REQUEST, "缺少邀请码");
-    };
-    let phone_number = match crate::routes::require_phone_number(request.phone_number, "手机号")
-    {
-        Ok(phone_number) => phone_number,
-        Err(response) => return response,
-    };
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAiChatCompletionRequest {
+    pub model: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<OpenAiChatMessage>,
+    #[serde(default)]
+    pub stream: bool,
+}
 
-    // Rate-limit by phone number + IP (best-effort). The phone number comes
-    // from the request body, but it still helps throttle attempts that target
-    // a known phone number even if the IP headers are spoofed.
-    let ip_key = public_client_key(&headers);
-    let phone_key = format!("phone:{phone_number}");
-    for key in [&ip_key, &phone_key] {
-        if let PublicAuthLimitStatus::Blocked { retry_after_secs } =
-            state.public_auth_limiter.check(key)
-        {
-            return json_rate_limited(retry_after_secs);
-        }
-    }
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAiChatMessage {
+    pub role: String,
+    pub content: serde_json::Value,
+}
 
-    match state
-        .web_auth
-        .create_session_for_invite(&invite_code, &phone_number)
-    {
-        Ok(Some(session)) => {
-            state.public_auth_limiter.record_success(&ip_key);
-            state.public_auth_limiter.record_success(&phone_key);
-            match state.web_auth.find_invite_user(&session.user_id) {
-                Ok(Some(user)) => {
-                    let user_id = user.user_id.clone();
-                    let mut response = Json(json!({
-                        "user": to_public_auth_user(&state, &user_id, user),
-                    }))
-                    .into_response();
-                    response.headers_mut().append(
-                        header::SET_COOKIE,
-                        build_session_cookie(
-                            &session.session_token,
-                            &headers,
-                            WEB_SESSION_MAX_AGE_LONG_SECS,
-                        ),
-                    );
-                    response
-                }
-                Ok(None) => {
-                    crate::routes::json_error(StatusCode::INTERNAL_SERVER_ERROR, "邀请码用户不存在")
-                }
-                Err(error) => crate::routes::json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("读取邀请码用户失败: {error}"),
-                ),
-            }
-        }
-        Ok(None) => {
-            let mut rate_limited_response = None;
-            for key in [&ip_key, &phone_key] {
-                if let Some(retry_after_secs) = state.public_auth_limiter.record_failure(key) {
-                    rate_limited_response = Some(json_rate_limited(retry_after_secs));
-                }
-            }
-            if let Some(response) = rate_limited_response {
+struct OpenAiStreamListener {
+    tx: tokio::sync::mpsc::Sender<String>,
+    id: String,
+    model: String,
+    created: i64,
+}
+
+#[async_trait]
+impl AgentSessionListener for OpenAiStreamListener {
+    async fn on_event(&self, event: AgentSessionEvent) {
+        let content = match event {
+            AgentSessionEvent::Segment { text } => Some(text),
+            AgentSessionEvent::Run(RunEvent::StreamDelta { content }) => Some(content),
+            AgentSessionEvent::Done { response } if !response.success => Some(
                 response
-            } else {
-                crate::routes::json_error(
-                    StatusCode::UNAUTHORIZED,
-                    "邀请码或手机号不正确，或邀请码已失效",
-                )
-            }
+                    .error
+                    .unwrap_or_else(|| "Hone Cloud run failed".to_string()),
+            ),
+            _ => None,
+        };
+        if let Some(content) = content.filter(|value| !value.is_empty()) {
+            let _ = self
+                .tx
+                .send(openai_stream_chunk(
+                    &self.id,
+                    &self.model,
+                    self.created,
+                    Some(&content),
+                    None,
+                ))
+                .await;
         }
-        Err(error) => crate::routes::json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("邀请码登录失败: {error}"),
-        ),
     }
 }
 
-pub(crate) async fn handle_password_login(
+pub(crate) async fn handle_sms_send_code(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<PublicPasswordLoginRequest>,
+    Json(request): Json<PublicSmsSendRequest>,
 ) -> Response {
     let phone_number = match crate::routes::require_phone_number(request.phone_number, "手机号")
     {
         Ok(value) => value,
         Err(response) => return response,
     };
-    let password = request
-        .password
-        .map(|value| value.to_string())
-        .unwrap_or_default();
-    if password.is_empty() {
-        return crate::routes::json_error(StatusCode::BAD_REQUEST, "缺少密码");
-    }
+    let sms_phone_number = aliyun_sms_phone_number(&phone_number);
 
     let ip_key = public_client_key(&headers);
-    let phone_key = format!("phone:{phone_number}");
+    let phone_key = format!("sms-send:{sms_phone_number}");
     for key in [&ip_key, &phone_key] {
         if let PublicAuthLimitStatus::Blocked { retry_after_secs } =
             state.public_auth_limiter.check(key)
@@ -169,31 +124,128 @@ pub(crate) async fn handle_password_login(
         }
     }
 
-    let user = match state.web_auth.find_by_phone_password_ready(&phone_number) {
+    if crate::aliyun_captcha::AliyunCaptchaConfig::public_config_from_env().enabled {
+        let captcha_verify_param = request.captcha_verify_param.unwrap_or_default();
+        match crate::aliyun_captcha::verify_captcha(&state.http_client, &captcha_verify_param).await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = state.public_auth_limiter.record_failure(&ip_key);
+                return crate::routes::json_error(StatusCode::FORBIDDEN, "请先完成图形验证");
+            }
+            Err(error) => {
+                warn!("aliyun captcha verification failed: {error}");
+                return captcha_provider_error_response("图形验证服务暂不可用", error);
+            }
+        }
+    }
+
+    let user = match find_active_invite_user_by_sms_phone(&state, &phone_number) {
         Ok(value) => value,
         Err(error) => {
             return crate::routes::json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("查询用户失败: {error}"),
+                format!("查询白名单失败: {error}"),
+            );
+        }
+    };
+    if user.is_none() {
+        let _ = state.public_auth_limiter.record_failure(&phone_key);
+        return crate::routes::json_error(
+            StatusCode::FORBIDDEN,
+            "目前是邀请制，请联系 bm@hone-claw.com 加入白名单",
+        );
+    }
+
+    match crate::aliyun_sms::send_verify_code(&state.http_client, &sms_phone_number).await {
+        Ok(()) => {
+            state.public_auth_limiter.record_success(&phone_key);
+            Json(json!({ "ok": true })).into_response()
+        }
+        Err(error) => sms_provider_error_response("发送验证码失败", error),
+    }
+}
+
+pub(crate) async fn handle_sms_login(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<PublicSmsLoginRequest>,
+) -> Response {
+    let phone_number = match crate::routes::require_phone_number(request.phone_number, "手机号")
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let sms_phone_number = aliyun_sms_phone_number(&phone_number);
+    let verify_code = request
+        .verify_code
+        .unwrap_or_default()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    if !(4..=8).contains(&verify_code.len()) {
+        return crate::routes::json_error(StatusCode::BAD_REQUEST, "验证码格式不正确");
+    }
+    let tos_version = request.tos_version.unwrap_or_default();
+    if tos_version.trim().is_empty() {
+        return crate::routes::json_error(StatusCode::BAD_REQUEST, "需同意用户协议与隐私政策");
+    }
+    if tos_version.trim() != TOS_VERSION {
+        return crate::routes::json_error(
+            StatusCode::BAD_REQUEST,
+            "协议版本已更新，请刷新页面后重新确认",
+        );
+    }
+
+    let ip_key = public_client_key(&headers);
+    let phone_key = format!("sms-login:{sms_phone_number}");
+    for key in [&ip_key, &phone_key] {
+        if let PublicAuthLimitStatus::Blocked { retry_after_secs } =
+            state.public_auth_limiter.check(key)
+        {
+            return json_rate_limited(retry_after_secs);
+        }
+    }
+
+    let user = match find_active_invite_user_by_sms_phone(&state, &phone_number) {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            let _ = state.public_auth_limiter.record_failure(&phone_key);
+            return crate::routes::json_error(
+                StatusCode::FORBIDDEN,
+                "目前是邀请制，请联系 bm@hone-claw.com 加入白名单",
+            );
+        }
+        Err(error) => {
+            return crate::routes::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("查询白名单失败: {error}"),
             );
         }
     };
 
-    let Some(user) = user else {
-        return password_login_failed(&state, &ip_key, &phone_key);
-    };
-    let hash = user.password_hash.as_deref().unwrap_or_default();
-    let verified = match hone_memory::password::verify_password(&password, hash) {
+    let verified = match crate::aliyun_sms::check_verify_code(
+        &state.http_client,
+        &sms_phone_number,
+        &verify_code,
+    )
+    .await
+    {
         Ok(value) => value,
-        Err(error) => {
-            return crate::routes::json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("验证密码失败: {error}"),
-            );
-        }
+        Err(error) => return sms_provider_error_response("核验验证码失败", error),
     };
     if !verified {
-        return password_login_failed(&state, &ip_key, &phone_key);
+        return sms_login_failed(&state, &ip_key, &phone_key);
+    }
+
+    if let Err(error) = state
+        .web_auth
+        .record_tos_acceptance(&user.user_id, TOS_VERSION)
+    {
+        return crate::routes::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("记录协议接受失败: {error}"),
+        );
     }
 
     let ttl_days = if request.remember {
@@ -248,7 +300,45 @@ pub(crate) async fn handle_password_login(
     response
 }
 
-fn password_login_failed(state: &AppState, ip_key: &str, phone_key: &str) -> Response {
+fn aliyun_sms_phone_number(phone_number: &str) -> String {
+    strip_china_country_code(phone_number).unwrap_or_else(|| phone_number.to_string())
+}
+
+fn public_sms_phone_candidates(phone_number: &str) -> Vec<String> {
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(local_number) = strip_china_country_code(phone_number) {
+        candidates.push(local_number);
+    }
+    if !candidates.iter().any(|candidate| candidate == phone_number) {
+        candidates.push(phone_number.to_string());
+    }
+    candidates
+}
+
+fn strip_china_country_code(phone_number: &str) -> Option<String> {
+    phone_number
+        .strip_prefix("+86")
+        .filter(|local_number| local_number.chars().all(|ch| ch.is_ascii_digit()))
+        .filter(|local_number| (6..=20).contains(&local_number.len()))
+        .map(ToString::to_string)
+}
+
+fn find_active_invite_user_by_sms_phone(
+    state: &AppState,
+    phone_number: &str,
+) -> Result<Option<hone_memory::WebInviteUser>, HoneError> {
+    for candidate in public_sms_phone_candidates(phone_number) {
+        if let Some(user) = state
+            .web_auth
+            .find_active_invite_user_by_phone(&candidate)?
+        {
+            return Ok(Some(user));
+        }
+    }
+    Ok(None)
+}
+
+fn sms_login_failed(state: &AppState, ip_key: &str, phone_key: &str) -> Response {
     let mut rate_limited = None;
     for key in [ip_key, phone_key] {
         if let Some(retry_after_secs) = state.public_auth_limiter.record_failure(key) {
@@ -256,157 +346,38 @@ fn password_login_failed(state: &AppState, ip_key: &str, phone_key: &str) -> Res
         }
     }
     rate_limited.unwrap_or_else(|| {
-        crate::routes::json_error(StatusCode::UNAUTHORIZED, "手机号或密码不正确")
+        crate::routes::json_error(StatusCode::UNAUTHORIZED, "验证码不正确或已过期")
     })
 }
 
-pub(crate) async fn handle_set_password(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(request): Json<PublicSetPasswordRequest>,
-) -> Response {
-    let user = match require_public_user(&state, &headers) {
-        Ok(user) => user,
-        Err(response) => return response,
-    };
-    if user.password_hash.is_some() {
-        return crate::routes::json_error(
-            StatusCode::CONFLICT,
-            "账号已设置过密码，请走修改密码流程",
-        );
-    }
-    let new_password = request.new_password.unwrap_or_default();
-    if let Err(msg) = validate_password_strength(&new_password) {
-        return crate::routes::json_error(StatusCode::BAD_REQUEST, msg);
-    }
-    let tos_version = request.tos_version.unwrap_or_default();
-    if tos_version.trim().is_empty() {
-        return crate::routes::json_error(StatusCode::BAD_REQUEST, "需同意用户协议与隐私政策");
-    }
-    if tos_version.trim() != TOS_VERSION {
-        return crate::routes::json_error(
-            StatusCode::BAD_REQUEST,
-            "协议版本已更新，请刷新页面后重新确认",
-        );
-    }
-
-    let hash = match hone_memory::password::hash_password(&new_password) {
-        Ok(value) => value,
-        Err(error) => {
-            return crate::routes::json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("密码加密失败: {error}"),
-            );
-        }
-    };
-    let updated = match state
-        .web_auth
-        .set_password(&user.user_id, &hash, TOS_VERSION)
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return crate::routes::json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("保存密码失败: {error}"),
-            );
-        }
-    };
-    if !updated {
-        return crate::routes::json_error(StatusCode::CONFLICT, "账号状态异常，请重新登录");
-    }
-
-    // 轮换 session token 防会话固定。保留原 TTL(设密码过程发生在已登录
-    // session 内,而这一次的 session 还是邀请码走 long TTL 建立的,这里保持
-    // long)。
-    let session = match state
-        .web_auth
-        .create_session_for_user(&user.user_id, SESSION_TTL_DAYS_LONG)
-    {
-        Ok(Some(session)) => session,
-        Ok(None) => {
-            return crate::routes::json_error(StatusCode::INTERNAL_SERVER_ERROR, "刷新登录态失败");
-        }
-        Err(error) => {
-            return crate::routes::json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("刷新登录态失败: {error}"),
-            );
-        }
-    };
-    let refreshed = state
-        .web_auth
-        .find_invite_user(&session.user_id)
-        .ok()
-        .flatten();
-    let body = match refreshed {
-        Some(user) => {
-            let user_id = user.user_id.clone();
-            json!({ "user": to_public_auth_user(&state, &user_id, user) })
-        }
-        None => json!({ "ok": true }),
-    };
-    let mut response = Json(body).into_response();
-    response.headers_mut().append(
-        header::SET_COOKIE,
-        build_session_cookie(
-            &session.session_token,
-            &headers,
-            WEB_SESSION_MAX_AGE_LONG_SECS,
+fn sms_provider_error_response(prefix: &str, error: crate::aliyun_sms::AliyunSmsError) -> Response {
+    match error.kind {
+        crate::aliyun_sms::AliyunSmsErrorKind::Config => crate::routes::json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{prefix}: 短信服务未配置"),
         ),
-    );
-    response
+        crate::aliyun_sms::AliyunSmsErrorKind::Transport => {
+            crate::routes::json_error(StatusCode::BAD_GATEWAY, format!("{prefix}: {error}"))
+        }
+        crate::aliyun_sms::AliyunSmsErrorKind::Provider => {
+            crate::routes::json_error(StatusCode::BAD_GATEWAY, format!("{prefix}: {error}"))
+        }
+    }
 }
 
-pub(crate) async fn handle_change_password(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(request): Json<PublicChangePasswordRequest>,
+fn captcha_provider_error_response(
+    prefix: &str,
+    error: crate::aliyun_captcha::AliyunCaptchaError,
 ) -> Response {
-    let user = match require_public_user(&state, &headers) {
-        Ok(user) => user,
-        Err(response) => return response,
-    };
-    let current_password = request.current_password.unwrap_or_default();
-    let new_password = request.new_password.unwrap_or_default();
-    let Some(existing_hash) = user.password_hash.clone() else {
-        return crate::routes::json_error(StatusCode::CONFLICT, "账号尚未设置密码");
-    };
-
-    let verified = match hone_memory::password::verify_password(&current_password, &existing_hash) {
-        Ok(value) => value,
-        Err(error) => {
-            return crate::routes::json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("验证密码失败: {error}"),
-            );
-        }
-    };
-    if !verified {
-        return crate::routes::json_error(StatusCode::UNAUTHORIZED, "当前密码不正确");
-    }
-    if let Err(msg) = validate_password_strength(&new_password) {
-        return crate::routes::json_error(StatusCode::BAD_REQUEST, msg);
-    }
-    if new_password == current_password {
-        return crate::routes::json_error(StatusCode::BAD_REQUEST, "新密码不能与当前密码相同");
-    }
-
-    let new_hash = match hone_memory::password::hash_password(&new_password) {
-        Ok(value) => value,
-        Err(error) => {
-            return crate::routes::json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("密码加密失败: {error}"),
-            );
-        }
-    };
-    match state.web_auth.change_password(&user.user_id, &new_hash) {
-        Ok(true) => Json(json!({ "ok": true })).into_response(),
-        Ok(false) => crate::routes::json_error(StatusCode::CONFLICT, "账号状态异常，请重新登录"),
-        Err(error) => crate::routes::json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("保存新密码失败: {error}"),
+    match error.kind {
+        crate::aliyun_captcha::AliyunCaptchaErrorKind::Config => crate::routes::json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{prefix}: 配置缺失"),
         ),
+        crate::aliyun_captcha::AliyunCaptchaErrorKind::Transport
+        | crate::aliyun_captcha::AliyunCaptchaErrorKind::Provider => {
+            crate::routes::json_error(StatusCode::BAD_GATEWAY, prefix)
+        }
     }
 }
 
@@ -495,6 +466,57 @@ pub(crate) async fn handle_chat(
     let combined_message = compose_message_with_attachments(&message, &validated_paths);
 
     build_chat_sse(state, Ok(actor), combined_message, attachments_count).into_response()
+}
+
+pub(crate) async fn handle_openai_chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<OpenAiChatCompletionRequest>,
+) -> Response {
+    let user = match require_public_api_key_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let actor = match ActorIdentity::new("web", &user.user_id, Option::<String>::None) {
+        Ok(actor) => actor,
+        Err(error) => return crate::routes::json_error(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    let message = match last_openai_user_message(&request.messages) {
+        Some(message) if !message.trim().is_empty() => message.trim().to_string(),
+        _ => return crate::routes::json_error(StatusCode::BAD_REQUEST, "messages 缺少 user 内容"),
+    };
+    let model = request
+        .model
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("hone-cloud")
+        .trim()
+        .to_string();
+
+    if request.stream {
+        build_openai_chat_sse(state, actor, message, model).into_response()
+    } else {
+        let content = match run_public_api_chat_once(state, actor, message).await {
+            Ok(content) => content,
+            Err(response) => return response,
+        };
+        let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+        Json(json!({
+            "id": id,
+            "object": "chat.completion",
+            "created": chrono::Utc::now().timestamp(),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                },
+                "finish_reason": "stop",
+            }],
+        }))
+        .into_response()
+    }
 }
 
 pub(crate) async fn handle_upload(
@@ -818,6 +840,38 @@ pub(crate) fn require_public_user(
     }
 }
 
+fn require_public_api_key_user(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<hone_memory::WebInviteUser, Response> {
+    let Some(api_key) = read_bearer_token(headers) else {
+        return Err(crate::routes::json_error(
+            StatusCode::UNAUTHORIZED,
+            "缺少 Authorization: Bearer API Key",
+        ));
+    };
+    match state.web_auth.find_invite_user_by_api_key(&api_key) {
+        Ok(Some(user)) => Ok(user),
+        Ok(None) => Err(crate::routes::json_error(
+            StatusCode::FORBIDDEN,
+            "API Key 无效或已停用",
+        )),
+        Err(error) => Err(crate::routes::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("验证 API Key 失败: {error}"),
+        )),
+    }
+}
+
+fn read_bearer_token(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    raw.strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 fn read_session_token(headers: &HeaderMap) -> Option<String> {
     let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
     cookies.split(';').find_map(|item| {
@@ -829,6 +883,175 @@ fn read_session_token(headers: &HeaderMap) -> Option<String> {
             None
         }
     })
+}
+
+fn last_openai_user_message(messages: &[OpenAiChatMessage]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| openai_content_to_text(&message.content))
+}
+
+fn openai_content_to_text(content: &serde_json::Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    if let Some(parts) = content.as_array() {
+        return parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    String::new()
+}
+
+async fn run_public_api_chat_once(
+    state: Arc<AppState>,
+    actor: ActorIdentity,
+    message: String,
+) -> Result<String, Response> {
+    if let Some(reply) = state
+        .core
+        .try_handle_intercept_command(&actor, &message)
+        .await
+    {
+        return Ok(reply);
+    }
+    let prompt_options = PromptOptions {
+        is_admin: state.core.is_admin_actor(&actor),
+        ..PromptOptions::default()
+    };
+    let session = AgentSession::new(state.core.clone(), actor.clone(), actor.user_id.clone())
+        .with_restore_max_messages(None)
+        .with_prompt_options(prompt_options)
+        .with_recv_extra(Some("openai_compatible_api=true".to_string()));
+    let run_options = AgentRunOptions {
+        timeout: Some(state.core.config.agent.overall_timeout()),
+        segmenter: None,
+        quota_mode: AgentRunQuotaMode::UserConversation,
+        model_override: None,
+    };
+    let result = session.run(&message, run_options).await;
+    if result.response.success {
+        Ok(result.response.content)
+    } else {
+        Err(crate::routes::json_error(
+            StatusCode::BAD_GATEWAY,
+            result
+                .response
+                .error
+                .unwrap_or_else(|| "Hone Cloud run failed".to_string()),
+        ))
+    }
+}
+
+fn build_openai_chat_sse(
+    state: Arc<AppState>,
+    actor: ActorIdentity,
+    message: String,
+    model: String,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+    let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+    let created = chrono::Utc::now().timestamp();
+    tokio::spawn(async move {
+        if let Some(reply) = state
+            .core
+            .try_handle_intercept_command(&actor, &message)
+            .await
+        {
+            let _ = tx
+                .send(openai_stream_chunk(
+                    &id,
+                    &model,
+                    created,
+                    Some(&reply),
+                    None,
+                ))
+                .await;
+            let _ = tx
+                .send(openai_stream_chunk(
+                    &id,
+                    &model,
+                    created,
+                    None,
+                    Some("stop"),
+                ))
+                .await;
+            let _ = tx.send("[DONE]".to_string()).await;
+            return;
+        }
+        let prompt_options = PromptOptions {
+            is_admin: state.core.is_admin_actor(&actor),
+            ..PromptOptions::default()
+        };
+        let mut session =
+            AgentSession::new(state.core.clone(), actor.clone(), actor.user_id.clone())
+                .with_restore_max_messages(None)
+                .with_prompt_options(prompt_options)
+                .with_recv_extra(Some("openai_compatible_api=true".to_string()));
+        session.add_listener(Arc::new(OpenAiStreamListener {
+            tx: tx.clone(),
+            id: id.clone(),
+            model: model.clone(),
+            created,
+        }));
+        let run_options = AgentRunOptions {
+            timeout: Some(state.core.config.agent.overall_timeout()),
+            segmenter: None,
+            quota_mode: AgentRunQuotaMode::UserConversation,
+            model_override: None,
+        };
+        let result = session.run(&message, run_options).await;
+        let finish = if result.response.success {
+            "stop"
+        } else {
+            "error"
+        };
+        let _ = tx
+            .send(openai_stream_chunk(
+                &id,
+                &model,
+                created,
+                None,
+                Some(finish),
+            ))
+            .await;
+        let _ = tx.send("[DONE]".to_string()).await;
+    });
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+        .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn openai_stream_chunk(
+    id: &str,
+    model: &str,
+    created: i64,
+    content: Option<&str>,
+    finish_reason: Option<&str>,
+) -> String {
+    let delta = content
+        .map(|text| json!({ "content": text }))
+        .unwrap_or_else(|| json!({}));
+    json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason,
+        }],
+    })
+    .to_string()
 }
 
 fn build_session_cookie(
@@ -925,15 +1148,6 @@ fn forwarded_proto_is_https(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-fn normalize_invite_code(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>()
-        .trim()
-        .to_uppercase()
-}
-
 fn public_client_key(headers: &HeaderMap) -> String {
     if let Some(forwarded_for) = headers
         .get("x-forwarded-for")
@@ -957,7 +1171,7 @@ fn public_client_key(headers: &HeaderMap) -> String {
 fn json_rate_limited(retry_after_secs: u64) -> Response {
     let mut response = crate::routes::json_error(
         StatusCode::TOO_MANY_REQUESTS,
-        format!("邀请码尝试过于频繁，请在 {} 秒后重试", retry_after_secs),
+        format!("登录尝试过于频繁，请在 {} 秒后重试", retry_after_secs),
     );
     if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
         response.headers_mut().insert(header::RETRY_AFTER, value);
@@ -1009,8 +1223,8 @@ fn to_public_auth_user(
 #[cfg(test)]
 mod tests {
     use super::{
-        WEB_SESSION_MAX_AGE_LONG_SECS, WEB_SESSION_MAX_AGE_SHORT_SECS, build_session_cookie,
-        clear_session_cookie, normalize_invite_code, public_client_key, validate_password_strength,
+        WEB_SESSION_MAX_AGE_LONG_SECS, WEB_SESSION_MAX_AGE_SHORT_SECS, aliyun_sms_phone_number,
+        build_session_cookie, clear_session_cookie, public_client_key, public_sms_phone_candidates,
     };
     use axum::http::{HeaderMap, HeaderValue, header};
     const SECURE_COOKIE_ENV: &str = "HONE_PUBLIC_SECURE_COOKIE";
@@ -1046,11 +1260,6 @@ mod tests {
     }
 
     #[test]
-    fn invite_code_normalization_removes_spaces_and_uppercases() {
-        assert_eq!(normalize_invite_code(" hone-abc 123 \n"), "HONE-ABC123");
-    }
-
-    #[test]
     fn secure_cookie_is_enabled_for_https_origin() {
         let _guard = crate::test_env_lock().lock().unwrap();
         let _env = EnvVarGuard::unset(SECURE_COOKIE_ENV);
@@ -1078,6 +1287,20 @@ mod tests {
             HeaderValue::from_static("203.0.113.9, 10.0.0.2"),
         );
         assert_eq!(public_client_key(&headers), "ip:203.0.113.9");
+    }
+
+    #[test]
+    fn sms_phone_candidates_accept_plus_86_and_local_numbers() {
+        assert_eq!(
+            public_sms_phone_candidates("+8613871396421"),
+            vec!["13871396421".to_string(), "+8613871396421".to_string()]
+        );
+        assert_eq!(
+            public_sms_phone_candidates("13871396421"),
+            vec!["13871396421".to_string()]
+        );
+        assert_eq!(aliyun_sms_phone_number("+8613871396421"), "13871396421");
+        assert_eq!(aliyun_sms_phone_number("13871396421"), "13871396421");
     }
 
     #[test]
@@ -1129,18 +1352,6 @@ mod tests {
         assert!(short_cookie.contains(&format!("Max-Age={WEB_SESSION_MAX_AGE_SHORT_SECS}")));
         assert_eq!(WEB_SESSION_MAX_AGE_SHORT_SECS, 86_400);
         assert_eq!(WEB_SESSION_MAX_AGE_LONG_SECS, 30 * 86_400);
-    }
-
-    #[test]
-    fn password_strength_rules() {
-        assert!(validate_password_strength("abc12345").is_ok());
-        assert!(validate_password_strength("abcdefgh").is_err(), "no digit");
-        assert!(validate_password_strength("12345678").is_err(), "no letter");
-        assert!(validate_password_strength("aB1").is_err(), "too short");
-        assert!(
-            validate_password_strength(&"a1".repeat(70)).is_err(),
-            "too long"
-        );
     }
 
     #[test]

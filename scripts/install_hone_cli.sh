@@ -122,6 +122,22 @@ pick_bin_dir() {
 
 BIN_DIR="$(pick_bin_dir)"
 
+ensure_bin_dir_ready() {
+  local dir="$1"
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    echo "failed to create wrapper bin dir: $dir" >&2
+    echo "set HONE_BIN_DIR to a writable directory or add a writable user bin directory to PATH" >&2
+    exit 1
+  fi
+  if [[ ! -w "$dir" ]]; then
+    echo "wrapper bin dir is not writable: $dir" >&2
+    echo "set HONE_BIN_DIR to a writable directory or adjust directory permissions" >&2
+    exit 1
+  fi
+}
+
+ensure_bin_dir_ready "$BIN_DIR"
+
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH_RAW="$(uname -m)"
 
@@ -181,12 +197,50 @@ PY
 
 download_file
 
-TOP_DIR="$(
-  tar -tzf "$ARCHIVE_PATH" | {
-    IFS= read -r first_entry || true
-    printf '%s\n' "${first_entry%%/*}"
-  }
-)"
+validate_archive_layout() {
+  local archive_path="$1"
+  local listing
+  if ! listing="$(tar -tzf "$archive_path")"; then
+    echo "failed to inspect archive layout: $archive_path" >&2
+    exit 1
+  fi
+
+  local top_dir=""
+  local entry
+  while IFS= read -r entry; do
+    if [[ -z "$entry" ]]; then
+      continue
+    fi
+
+    case "$entry" in
+      /*|../*|*/../*|*/..|.|..)
+        echo "release asset contains unsafe archive path: $entry" >&2
+        echo "downloaded asset: $DOWNLOAD_URL" >&2
+        exit 1
+        ;;
+    esac
+
+    local entry_top="${entry%%/*}"
+    if [[ -z "$entry_top" || "$entry_top" == "." || "$entry_top" == ".." ]]; then
+      echo "release asset contains unsafe archive path: $entry" >&2
+      echo "downloaded asset: $DOWNLOAD_URL" >&2
+      exit 1
+    fi
+
+    if [[ -z "$top_dir" ]]; then
+      top_dir="$entry_top"
+    elif [[ "$entry_top" != "$top_dir" ]]; then
+      echo "release asset must contain exactly one top-level bundle directory" >&2
+      echo "found top-level entries: $top_dir and $entry_top" >&2
+      echo "downloaded asset: $DOWNLOAD_URL" >&2
+      exit 1
+    fi
+  done <<< "$listing"
+
+  printf '%s\n' "$top_dir"
+}
+
+TOP_DIR="$(validate_archive_layout "$ARCHIVE_PATH")"
 if [[ -z "$TOP_DIR" ]]; then
   echo "failed to inspect archive layout: $ARCHIVE_PATH" >&2
   exit 1
@@ -194,9 +248,36 @@ fi
 
 RELEASES_DIR="$INSTALL_ROOT/releases"
 DEST_DIR="$RELEASES_DIR/$TOP_DIR"
-mkdir -p "$RELEASES_DIR" "$BIN_DIR"
+mkdir -p "$RELEASES_DIR"
 rm -rf "$DEST_DIR"
 tar -xzf "$ARCHIVE_PATH" -C "$RELEASES_DIR"
+
+require_regular_bundle_file() {
+  local relative_path="$1"
+  local full_path="$DEST_DIR/$relative_path"
+
+  if [[ ! -e "$full_path" ]]; then
+    echo "release asset is missing required bundle path: $relative_path" >&2
+    echo "downloaded asset: $DOWNLOAD_URL" >&2
+    exit 1
+  fi
+  if [[ -L "$full_path" || ! -f "$full_path" ]]; then
+    echo "release asset required bundle path must be a regular file: $relative_path" >&2
+    echo "downloaded asset: $DOWNLOAD_URL" >&2
+    exit 1
+  fi
+}
+
+require_regular_bundle_file "bin/hone-cli"
+if [[ ! -x "$DEST_DIR/bin/hone-cli" ]]; then
+  echo "release asset required CLI binary is not executable: bin/hone-cli" >&2
+  echo "downloaded asset: $DOWNLOAD_URL" >&2
+  exit 1
+fi
+require_regular_bundle_file "share/honeclaw/config.example.yaml"
+require_regular_bundle_file "share/honeclaw/soul.md"
+require_regular_bundle_file "share/honeclaw/web/index.html"
+require_regular_bundle_file "share/honeclaw/web-public/index.html"
 
 CURRENT_LINK="$INSTALL_ROOT/current"
 ln -sfn "$DEST_DIR" "$CURRENT_LINK"
@@ -223,6 +304,13 @@ export HONE_USER_CONFIG_PATH="${HONE_USER_CONFIG_PATH:-$HONE_HOME/config.yaml}"
 export HONE_DATA_DIR="${HONE_DATA_DIR:-$HONE_HOME/data}"
 export HONE_SKILLS_DIR="${HONE_SKILLS_DIR:-$CURRENT_ROOT/share/honeclaw/skills}"
 export HONE_WEB_DIST_DIR="${HONE_WEB_DIST_DIR:-$CURRENT_ROOT/share/honeclaw/web}"
+export HONE_PUBLIC_WEB_DIST_DIR="${HONE_PUBLIC_WEB_DIST_DIR:-$CURRENT_ROOT/share/honeclaw/web-public}"
+
+if [[ ! -x "$CURRENT_ROOT/bin/hone-cli" ]]; then
+  echo "installed Hone CLI binary is missing: $CURRENT_ROOT/bin/hone-cli" >&2
+  echo "rerun the Hone installer or restore the current release bundle under $CURRENT_ROOT" >&2
+  exit 1
+fi
 
 exec "$CURRENT_ROOT/bin/hone-cli" "$@"
 EOF
@@ -264,6 +352,8 @@ Next steps:
   hone-cli onboard
   hone-cli configure --section agent --section channels --section providers
   hone-cli start
+  hone-cli web admin-ui
+  hone-cli web user-ui
 EOF
 
 if ! path_contains_dir "$BIN_DIR"; then

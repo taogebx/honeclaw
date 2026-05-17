@@ -14,19 +14,22 @@ use crate::runners::{AgentRunner, AgentRunnerRequest, FunctionCallingReasoningRu
 use crate::sandbox::ensure_actor_sandbox;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionMode {
+pub(crate) enum ExecutionMode {
     PersistentConversation,
     TransientTask,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionRunnerSelection {
+pub(crate) enum ExecutionRunnerSelection {
     Configured,
-    AuxiliaryFunctionCalling { max_iterations: u32 },
+    AuxiliaryFunctionCalling {
+        max_iterations: u32,
+        max_tokens_override: Option<u16>,
+    },
 }
 
 #[derive(Clone)]
-pub struct ExecutionRequest {
+pub(crate) struct ExecutionRequest {
     pub mode: ExecutionMode,
     pub session_id: String,
     pub actor: ActorIdentity,
@@ -45,22 +48,22 @@ pub struct ExecutionRequest {
     pub prompt_audit: Option<PromptAuditMetadata>,
 }
 
-pub struct PreparedExecution {
+pub(crate) struct PreparedExecution {
     pub runner_name: &'static str,
     pub runner: Box<dyn AgentRunner>,
     pub runner_request: AgentRunnerRequest,
 }
 
-pub struct ExecutionService {
+pub(crate) struct ExecutionService {
     core: Arc<HoneBotCore>,
 }
 
 impl ExecutionService {
-    pub fn new(core: Arc<HoneBotCore>) -> Self {
+    pub(crate) fn new(core: Arc<HoneBotCore>) -> Self {
         Self { core }
     }
 
-    pub fn prepare(&self, request: ExecutionRequest) -> Result<PreparedExecution, String> {
+    pub(crate) fn prepare(&self, request: ExecutionRequest) -> Result<PreparedExecution, String> {
         if let Some(metadata) = request.prompt_audit.as_ref() {
             if let Err(err) = write_prompt_audit(
                 &self.core.config,
@@ -90,10 +93,18 @@ impl ExecutionService {
                 tool_registry,
                 request.model_override.as_deref(),
             )?,
-            ExecutionRunnerSelection::AuxiliaryFunctionCalling { max_iterations } => {
-                let llm = self.core.auxiliary_llm.clone().ok_or_else(|| {
-                    "execution prepare failed: auxiliary llm unavailable".to_string()
-                })?;
+            ExecutionRunnerSelection::AuxiliaryFunctionCalling {
+                max_iterations,
+                max_tokens_override,
+            } => {
+                let llm = if let Some(max_tokens) = max_tokens_override {
+                    self.core
+                        .create_auxiliary_llm_provider_with_max_tokens(max_tokens)?
+                } else {
+                    self.core.auxiliary_llm.clone().ok_or_else(|| {
+                        "execution prepare failed: auxiliary llm unavailable".to_string()
+                    })?
+                };
                 Box::new(FunctionCallingReasoningRunner::new(
                     llm,
                     Arc::new(tool_registry),
@@ -293,7 +304,10 @@ mod tests {
             .prepare(make_request(
                 actor,
                 ExecutionMode::TransientTask,
-                ExecutionRunnerSelection::AuxiliaryFunctionCalling { max_iterations: 6 },
+                ExecutionRunnerSelection::AuxiliaryFunctionCalling {
+                    max_iterations: 6,
+                    max_tokens_override: None,
+                },
             ))
             .expect("prepare should succeed");
 
@@ -309,13 +323,56 @@ mod tests {
         let err = match ExecutionService::new(core).prepare(make_request(
             actor,
             ExecutionMode::TransientTask,
-            ExecutionRunnerSelection::AuxiliaryFunctionCalling { max_iterations: 6 },
+            ExecutionRunnerSelection::AuxiliaryFunctionCalling {
+                max_iterations: 6,
+                max_tokens_override: None,
+            },
         )) {
             Ok(_) => panic!("prepare should fail without auxiliary llm"),
             Err(err) => err,
         };
 
         assert!(err.contains("auxiliary llm unavailable"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_ignores_repo_internal_sandbox_override() {
+        let _guard = crate::sandbox::sandbox_env_test_lock()
+            .lock()
+            .expect("env lock");
+        let root = temp_root("execution_repo_internal_sandbox_override");
+        let repo_internal =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/agent-sandboxes-test");
+        unsafe {
+            std::env::set_var("HONE_AGENT_SANDBOX_DIR", &repo_internal);
+        }
+        let core = make_test_core(&root, "codex_cli", false);
+        let actor = ActorIdentity::new("web", "alice", None::<String>).expect("actor");
+        let prepared = ExecutionService::new(core)
+            .prepare(make_request(
+                actor,
+                ExecutionMode::PersistentConversation,
+                ExecutionRunnerSelection::Configured,
+            ))
+            .expect("prepare should succeed");
+
+        assert!(
+            prepared
+                .runner_request
+                .working_directory
+                .contains("hone-agent-sandboxes")
+        );
+        assert!(
+            !prepared
+                .runner_request
+                .working_directory
+                .contains("/data/agent-sandboxes-test")
+        );
+
+        unsafe {
+            std::env::remove_var("HONE_AGENT_SANDBOX_DIR");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 }

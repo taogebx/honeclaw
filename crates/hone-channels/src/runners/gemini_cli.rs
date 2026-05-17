@@ -14,14 +14,16 @@ use super::types::{
     RunnerTimeouts,
 };
 
-pub struct GeminiCliRunner {
+const GEMINI_CLI_STDERR_DETAIL_CHARS: usize = 400;
+
+pub(crate) struct GeminiCliRunner {
     system_prompt: String,
     tool_registry: Arc<ToolRegistry>,
     timeouts: RunnerTimeouts,
 }
 
 impl GeminiCliRunner {
-    pub fn new(
+    pub(crate) fn new(
         system_prompt: String,
         tool_registry: Arc<ToolRegistry>,
         timeouts: RunnerTimeouts,
@@ -294,6 +296,121 @@ fn truncate_gemini_cli_detail(text: &str, max_chars: usize) -> String {
     format!("{prefix}…")
 }
 
+fn gemini_cli_exit_error_message(code: Option<i32>, stderr: &str) -> String {
+    match gemini_cli_stderr_detail(stderr) {
+        Some(stderr_detail) => {
+            format!("gemini exited with error (code={code:?}; stderr={stderr_detail})")
+        }
+        None => format!("gemini exited with error (code={code:?}; stderr=<empty>)"),
+    }
+}
+
+fn gemini_cli_stderr_detail(stderr: &str) -> Option<String> {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_gemini_cli_detail(
+        &redact_common_stderr_secrets(trimmed),
+        GEMINI_CLI_STDERR_DETAIL_CHARS,
+    ))
+}
+
+fn redact_common_stderr_secrets(text: &str) -> String {
+    let mut output = redact_marker_value(text, "Bearer ");
+    for key in [
+        "access_token",
+        "accessToken",
+        "api_key",
+        "apiKey",
+        "apikey",
+        "token",
+        "app_secret",
+        "appSecret",
+        "secret",
+        "password",
+    ] {
+        output = redact_marker_value(&output, &format!("{key}="));
+        output = redact_marker_value(&output, &format!("{key}:"));
+        output = redact_json_string_field(&output, key);
+    }
+    output
+}
+
+fn redact_marker_value(text: &str, marker: &str) -> String {
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find(marker) {
+        let value_start = index + marker.len();
+        output.push_str(&remaining[..value_start]);
+        let leading_whitespace = remaining[value_start..]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        output.push_str(&remaining[value_start..value_start + leading_whitespace]);
+        output.push_str("<redacted>");
+        let value_tail = remaining[value_start + leading_whitespace..]
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                (ch == '&'
+                    || ch == ')'
+                    || ch == ','
+                    || ch == '"'
+                    || ch == '\''
+                    || ch == '}'
+                    || ch == ']'
+                    || ch.is_whitespace())
+                .then_some(idx)
+            })
+            .unwrap_or(remaining[value_start + leading_whitespace..].len());
+        remaining = &remaining[value_start + leading_whitespace + value_tail..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn redact_json_string_field(text: &str, key: &str) -> String {
+    let key_marker = format!("\"{key}\"");
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find(&key_marker) {
+        let after_key = index + key_marker.len();
+        let tail = &remaining[after_key..];
+        let Some((colon_offset, _)) = tail.char_indices().find(|(_, ch)| !ch.is_whitespace())
+        else {
+            break;
+        };
+        if !tail[colon_offset..].starts_with(':') {
+            output.push_str(&remaining[..after_key]);
+            remaining = &remaining[after_key..];
+            continue;
+        }
+        let after_colon = &tail[colon_offset + 1..];
+        let Some((quote_offset, _)) = after_colon
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+        else {
+            break;
+        };
+        if !after_colon[quote_offset..].starts_with('"') {
+            output.push_str(&remaining[..after_key]);
+            remaining = &remaining[after_key..];
+            continue;
+        }
+        let value_start = after_key + colon_offset + 1 + quote_offset + 1;
+        output.push_str(&remaining[..value_start]);
+        output.push_str("<redacted>");
+        let value_tail = remaining[value_start..]
+            .char_indices()
+            .find_map(|(idx, ch)| (ch == '"').then_some(idx))
+            .unwrap_or(remaining[value_start..].len());
+        remaining = &remaining[value_start + value_tail..];
+    }
+    output.push_str(remaining);
+    output
+}
+
 #[async_trait]
 impl AgentRunner for GeminiCliRunner {
     fn name(&self) -> &'static str {
@@ -313,7 +430,7 @@ impl AgentRunner for GeminiCliRunner {
         let mut iteration = 0u32;
         let mut hit_max_iterations = false;
         let mut total_raw_lines_seen = 0u32;
-        let mut last_iter_buf = String::new();
+        let mut last_iteration_output = String::new();
         let mut final_assistant_content: Option<String> = None;
         let mut stream_options = request.gemini_stream.clone();
         stream_options.overall_timeout = self.timeouts.overall;
@@ -344,7 +461,7 @@ impl AgentRunner for GeminiCliRunner {
                 })
                 .await;
 
-            let iter_buf = match stream_gemini_prompt(
+            let iteration_output = match stream_gemini_prompt(
                 &prompt,
                 &request.actor_label,
                 &request.working_directory,
@@ -356,7 +473,7 @@ impl AgentRunner for GeminiCliRunner {
             )
             .await
             {
-                Ok(buf) => buf,
+                Ok(output) => output,
                 Err(error) => {
                     emitter
                         .emit(AgentRunnerEvent::Error {
@@ -379,7 +496,8 @@ impl AgentRunner for GeminiCliRunner {
                 }
             };
 
-            let (visible_text, maybe_tool_call) = GeminiCliAgent::parse_tool_call(&iter_buf);
+            let (visible_text, maybe_tool_call) =
+                GeminiCliAgent::parse_tool_call(&iteration_output);
 
             if let Some((tool_name, tool_args, tool_reasoning)) = maybe_tool_call {
                 let call_id = format!("gemini_cli_call_{iteration}_{}", tool_calls_made.len() + 1);
@@ -408,12 +526,12 @@ impl AgentRunner for GeminiCliRunner {
                     })
                     .await;
 
-                let tool_result_val = self
+                let tool_result_value = self
                     .tool_registry
                     .execute_tool(&tool_name, tool_args.clone())
                     .await
                     .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }));
-                let tool_result_str = tool_result_val.to_string();
+                let tool_result_str = tool_result_value.to_string();
                 append_gemini_cli_tool_context_messages(
                     &mut context_messages,
                     &call_id,
@@ -442,17 +560,17 @@ impl AgentRunner for GeminiCliRunner {
                 tool_calls_made.push(ToolCallMade {
                     name: tool_name.clone(),
                     arguments: tool_args,
-                    result: tool_result_val,
+                    result: tool_result_value,
                     tool_call_id: Some(call_id.clone()),
                 });
 
                 pending_tool_results.push((call_id, tool_name, tool_result_str));
-                last_iter_buf = iter_buf;
+                last_iteration_output = iteration_output;
                 continue;
             }
 
             final_assistant_content = Some(visible_text);
-            last_iter_buf = iter_buf;
+            last_iteration_output = iteration_output;
             break;
         }
 
@@ -516,7 +634,7 @@ impl AgentRunner for GeminiCliRunner {
             tracing::warn!(
                 "[AgentRunner/gemini] empty stream response (raw_lines_seen={}, last_buf_preview={})",
                 total_raw_lines_seen,
-                last_iter_buf.chars().take(200).collect::<String>()
+                last_iteration_output.chars().take(200).collect::<String>()
             );
         }
         if final_assistant_content.is_none() && !full_reply.trim().is_empty() {
@@ -576,7 +694,7 @@ pub(crate) async fn stream_gemini_prompt(
     })?;
 
     let mut reader = tokio::io::BufReader::new(stdout).lines();
-    let mut iter_buf = String::new();
+    let mut iteration_output = String::new();
     let mut visible_emitted_len = 0usize;
     let mut raw_line_count = 0u32;
     let overall_start = Instant::now();
@@ -598,7 +716,7 @@ pub(crate) async fn stream_gemini_prompt(
                 raw_line_count += 1;
                 *total_raw_lines_seen += 1;
                 if raw_line_count <= 5 {
-                    let preview: String = line.chars().take(200).collect();
+                    let preview = gemini_cli_log_preview(&line, 200);
                     tracing::debug!(
                         "[AgentRunner/gemini] [{}] raw_line[iter={} n={}]: {}",
                         actor_label,
@@ -609,10 +727,10 @@ pub(crate) async fn stream_gemini_prompt(
                 }
                 match parse_stream_event(&line) {
                     Some(GeminiStreamEvent::Content(chunk)) => {
-                        iter_buf.push_str(&chunk);
-                        let visible_prefix = match iter_buf.find("<tool_call") {
-                            Some(idx) => &iter_buf[..idx],
-                            None => iter_buf.as_str(),
+                        iteration_output.push_str(&chunk);
+                        let visible_prefix = match iteration_output.find("<tool_call") {
+                            Some(idx) => &iteration_output[..idx],
+                            None => iteration_output.as_str(),
                         };
                         if visible_prefix.len() > visible_emitted_len {
                             let delta = &visible_prefix[visible_emitted_len..];
@@ -702,24 +820,61 @@ pub(crate) async fn stream_gemini_prompt(
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stderr_trimmed = stderr.trim();
         if !stderr_trimmed.is_empty() {
-            tracing::warn!("[AgentRunner/gemini] stderr: {}", stderr_trimmed);
+            tracing::warn!(
+                stderr_chars = stderr_trimmed.chars().count(),
+                stderr_preview = %gemini_cli_stderr_detail(stderr_trimmed).unwrap_or_default(),
+                "[AgentRunner/gemini] stderr"
+            );
         }
-        if !out.status.success() && iter_buf.is_empty() {
+        if !out.status.success() && iteration_output.is_empty() {
             return Err(AgentSessionError {
                 kind: AgentSessionErrorKind::ExitFailure,
-                message: format!(
-                    "gemini exited with error (code={:?}): {}",
-                    out.status.code(),
-                    stderr_trimmed
-                ),
+                message: gemini_cli_exit_error_message(out.status.code(), stderr_trimmed),
             });
         }
     }
 
-    Ok(iter_buf)
+    Ok(iteration_output)
+}
+
+fn gemini_cli_log_preview(text: &str, max_chars: usize) -> String {
+    truncate_gemini_cli_detail(&redact_common_stderr_secrets(text), max_chars)
 }
 
 fn gemini_command() -> tokio::process::Command {
     let bin = std::env::var("HONE_GEMINI_BIN").unwrap_or_else(|_| "gemini".to_string());
     tokio::process::Command::new(bin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gemini_cli_exit_error_message;
+
+    #[test]
+    fn gemini_exit_error_redacts_common_stderr_secret_shapes() {
+        let message = gemini_cli_exit_error_message(
+            Some(2),
+            r#"request failed token: header-secret auth=Bearer bearer-secret {"api_key":"json-secret"}"#,
+        );
+
+        assert!(message.contains("token: <redacted>"));
+        assert!(message.contains("Bearer <redacted>"));
+        assert!(message.contains("\"api_key\":\"<redacted>\""));
+        assert!(!message.contains("header-secret"));
+        assert!(!message.contains("bearer-secret"));
+        assert!(!message.contains("json-secret"));
+    }
+
+    #[test]
+    fn gemini_raw_line_preview_redacts_common_secret_shapes() {
+        let preview = super::gemini_cli_log_preview(
+            r#"{"message":"token: header-secret","api_key":"json-secret"}"#,
+            200,
+        );
+
+        assert!(preview.contains("token: <redacted>"));
+        assert!(preview.contains("\"api_key\":\"<redacted>\""));
+        assert!(!preview.contains("header-secret"));
+        assert!(!preview.contains("json-secret"));
+    }
 }

@@ -16,6 +16,8 @@ pub const DEFAULT_MIN_BUFFER_SIZE: usize = 100;
 pub const DEFAULT_MAX_SEGMENT_SIZE: usize = 400;
 const GENERIC_USER_ERROR_MESSAGE: &str = "抱歉，这次处理失败了。请稍后再试。";
 const TIMEOUT_USER_ERROR_MESSAGE: &str = "抱歉，处理超时了。请稍后再试。";
+const RUNNER_USAGE_LIMIT_USER_ERROR_MESSAGE: &str =
+    "当前执行额度已用尽，暂时无法继续处理。请稍后再试。";
 
 /// 流式处理结果
 #[derive(Debug, Clone)]
@@ -107,7 +109,7 @@ pub fn relativize_user_visible_paths(text: &str, sandbox_root: &str) -> String {
 }
 
 fn trim_trailing_path_separators(value: &str) -> &str {
-    value.trim_end_matches(|ch| ch == '/' || ch == '\\')
+    value.trim_end_matches(['/', '\\'])
 }
 
 fn split_trailing_path_punctuation(raw: &str) -> (&str, &str) {
@@ -218,6 +220,18 @@ static RE_COMPACT_MARKER_LINE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?i)^\s*(context|conversation)\s+compacted[\s\.\u{3002}:：-]*$")
         .expect("valid regex")
 });
+static RE_LOCAL_MARKDOWN_LINK: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"\[(?P<label>[^\]\n]{0,240})\]\((?P<path>(?:file://)?(?:[A-Za-z]:[\\/]|/)[^)\n]+)\)"#,
+    )
+    .expect("valid regex")
+});
+static RE_FILE_URI_ABSOLUTE_PATH: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?P<prefix>^|[\s\(\[\{<"'`])file://(?P<path>(?:[A-Za-z]:[\\/]|/)[^\s<>"'`]+)"#,
+    )
+    .expect("valid regex")
+});
 static RE_ABSOLUTE_PATH: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"(?P<prefix>^|[\s\(\[\{<"'`])(?P<path>(?:[A-Za-z]:[\\/]|/)[^\s<>"'`]+)"#)
         .expect("valid regex")
@@ -264,12 +278,7 @@ pub fn clean_msg_markers(text: &str) -> String {
 /// 「什么算内部 reasoning」在全链路单一来源。
 pub fn strip_internal_reasoning_blocks(text: &str) -> String {
     let normalized = text.replace("\r\n", "\n");
-    let block_stripped = RE_INTERNAL_BLOCK
-        .replace_all(&normalized, "\n")
-        .into_owned();
-    RE_BRACKET_INTERNAL_BLOCK
-        .replace_all(&block_stripped, "")
-        .into_owned()
+    strip_internal_protocol_blocks(normalized).0
 }
 
 pub fn sanitize_user_visible_output(text: &str) -> SanitizedUserVisibleOutput {
@@ -281,20 +290,8 @@ pub fn sanitize_user_visible_output(text: &str) -> SanitizedUserVisibleOutput {
         };
     }
 
-    let mut removed_internal = false;
-    let mut sanitized = text.replace("\r\n", "\n");
-
-    let block_stripped = RE_INTERNAL_BLOCK.replace_all(&sanitized, "\n");
-    if block_stripped != sanitized {
-        removed_internal = true;
-        sanitized = block_stripped.into_owned();
-    }
-
-    let bracket_stripped = RE_BRACKET_INTERNAL_BLOCK.replace_all(&sanitized, "");
-    if bracket_stripped != sanitized {
-        removed_internal = true;
-        sanitized = bracket_stripped.into_owned();
-    }
+    let (mut sanitized, mut removed_internal) =
+        strip_internal_protocol_blocks(text.replace("\r\n", "\n"));
 
     let mut kept_lines = Vec::new();
     for line in sanitized.lines() {
@@ -315,6 +312,13 @@ pub fn sanitize_user_visible_output(text: &str) -> SanitizedUserVisibleOutput {
     }
 
     sanitized = kept_lines.join("\n");
+    if let Some(stripped) = strip_internal_workflow_prelude(&sanitized) {
+        removed_internal = true;
+        sanitized = stripped;
+    }
+    let (path_sanitized, removed_paths) = redact_user_visible_local_paths(&sanitized);
+    sanitized = path_sanitized;
+    removed_internal |= removed_paths;
     sanitized = RE_WS.replace_all(&sanitized, " ").to_string();
     sanitized = RE_NL.replace_all(&sanitized, "\n\n").to_string();
     sanitized = sanitized.trim().to_string();
@@ -326,21 +330,82 @@ pub fn sanitize_user_visible_output(text: &str) -> SanitizedUserVisibleOutput {
     }
 }
 
-pub fn user_visible_error_message(raw: Option<&str>) -> String {
-    let sanitized = raw
-        .map(sanitize_user_visible_output)
-        .map(|value| value.content.trim().to_string())
-        .filter(|value| !value.is_empty());
+fn strip_internal_protocol_blocks(mut value: String) -> (String, bool) {
+    let mut removed_internal = false;
 
-    let Some(sanitized) = sanitized else {
+    let block_stripped = RE_INTERNAL_BLOCK.replace_all(&value, "\n");
+    if block_stripped != value {
+        removed_internal = true;
+        value = block_stripped.into_owned();
+    }
+
+    let bracket_stripped = RE_BRACKET_INTERNAL_BLOCK.replace_all(&value, "");
+    if bracket_stripped != value {
+        removed_internal = true;
+        value = bracket_stripped.into_owned();
+    }
+
+    (value, removed_internal)
+}
+
+fn redact_user_visible_local_paths(text: &str) -> (String, bool) {
+    let mut removed = false;
+
+    let markdown_stripped = RE_LOCAL_MARKDOWN_LINK.replace_all(text, |caps: &regex::Captures| {
+        removed = true;
+        let label = caps
+            .name("label")
+            .map(|m| m.as_str().trim())
+            .unwrap_or_default();
+        let raw_path = caps
+            .name("path")
+            .map(|m| m.as_str())
+            .unwrap_or_default()
+            .trim_start_matches("file://");
+        if label.is_empty()
+            || RE_ABSOLUTE_PATH.is_match(label)
+            || RE_FILE_URI_ABSOLUTE_PATH.is_match(label)
+        {
+            mask_absolute_path(raw_path)
+        } else {
+            label.to_string()
+        }
+    });
+    let mut sanitized = markdown_stripped.into_owned();
+
+    let file_uri_stripped =
+        RE_FILE_URI_ABSOLUTE_PATH.replace_all(&sanitized, |caps: &regex::Captures| {
+            removed = true;
+            let prefix = caps.name("prefix").map(|m| m.as_str()).unwrap_or_default();
+            let raw = caps.name("path").map(|m| m.as_str()).unwrap_or_default();
+            let (path, suffix) = split_trailing_path_punctuation(raw);
+            format!("{prefix}{}{suffix}", mask_absolute_path(path))
+        });
+    sanitized = file_uri_stripped.into_owned();
+
+    let absolute_stripped = RE_ABSOLUTE_PATH.replace_all(&sanitized, |caps: &regex::Captures| {
+        removed = true;
+        let prefix = caps.name("prefix").map(|m| m.as_str()).unwrap_or_default();
+        let raw = caps.name("path").map(|m| m.as_str()).unwrap_or_default();
+        let (path, suffix) = split_trailing_path_punctuation(raw);
+        format!("{prefix}{}{suffix}", mask_absolute_path(path))
+    });
+
+    (absolute_stripped.into_owned(), removed)
+}
+
+pub fn user_visible_error_message(raw: Option<&str>) -> String {
+    let Some(sanitized) = sanitized_non_empty_user_visible(raw) else {
         return GENERIC_USER_ERROR_MESSAGE.to_string();
     };
 
     let lowered = sanitized.to_ascii_lowercase();
-    if lowered.contains("timeout") || lowered.contains("timed out") {
+    if let Some(message) = user_actionable_error_message(&sanitized, &lowered) {
+        return message;
+    }
+    if looks_timeout_error_lowered(&lowered) {
         return TIMEOUT_USER_ERROR_MESSAGE.to_string();
     }
-
     if looks_internal_error_detail(&sanitized, &lowered) {
         return GENERIC_USER_ERROR_MESSAGE.to_string();
     }
@@ -349,18 +414,57 @@ pub fn user_visible_error_message(raw: Option<&str>) -> String {
 }
 
 pub fn user_visible_error_message_or_none(raw: Option<&str>) -> Option<String> {
-    let sanitized = raw
-        .map(sanitize_user_visible_output)
-        .map(|value| value.content.trim().to_string())
-        .filter(|value| !value.is_empty())?;
+    let sanitized = sanitized_non_empty_user_visible(raw)?;
     let lowered = sanitized.to_ascii_lowercase();
-    if lowered.contains("timeout") || lowered.contains("timed out") {
-        return Some(TIMEOUT_USER_ERROR_MESSAGE.to_string());
+    if let Some(message) = user_actionable_error_message(&sanitized, &lowered) {
+        return Some(message);
     }
     if looks_internal_error_detail(&sanitized, &lowered) {
         return None;
     }
+    if looks_timeout_error_lowered(&lowered) {
+        return Some(TIMEOUT_USER_ERROR_MESSAGE.to_string());
+    }
     Some(sanitized)
+}
+
+fn sanitized_non_empty_user_visible(raw: Option<&str>) -> Option<String> {
+    raw.map(sanitize_user_visible_output)
+        .map(|value| value.content.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn user_actionable_error_message(sanitized: &str, lowered: &str) -> Option<String> {
+    quota_rejection_user_message(sanitized).or_else(|| {
+        looks_runner_usage_limit_error_lowered(lowered)
+            .then(|| RUNNER_USAGE_LIMIT_USER_ERROR_MESSAGE.to_string())
+    })
+}
+
+fn quota_rejection_user_message(sanitized: &str) -> Option<String> {
+    let start = sanitized.find("已达到今日对话上限")?;
+    let rest = sanitized[start..].trim();
+    let first_line = rest.lines().next().unwrap_or(rest).trim();
+    (!first_line.is_empty()).then(|| first_line.to_string())
+}
+
+pub fn is_runner_usage_limit_error(raw: &str) -> bool {
+    looks_runner_usage_limit_error_lowered(&raw.to_ascii_lowercase())
+}
+
+fn looks_runner_usage_limit_error_lowered(lowered: &str) -> bool {
+    (lowered.contains("codex") || lowered.contains("runner") || lowered.contains("acp"))
+        && (lowered.contains("usage limit")
+            || lowered.contains("usage limits")
+            || lowered.contains("rate limit")
+            || lowered.contains("quota exceeded")
+            || lowered.contains("quota exhausted")
+            || lowered.contains("insufficient quota")
+            || lowered.contains("try again later"))
+}
+
+fn looks_timeout_error_lowered(lowered: &str) -> bool {
+    lowered.contains("timeout") || lowered.contains("timed out")
 }
 
 fn looks_internal_error_detail(sanitized: &str, lowered: &str) -> bool {
@@ -381,6 +485,102 @@ fn looks_internal_error_detail(sanitized: &str, lowered: &str) -> bool {
         || lowered.contains("codex acp")
         || lowered.contains("stream closed before response")
         || lowered.contains("acp stream")
+}
+
+fn strip_internal_workflow_prelude(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(paragraph_end) = trimmed.find("\n\n") {
+        let first_paragraph = &trimmed[..paragraph_end];
+        let rest = trimmed[paragraph_end..].trim_start();
+        if !rest.is_empty() && looks_like_internal_workflow_prelude(first_paragraph) {
+            return Some(rest.to_string());
+        }
+    }
+
+    let first_sentence_end = trimmed.char_indices().find_map(|(idx, ch)| {
+        matches!(ch, '。' | '！' | '!' | '\n').then_some(idx + ch.len_utf8())
+    });
+    if let Some(sentence_end) = first_sentence_end {
+        let first_sentence = &trimmed[..sentence_end];
+        let rest = trimmed[sentence_end..].trim_start();
+        if rest.chars().count() >= 30 && looks_like_internal_workflow_prelude(first_sentence) {
+            return Some(rest.to_string());
+        }
+    }
+
+    None
+}
+
+fn looks_like_internal_workflow_prelude(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 320 {
+        return false;
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    if contains_any_casefolded(
+        trimmed,
+        &lowered,
+        &[
+            "todo",
+            "current-plan",
+            "current plan",
+            "动态计划",
+            "任务计划",
+            "不落盘",
+            "文档方面",
+            "工作流",
+            "检查本地是否已有相关公司画像",
+            "检查本地公司画像",
+        ],
+    ) {
+        return true;
+    }
+
+    let starts_like_workflow = starts_with_any(
+        trimmed,
+        &[
+            "我先",
+            "我会先",
+            "我接下来",
+            "接下来我",
+            "先",
+            "先按",
+            "先对齐",
+            "先检查",
+        ],
+    );
+    if !starts_like_workflow {
+        return false;
+    }
+
+    if contains_any(trimmed, &["结论", "答案", "核心判断", "直接说", "简短说"]) {
+        return false;
+    }
+
+    let has_workflow_verb = contains_any(
+        trimmed,
+        &[
+            "核验",
+            "检查",
+            "对齐",
+            "拆成",
+            "整理",
+            "补查",
+            "调取",
+            "检索",
+            "看本地",
+            "拉取",
+            "搜索",
+            "梳理",
+        ],
+    );
+    let has_sequence = contains_any(trimmed, &["再", "然后", "最后", "之后"]);
+    has_workflow_verb && has_sequence
 }
 
 /// 检测文本是否包含工具调用标记
@@ -441,6 +641,45 @@ pub(crate) fn is_transitional_planning_sentence(text: &str) -> bool {
     if char_count >= 200 || char_count == 0 {
         return false;
     }
+    if text.contains('？') || text.contains('?') {
+        return false;
+    }
+    let trimmed = text.trim_start();
+    let starts_like_internal_planning = starts_with_any(
+        trimmed,
+        &[
+            "我先",
+            "我再",
+            "我需要先",
+            "我还缺",
+            "我需要补",
+            "先看本地",
+            "先补查",
+            "先调取",
+            "先核验",
+            "先抓取",
+            "还缺一件事",
+            "我还需要先",
+        ],
+    );
+    if !starts_like_internal_planning {
+        return false;
+    }
+    if contains_any(
+        text,
+        &[
+            "请先确认",
+            "请确认",
+            "先确认",
+            "请先提供",
+            "请提供",
+            "告诉我",
+            "发我",
+            "补充一下",
+        ],
+    ) {
+        return false;
+    }
     let patterns = [
         "我先",
         "我再",
@@ -460,7 +699,21 @@ pub(crate) fn is_transitional_planning_sentence(text: &str) -> bool {
         "还缺一件事",
         "我还需要先",
     ];
-    patterns.iter().any(|pat| text.contains(pat))
+    contains_any(text, &patterns)
+}
+
+fn contains_any(text: &str, markers: &[&str]) -> bool {
+    markers.iter().any(|marker| text.contains(marker))
+}
+
+fn contains_any_casefolded(text: &str, lowered: &str, markers: &[&str]) -> bool {
+    markers
+        .iter()
+        .any(|marker| lowered.contains(marker) || text.contains(marker))
+}
+
+fn starts_with_any(text: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|prefix| text.starts_with(prefix))
 }
 
 /// 检测缓冲区内容是否应该跳过发送
@@ -493,43 +746,39 @@ pub fn find_split_point(text: &str, target_pos: usize) -> usize {
     let search_text = &text[..search_end];
 
     // 优先级 1: --- 分隔线
-    if let Some(pos) = search_text.rfind("---") {
-        if pos > 0 {
-            let mut end = pos + 3;
-            let bytes = text.as_bytes();
-            while end < text.len()
-                && (bytes[end] == b'\n' || bytes[end] == b'\r' || bytes[end] == b' ')
-            {
-                end += 1;
-            }
-            return end;
+    if let Some(pos) = search_text.rfind("---")
+        && pos > 0
+    {
+        let mut end = pos + 3;
+        let bytes = text.as_bytes();
+        while end < text.len() && (bytes[end] == b'\n' || bytes[end] == b'\r' || bytes[end] == b' ')
+        {
+            end += 1;
         }
+        return end;
     }
 
     // 优先级 2: 空行
-    if let Some(pos) = search_text.rfind("\n\n") {
-        if pos > 0 {
-            return pos + 2;
-        }
+    if let Some(pos) = search_text.rfind("\n\n")
+        && pos > 0
+    {
+        return pos + 2;
     }
 
     // 优先级 3: 换行
-    if let Some(pos) = search_text.rfind('\n') {
-        if pos > 0 {
-            return pos + 1;
-        }
+    if let Some(pos) = search_text.rfind('\n')
+        && pos > 0
+    {
+        return pos + 1;
     }
 
     // 优先级 4: 句末标点
-    let mut best = 0usize;
-    for &ch in DEFAULT_STOP_CHARS {
-        if let Some(pos) = search_text.rfind(ch) {
-            if pos > best {
-                best = pos;
-            }
-        }
-    }
-    if best > 0 {
+    if let Some(best) = DEFAULT_STOP_CHARS
+        .iter()
+        .filter_map(|ch| search_text.rfind(*ch))
+        .max()
+        .filter(|pos| *pos > 0)
+    {
         // Advance past the stop char (handle multi-byte)
         return best + ch_len_at(text, best);
     }
@@ -639,6 +888,63 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_user_visible_output_strips_internal_workflow_prelude() {
+        let raw = "我先把任务计划压缩成当前会话 todo，文档方面只在结论有长期变化时更新公司画像，否则说明无需更新，不落盘到 current-plan。\n\nASTS 最近下跌，核心还是发射节奏、融资预期和风险偏好三件事同时压估值。";
+        let sanitized = sanitize_user_visible_output(raw);
+        assert!(sanitized.removed_internal);
+        assert_eq!(
+            sanitized.content,
+            "ASTS 最近下跌，核心还是发射节奏、融资预期和风险偏好三件事同时压估值。"
+        );
+    }
+
+    #[test]
+    fn sanitize_user_visible_output_strips_planning_prelude_before_answer() {
+        let raw = "我先对齐今天的市场口径，再把软件被压的原因拆成四条线。\n\n核心原因是利率预期、AI capex 分流、企业预算放缓和高估值久期资产折现率上行。";
+        let sanitized = sanitize_user_visible_output(raw);
+        assert!(sanitized.removed_internal);
+        assert_eq!(
+            sanitized.content,
+            "核心原因是利率预期、AI capex 分流、企业预算放缓和高估值久期资产折现率上行。"
+        );
+    }
+
+    #[test]
+    fn sanitize_user_visible_output_keeps_user_facing_conclusion_prelude() {
+        let raw = "我先给结论：软件股被压不是单一基本面恶化，而是利率、预算和 AI 资金偏好的共同作用。\n\n后面再看个股分化。";
+        let sanitized = sanitize_user_visible_output(raw);
+        assert!(!sanitized.removed_internal);
+        assert_eq!(sanitized.content, raw);
+    }
+
+    #[test]
+    fn sanitize_user_visible_output_redacts_local_markdown_file_links() {
+        let raw = "PDD 公司画像已建好：主画像 [profile.md](/Users/fengming2/Desktop/honeclaw/data/agent-sandboxes/feishu/direct__secret/company_profiles/pdd/profile.md)，事件 [2026-05-12-init.md](file:///Users/fengming2/Desktop/honeclaw/data/agent-sandboxes/feishu/direct__secret/company_profiles/pdd/events/2026-05-12-init.md)。";
+        let sanitized = sanitize_user_visible_output(raw);
+        assert!(sanitized.removed_internal);
+        assert_eq!(
+            sanitized.content,
+            "PDD 公司画像已建好：主画像 profile.md，事件 2026-05-12-init.md。"
+        );
+        assert!(!sanitized.content.contains("/Users/"));
+        assert!(!sanitized.content.contains("direct__secret"));
+    }
+
+    #[test]
+    fn sanitize_user_visible_output_redacts_bare_absolute_paths() {
+        let raw = "已写入 /Users/fengming2/Desktop/honeclaw/data/agent-sandboxes/feishu/direct__secret/company_profiles/pdd/profile.md 和 C:\\Users\\fengming\\honeclaw\\secret\\note.txt。";
+        let sanitized = sanitize_user_visible_output(raw);
+        assert!(sanitized.removed_internal);
+        assert_eq!(
+            sanitized.content,
+            "已写入 <absolute-path>/profile.md 和 <absolute-path>/note.txt。"
+        );
+        assert!(!sanitized.content.contains("/Users/"));
+        assert!(!sanitized.content.contains("C:\\Users"));
+        assert!(!sanitized.content.contains("direct__secret"));
+    }
+
+    #[test]
     fn user_visible_error_message_rewrites_provider_protocol_errors() {
         let err = user_visible_error_message(Some(
             "LLM 错误: bad_request_error: invalid params, tool call result does not follow tool call (2013), tool_call_id: call_123",
@@ -656,6 +962,26 @@ mod tests {
     }
 
     #[test]
+    fn user_visible_error_message_preserves_wrapped_quota_rejection() {
+        let err = user_visible_error_message(Some(
+            "工具执行错误: 已达到今日对话上限（12/12，北京时间 2026-05-01），请明天再试",
+        ));
+        assert_eq!(
+            err,
+            "已达到今日对话上限（12/12，北京时间 2026-05-01），请明天再试"
+        );
+    }
+
+    #[test]
+    fn user_visible_error_message_maps_codex_usage_limit_errors() {
+        let err = user_visible_error_message(Some(
+            "codex acp error: You've reached your usage limit. Try again later.",
+        ));
+        assert_eq!(err, RUNNER_USAGE_LIMIT_USER_ERROR_MESSAGE);
+        assert!(!err.contains("codex acp"));
+    }
+
+    #[test]
     fn user_visible_error_message_or_none_suppresses_internal_acp_errors() {
         let err = user_visible_error_message_or_none(Some(
             "codex acp prompt ended before tool completion: Searching the Web",
@@ -664,9 +990,36 @@ mod tests {
     }
 
     #[test]
-    fn user_visible_error_message_or_none_keeps_timeout_errors() {
+    fn user_visible_error_message_or_none_preserves_quota_rejection() {
+        let err = user_visible_error_message_or_none(Some(
+            "渠道错误: 已达到今日对话上限（12/12，北京时间 2026-05-01），请明天再试",
+        ));
+        assert_eq!(
+            err.as_deref(),
+            Some("已达到今日对话上限（12/12，北京时间 2026-05-01），请明天再试")
+        );
+    }
+
+    #[test]
+    fn user_visible_error_message_or_none_keeps_codex_usage_limit_errors() {
+        let err = user_visible_error_message_or_none(Some(
+            "LLM 错误: codex runner quota exceeded, please try again later",
+        ));
+        assert_eq!(err.as_deref(), Some(RUNNER_USAGE_LIMIT_USER_ERROR_MESSAGE));
+    }
+
+    #[test]
+    fn user_visible_error_message_or_none_suppresses_internal_idle_timeout() {
         let err = user_visible_error_message_or_none(Some(
             "codex acp session/prompt idle timeout (180s)",
+        ));
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn user_visible_error_message_or_none_keeps_generic_timeout_errors() {
+        let err = user_visible_error_message_or_none(Some(
+            "request timed out while waiting for upstream response",
         ));
         assert_eq!(err.as_deref(), Some(TIMEOUT_USER_ERROR_MESSAGE));
     }

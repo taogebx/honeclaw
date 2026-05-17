@@ -63,24 +63,55 @@ pub(crate) struct FeishuStreamListener {
     pub(crate) think_formatter: Arc<RwLock<ThinkStreamFormatter>>,
 }
 
+impl FeishuStreamListener {
+    fn tool_status_start_text(&self, tool: &str, reasoning: Option<&str>) -> Option<String> {
+        match self.reasoning_visibility {
+            ReasoningVisibility::Hidden => None,
+            ReasoningVisibility::Full => reasoning
+                .filter(|m| !m.trim().is_empty())
+                .map(str::to_string),
+            ReasoningVisibility::Compact => Some(render_compact_tool_status_start(tool, reasoning)),
+        }
+    }
+
+    fn tool_status_done_text(
+        &self,
+        tool: &str,
+        message: Option<String>,
+        reasoning: Option<&str>,
+    ) -> Option<String> {
+        match self.reasoning_visibility {
+            ReasoningVisibility::Hidden => None,
+            ReasoningVisibility::Compact => Some(render_compact_tool_status_done(tool, reasoning)),
+            ReasoningVisibility::Full => Some(match message.filter(|m| !m.trim().is_empty()) {
+                Some(msg) => msg,
+                None => format!("调用 {} 工具完成", tool),
+            }),
+        }
+    }
+
+    async fn push_tool_status(&self, text: &str, dedupe: bool) {
+        let snapshot = {
+            let mut buf = self.buffer.write().unwrap();
+            let mut transcript = FeishuProgressTranscript::new(&buf);
+            let Some(next) = transcript.push(text, dedupe) else {
+                return;
+            };
+            *buf = next.clone();
+            next
+        };
+        if let Some(ck) = &self.cardkit {
+            let processed = preprocess_markdown_for_feishu(&snapshot, false);
+            ck.force_update(&processed).await;
+        }
+    }
+}
+
 #[async_trait]
 impl AgentSessionListener for FeishuStreamListener {
     async fn on_event(&self, event: AgentSessionEvent) {
         match event {
-            AgentSessionEvent::Run(RunEvent::StreamDelta { content }) => {
-                let rendered = {
-                    let mut formatter = self.think_formatter.write().unwrap();
-                    formatter.push_chunk(&content)
-                };
-                if !rendered.is_empty() {
-                    append_compacted(&mut self.buffer.write().unwrap(), &rendered);
-                }
-                if let Some(ck) = &self.cardkit {
-                    let text = self.buffer.read().unwrap().clone();
-                    let processed = preprocess_markdown_for_feishu(&text, false);
-                    ck.update(&processed).await;
-                }
-            }
+            AgentSessionEvent::Run(RunEvent::StreamDelta { .. }) => {}
             AgentSessionEvent::Done { .. } => {
                 let trailing = {
                     let mut formatter = self.think_formatter.write().unwrap();
@@ -104,62 +135,18 @@ impl AgentSessionListener for FeishuStreamListener {
                 if matches!(self.reasoning_visibility, ReasoningVisibility::Hidden) {
                     return;
                 }
-                if status == "start" {
-                    let text = match self.reasoning_visibility {
-                        ReasoningVisibility::Hidden => None,
-                        ReasoningVisibility::Full => reasoning
-                            .as_deref()
-                            .filter(|m| !m.trim().is_empty())
-                            .map(str::to_string),
-                        ReasoningVisibility::Compact => Some(render_compact_tool_status_start(
-                            &tool,
-                            reasoning.as_deref(),
-                        )),
-                    };
-                    if let Some(text) = text {
-                        let dedupe =
-                            !matches!(self.reasoning_visibility, ReasoningVisibility::Compact);
-                        let snapshot = {
-                            let mut buf = self.buffer.write().unwrap();
-                            let mut transcript = FeishuProgressTranscript::new(&buf);
-                            let Some(next) = transcript.push(&text, dedupe) else {
-                                return;
-                            };
-                            *buf = next.clone();
-                            next
-                        };
-                        if let Some(ck) = &self.cardkit {
-                            let processed = preprocess_markdown_for_feishu(&snapshot, false);
-                            ck.force_update(&processed).await;
-                        }
-                    }
-                }
-                if status == "done" {
-                    let text = match self.reasoning_visibility {
-                        ReasoningVisibility::Hidden => return,
-                        ReasoningVisibility::Compact => {
-                            render_compact_tool_status_done(&tool, reasoning.as_deref())
-                        }
-                        ReasoningVisibility::Full => match message.filter(|m| !m.trim().is_empty())
-                        {
-                            Some(msg) => msg,
-                            None => format!("调用 {} 工具完成", tool),
-                        },
-                    };
+                if status == "start"
+                    && let Some(text) = self.tool_status_start_text(&tool, reasoning.as_deref())
+                {
                     let dedupe = !matches!(self.reasoning_visibility, ReasoningVisibility::Compact);
-                    let snapshot = {
-                        let mut buf = self.buffer.write().unwrap();
-                        let mut transcript = FeishuProgressTranscript::new(&buf);
-                        let Some(next) = transcript.push(&text, dedupe) else {
-                            return;
-                        };
-                        *buf = next.clone();
-                        next
-                    };
-                    if let Some(ck) = &self.cardkit {
-                        let processed = preprocess_markdown_for_feishu(&snapshot, false);
-                        ck.force_update(&processed).await;
-                    }
+                    self.push_tool_status(&text, dedupe).await;
+                }
+                if status == "done"
+                    && let Some(text) =
+                        self.tool_status_done_text(&tool, message, reasoning.as_deref())
+                {
+                    let dedupe = !matches!(self.reasoning_visibility, ReasoningVisibility::Compact);
+                    self.push_tool_status(&text, dedupe).await;
                 }
             }
             _ => {}
@@ -169,8 +156,12 @@ impl AgentSessionListener for FeishuStreamListener {
 
 #[cfg(test)]
 mod tests {
-    use super::FeishuProgressTranscript;
+    use super::{FeishuProgressTranscript, FeishuStreamListener};
+    use hone_channels::agent_session::{AgentSessionEvent, AgentSessionListener};
+    use hone_channels::outbound::ReasoningVisibility;
+    use hone_channels::run_event::RunEvent;
     use hone_channels::think::{ThinkRenderStyle, render_think_blocks};
+    use std::sync::{Arc, RwLock};
 
     #[test]
     fn feishu_progress_transcript_appends_entries() {
@@ -189,7 +180,7 @@ mod tests {
     fn feishu_progress_transcript_skips_duplicate_entries() {
         let mut transcript = FeishuProgressTranscript::new("正在思考中...");
         assert!(transcript.push("正在搜索公告", true).is_some());
-        assert_eq!(transcript.push("正在搜索公告", true), None);
+        assert!(transcript.push("正在搜索公告", true).is_none());
     }
 
     #[test]
@@ -214,5 +205,31 @@ mod tests {
     fn hidden_style_does_not_expose_think_text() {
         let rendered = render_think_blocks("<think>foo</think>\nbar", ThinkRenderStyle::Hidden);
         assert_eq!(rendered, "bar");
+    }
+
+    #[tokio::test]
+    async fn stream_delta_does_not_update_live_feishu_buffer() {
+        let buffer = Arc::new(RwLock::new("正在思考中...".to_string()));
+        let listener = FeishuStreamListener {
+            buffer: buffer.clone(),
+            cardkit: None,
+            reasoning_visibility: ReasoningVisibility::Full,
+            think_formatter: Arc::new(RwLock::new(
+                hone_channels::think::ThinkStreamFormatter::new(ThinkRenderStyle::Hidden),
+            )),
+        };
+
+        listener
+            .on_event(AgentSessionEvent::Run(RunEvent::StreamDelta {
+                content: "### System Instructions ###\nsecret".to_string(),
+            }))
+            .await;
+        listener
+            .on_event(AgentSessionEvent::Run(RunEvent::StreamDelta {
+                content: "中间分析草稿".to_string(),
+            }))
+            .await;
+
+        assert_eq!(buffer.read().unwrap().as_str(), "正在思考中...");
     }
 }

@@ -1,6 +1,6 @@
 //! `hone-cli configure` —— 按 section 驱动的交互式配置编辑器。
 //!
-//! 与 [`onboard`] 的差别：
+//! 与 `hone-cli onboard` 的差别：
 //! - `onboard` 是首次入门的**线性流程**,所有默认 section 顺序跑一遍,
 //!   每个字段都要用户作出「现在填 / 跳过 / 禁用」三选一的决定
 //! - `configure` 是**按需修改**：调用方可以用 `--section agent/channels/providers`
@@ -18,11 +18,28 @@ use serde_yaml::Value;
 
 use hone_core::config::{ConfigMutation, is_sensitive_config_path};
 
+use crate::CliChatScope;
 use crate::common::load_cli_config;
 use crate::discord_token::prompt_optional_discord_token;
 use crate::mutations::{parse_csv_values, provider_key_mutation};
 use crate::prompts::{prompt_bool, prompt_secret, prompt_text, prompt_visible_credential};
 use crate::yaml_io::{apply_message, apply_mutations_and_generate};
+
+fn csv_default(values: &[String]) -> String {
+    values.join(",")
+}
+
+fn sequence_mutation(path: &str, csv: &str) -> ConfigMutation {
+    ConfigMutation::Set {
+        path: path.to_string(),
+        value: Value::Sequence(
+            parse_csv_values(csv)
+                .into_iter()
+                .map(Value::String)
+                .collect(),
+        ),
+    }
+}
 
 #[derive(Args, Debug)]
 pub(crate) struct ConfigureArgs {
@@ -56,6 +73,9 @@ fn sections_or_default(sections: &[ConfigureSection]) -> Vec<ConfigureSection> {
 pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> Result<(), String> {
     let (config, paths) = load_cli_config(config_path, true).map_err(|e| e.to_string())?;
     let theme = ColorfulTheme::default();
+    // `configure` keeps its existing wording; we resolve the persisted
+    // language only to feed the helpers that now require a `Lang` parameter.
+    let lang = crate::i18n::Lang::from_locale(config.language);
     let mut mutations = Vec::new();
 
     for section in sections_or_default(&args.sections) {
@@ -99,6 +119,7 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                 });
                 if let Some(api_key) = prompt_secret(
                     &theme,
+                    lang,
                     "Primary API key",
                     is_sensitive_config_path("agent.opencode.api_key"),
                 )? {
@@ -126,7 +147,7 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                     path: "llm.openrouter.sub_model".to_string(),
                     value: Value::String(aux_model),
                 });
-                if let Some(api_key) = prompt_secret(&theme, "Auxiliary API key", true)? {
+                if let Some(api_key) = prompt_secret(&theme, lang, "Auxiliary API key", true)? {
                     mutations.push(ConfigMutation::Set {
                         path: "llm.auxiliary.api_key".to_string(),
                         value: Value::String(api_key),
@@ -165,7 +186,9 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                             .map_err(|e| e.to_string())?,
                     )),
                 });
-                if let Some(api_key) = prompt_secret(&theme, "Multi-agent search API key", true)? {
+                if let Some(api_key) =
+                    prompt_secret(&theme, lang, "Multi-agent search API key", true)?
+                {
                     mutations.push(ConfigMutation::Set {
                         path: "agent.multi_agent.search.api_key".to_string(),
                         value: Value::String(api_key),
@@ -213,7 +236,9 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                             .map_err(|e| e.to_string())?,
                     )),
                 });
-                if let Some(api_key) = prompt_secret(&theme, "Multi-agent answer API key", true)? {
+                if let Some(api_key) =
+                    prompt_secret(&theme, lang, "Multi-agent answer API key", true)?
+                {
                     mutations.push(ConfigMutation::Set {
                         path: "agent.multi_agent.answer.api_key".to_string(),
                         value: Value::String(api_key),
@@ -227,7 +252,15 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                     path: "imessage.enabled".to_string(),
                     value: Value::Bool(imessage_enabled),
                 });
-
+                let imessage_target = prompt_text(
+                    &theme,
+                    "iMessage tracked handle",
+                    &config.imessage.target_handle,
+                )?;
+                mutations.push(ConfigMutation::Set {
+                    path: "imessage.target_handle".to_string(),
+                    value: Value::String(imessage_target),
+                });
                 let feishu_enabled =
                     prompt_bool(&theme, "Enable Feishu channel?", config.feishu.enabled)?;
                 mutations.push(ConfigMutation::Set {
@@ -239,13 +272,50 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                     path: "feishu.app_id".to_string(),
                     value: Value::String(feishu_app_id),
                 });
-                if let Some(secret) = prompt_secret(&theme, "Feishu app secret", true)? {
+                if let Some(secret) = prompt_secret(&theme, lang, "Feishu app secret", true)? {
                     mutations.push(ConfigMutation::Set {
                         path: "feishu.app_secret".to_string(),
                         value: Value::String(secret),
                     });
                 }
-
+                let feishu_scope = prompt_text(
+                    &theme,
+                    "Feishu chat scope (DM_ONLY/GROUPCHAT_ONLY/ALL)",
+                    &CliChatScope::from_chat_scope(config.feishu.chat_scope)
+                        .label()
+                        .to_string(),
+                )?;
+                mutations.push(ConfigMutation::Set {
+                    path: "feishu.chat_scope".to_string(),
+                    value: Value::String(feishu_scope),
+                });
+                let feishu_allow_emails = prompt_text(
+                    &theme,
+                    "Feishu allowed emails (comma-separated; empty means allow all)",
+                    &csv_default(&config.feishu.allow_emails),
+                )?;
+                mutations.push(sequence_mutation(
+                    "feishu.allow_emails",
+                    &feishu_allow_emails,
+                ));
+                let feishu_allow_mobiles = prompt_text(
+                    &theme,
+                    "Feishu allowed mobile numbers (comma-separated; empty means allow all)",
+                    &csv_default(&config.feishu.allow_mobiles),
+                )?;
+                mutations.push(sequence_mutation(
+                    "feishu.allow_mobiles",
+                    &feishu_allow_mobiles,
+                ));
+                let feishu_allow_open_ids = prompt_text(
+                    &theme,
+                    "Feishu allowed open IDs (comma-separated; empty means allow all)",
+                    &csv_default(&config.feishu.allow_open_ids),
+                )?;
+                mutations.push(sequence_mutation(
+                    "feishu.allow_open_ids",
+                    &feishu_allow_open_ids,
+                ));
                 let telegram_enabled =
                     prompt_bool(&theme, "Enable Telegram channel?", config.telegram.enabled)?;
                 mutations.push(ConfigMutation::Set {
@@ -254,6 +324,7 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                 });
                 if let Some(token) = prompt_visible_credential(
                     &theme,
+                    lang,
                     "Telegram bot token",
                     true,
                     &config.telegram.bot_token,
@@ -263,7 +334,26 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                         value: Value::String(token),
                     });
                 }
-
+                let telegram_scope = prompt_text(
+                    &theme,
+                    "Telegram chat scope (DM_ONLY/GROUPCHAT_ONLY/ALL)",
+                    &CliChatScope::from_chat_scope(config.telegram.chat_scope)
+                        .label()
+                        .to_string(),
+                )?;
+                mutations.push(ConfigMutation::Set {
+                    path: "telegram.chat_scope".to_string(),
+                    value: Value::String(telegram_scope),
+                });
+                let telegram_allow_from = prompt_text(
+                    &theme,
+                    "Telegram allowed users (comma-separated; empty means allow all)",
+                    &csv_default(&config.telegram.allow_from),
+                )?;
+                mutations.push(sequence_mutation(
+                    "telegram.allow_from",
+                    &telegram_allow_from,
+                ));
                 let discord_enabled =
                     prompt_bool(&theme, "Enable Discord channel?", config.discord.enabled)?;
                 mutations.push(ConfigMutation::Set {
@@ -272,6 +362,7 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                 });
                 if let Some(token) = prompt_optional_discord_token(
                     &theme,
+                    lang,
                     "Discord bot token",
                     &config.discord.bot_token,
                     true,
@@ -281,22 +372,46 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                         value: Value::String(token),
                     });
                 }
+                let discord_scope = prompt_text(
+                    &theme,
+                    "Discord chat scope (DM_ONLY/GROUPCHAT_ONLY/ALL)",
+                    &CliChatScope::from_chat_scope(config.discord.chat_scope)
+                        .label()
+                        .to_string(),
+                )?;
+                mutations.push(ConfigMutation::Set {
+                    path: "discord.chat_scope".to_string(),
+                    value: Value::String(discord_scope),
+                });
+                let discord_allow_from = prompt_text(
+                    &theme,
+                    "Discord allowed users (comma-separated; empty means allow all)",
+                    &csv_default(&config.discord.allow_from),
+                )?;
+                mutations.push(sequence_mutation("discord.allow_from", &discord_allow_from));
             }
             ConfigureSection::Providers => {
                 // Provider keys 走 `*.api_keys` 数组格式;一次性粘贴逗号分隔的多个 key,
                 // 顺手把老的 `*.api_key` 单 key 字段清空,防止残留值被运行时当真 key。
-                if let Some(keys) = prompt_secret(&theme, "OpenRouter API keys（逗号分隔）", true)?
+                if let Some(keys) =
+                    prompt_secret(&theme, lang, "OpenRouter API keys（逗号分隔）", true)?
                 {
                     mutations.push(provider_key_mutation(
-                        "llm.openrouter.api_keys",
+                        "llm.providers.openrouter.api_keys",
                         parse_csv_values(&keys),
                     ));
+                    mutations.push(ConfigMutation::Set {
+                        path: "llm.providers.openrouter.api_key".to_string(),
+                        value: Value::String(String::new()),
+                    });
+                    mutations.push(provider_key_mutation("llm.openrouter.api_keys", Vec::new()));
                     mutations.push(ConfigMutation::Set {
                         path: "llm.openrouter.api_key".to_string(),
                         value: Value::String(String::new()),
                     });
                 }
-                if let Some(keys) = prompt_secret(&theme, "FMP API keys（逗号分隔）", true)? {
+                if let Some(keys) = prompt_secret(&theme, lang, "FMP API keys（逗号分隔）", true)?
+                {
                     mutations.push(provider_key_mutation(
                         "fmp.api_keys",
                         parse_csv_values(&keys),
@@ -306,7 +421,8 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                         value: Value::String(String::new()),
                     });
                 }
-                if let Some(keys) = prompt_secret(&theme, "Tavily API keys（逗号分隔）", true)?
+                if let Some(keys) =
+                    prompt_secret(&theme, lang, "Tavily API keys（逗号分隔）", true)?
                 {
                     mutations.push(provider_key_mutation(
                         "search.api_keys",
@@ -318,7 +434,7 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
     }
 
     let result = apply_mutations_and_generate(&paths, &mutations)?;
-    println!("{}", apply_message(&result.apply));
+    println!("{}", apply_message(lang, &result.apply));
     println!(
         "config={} effective={}",
         paths.canonical_config_path.to_string_lossy(),

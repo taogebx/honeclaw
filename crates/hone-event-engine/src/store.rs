@@ -31,6 +31,38 @@ pub struct EventStore {
     jsonl_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DeliveryLogFilter {
+    pub since_ts: Option<i64>,
+    pub until_ts: Option<i64>,
+    pub actor: Option<String>,
+    pub actor_channel: Option<String>,
+    pub actor_user_id: Option<String>,
+    pub event_id: Option<String>,
+    pub status: Option<String>,
+    pub delivery_channel: Option<String>,
+    pub top_level_only: bool,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeliveryLogRecord {
+    pub id: i64,
+    pub event_id: String,
+    pub actor: String,
+    pub channel: String,
+    pub severity: String,
+    pub sent_at_ts: i64,
+    pub status: String,
+    pub body: Option<String>,
+    pub event_title: Option<String>,
+    pub event_summary: Option<String>,
+    pub event_kind: Option<String>,
+    pub event_source: Option<String>,
+    pub event_url: Option<String>,
+    pub event_symbols: Vec<String>,
+}
+
 impl EventStore {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -150,10 +182,13 @@ impl EventStore {
             )?
         };
         let is_new = affected > 0;
-        if is_new {
-            if let Err(e) = self.append_jsonl_mirror(ev) {
-                tracing::warn!("events jsonl mirror append failed: {e:#}");
-            }
+        if is_new && let Err(e) = self.append_jsonl_mirror(ev) {
+            tracing::warn!(
+                event_id = %ev.id,
+                source = %ev.source,
+                symbols = ?ev.symbols,
+                "events jsonl mirror append failed: {e:#}"
+            );
         }
         Ok(is_new)
     }
@@ -231,10 +266,10 @@ impl EventStore {
         let mut out: Vec<String> = Vec::new();
         for r in rows {
             let json = r?;
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
-                if let Some(t) = v.get("type").and_then(|v| v.as_str()) {
-                    out.push(t.to_string());
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json)
+                && let Some(t) = v.get("type").and_then(|v| v.as_str())
+            {
+                out.push(t.to_string());
             }
         }
         Ok(out)
@@ -251,7 +286,7 @@ impl EventStore {
 
     /// 列出未来 `within_days` 天内的 `EarningsUpcoming` teaser 事件。
     ///
-    /// 用于 `DigestScheduler` 在每次 flush 时刻把"今天应该提醒 T-3/T-2/T-1"
+    /// 用于 `UnifiedDigestScheduler` 在每个 slot 触发时把"今天应该提醒 T-3/T-2/T-1"
     /// 的财报现算出来(见 `pollers::earnings::synthesize_countdowns`),这样
     /// 即使 poller 的 cron tick 漂移也不会让倒计时 off-by-one。
     pub fn list_upcoming_earnings(
@@ -389,15 +424,19 @@ impl EventStore {
         actor: &str,
         symbol: &str,
     ) -> anyhow::Result<Option<DateTime<Utc>>> {
-        self.last_high_sink_send_for_symbol_category(actor, symbol, "all")
+        self.last_high_sink_send_for_symbol_category(actor, symbol, "all", None)
     }
 
     /// 该 actor 针对 symbol + category 最近一次 High 成功送达 sink 的时刻。
+    /// `firm` 仅当 category 命中 kind 列表时附加 `payload_json.gradingCompany` 过滤,
+    /// 用于把 AnalystGrade 的冷却 key 拆到 (symbol, firm) 粒度,这样同 ticker 不同
+    /// 投行同分钟到达不会互相冷却。其他 category 一律传 `None`。
     pub fn last_high_sink_send_for_symbol_category(
         &self,
         actor: &str,
         symbol: &str,
         category: &str,
+        firm: Option<&str>,
     ) -> anyhow::Result<Option<DateTime<Utc>>> {
         if category == "all" {
             return self.last_high_sink_send_for_symbol_all(actor, symbol);
@@ -407,6 +446,11 @@ impl EventStore {
         };
         let predicates = vec!["e.kind_json LIKE ?"; tags.len()].join(" OR ");
         let needle = format!("%\"{}\"%", symbol.to_uppercase());
+        let firm_clause = if firm.is_some() {
+            "AND json_extract(e.payload_json, '$.gradingCompany') = ?"
+        } else {
+            ""
+        };
         let sql = format!(
             r#"
             SELECT MAX(d.sent_at_ts) FROM delivery_log d
@@ -417,13 +461,17 @@ impl EventStore {
               AND d.channel = 'sink'
               AND e.symbols_json LIKE ?
               AND ({predicates})
+              {firm_clause}
             "#
         );
-        let mut values = Vec::with_capacity(2 + tags.len());
+        let mut values = Vec::with_capacity(2 + tags.len() + firm.is_some() as usize);
         values.push(SqlValue::Text(actor.to_string()));
         values.push(SqlValue::Text(needle));
         for tag in tags {
             values.push(SqlValue::Text(format!("%\"{tag}\"%")));
+        }
+        if let Some(f) = firm {
+            values.push(SqlValue::Text(f.to_string()));
         }
         let conn = self.conn.lock().unwrap();
         let row: Option<i64> = conn.query_row(&sql, params_from_iter(values), |row| {
@@ -455,45 +503,20 @@ impl EventStore {
         Ok(row.and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0)))
     }
 
-    pub fn count_price_band_sent_since(
+    /// 该 actor 针对同一 ticker + analyst source article 最近一次 High sink 成功送达。
+    /// AnalystGrade 的通用 cooldown 按投行拆 key；这个查询补上同一 TheFly article
+    /// fanout 的批次防护，避免一个聚合页拆成 5-10 条不同 firm immediate。
+    pub fn last_high_sink_send_for_analyst_news_url(
         &self,
         actor: &str,
         symbol: &str,
-        direction: &str,
+        news_url: &str,
         since: DateTime<Utc>,
-    ) -> anyhow::Result<i64> {
-        let Some(pattern) = price_band_id_pattern(symbol, direction) else {
-            return Ok(0);
-        };
-        let needle = format!("%\"{}\"%", symbol.to_uppercase());
-        let conn = self.conn.lock().unwrap();
-        let n: i64 = conn.query_row(
-            r#"
-            SELECT COUNT(*) FROM delivery_log d
-            JOIN events e ON d.event_id = e.id
-            WHERE d.actor = ?1
-              AND d.severity = 'high'
-              AND d.status = 'sent'
-              AND d.channel = 'sink'
-              AND d.sent_at_ts >= ?2
-              AND e.symbols_json LIKE ?3
-              AND e.id LIKE ?4
-            "#,
-            params![actor, since.timestamp(), needle, pattern],
-            |row| row.get(0),
-        )?;
-        Ok(n)
-    }
-
-    pub fn last_price_band_sink_send_for_symbol_direction(
-        &self,
-        actor: &str,
-        symbol: &str,
-        direction: &str,
     ) -> anyhow::Result<Option<DateTime<Utc>>> {
-        let Some(pattern) = price_band_id_pattern(symbol, direction) else {
+        let news_url = news_url.trim();
+        if news_url.is_empty() {
             return Ok(None);
-        };
+        }
         let needle = format!("%\"{}\"%", symbol.to_uppercase());
         let conn = self.conn.lock().unwrap();
         let row: Option<i64> = conn.query_row(
@@ -504,13 +527,60 @@ impl EventStore {
               AND d.severity = 'high'
               AND d.status = 'sent'
               AND d.channel = 'sink'
-              AND e.symbols_json LIKE ?2
-              AND e.id LIKE ?3
+              AND d.sent_at_ts >= ?2
+              AND e.symbols_json LIKE ?3
+              AND e.kind_json LIKE '%"analyst_grade"%'
+              AND (
+                    json_extract(e.payload_json, '$.newsURL') = ?4
+                    OR e.url = ?4
+                  )
             "#,
-            params![actor, needle, pattern],
+            params![actor, since.timestamp(), needle, news_url],
             |row| row.get::<_, Option<i64>>(0),
         )?;
         Ok(row.and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0)))
+    }
+
+    /// 返回 `since` 之后 actor 在 (symbol, direction) 上**已被 sink 推过的最大
+    /// band bps**(从 `price_band:SYM:DATE:up:BPS` 的 id 末段解析)。供 dispatch
+    /// 的「monotone 新高 + N」单一推送规则用 —— 新档 pct 必须比该值高出
+    /// `price_band_min_advance_pct` 才允许直推,否则降级 digest。
+    pub fn last_price_band_max_bps_for_symbol_direction(
+        &self,
+        actor: &str,
+        symbol: &str,
+        direction: &str,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<Option<i64>> {
+        let Some(pattern) = price_band_id_pattern(symbol, direction) else {
+            return Ok(None);
+        };
+        let needle = format!("%\"{}\"%", symbol.to_uppercase());
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT e.id FROM delivery_log d
+            JOIN events e ON d.event_id = e.id
+            WHERE d.actor = ?1
+              AND d.severity = 'high'
+              AND d.status = 'sent'
+              AND d.channel = 'sink'
+              AND d.sent_at_ts >= ?2
+              AND e.symbols_json LIKE ?3
+              AND e.id LIKE ?4
+            "#,
+        )?;
+        let rows = stmt.query_map(params![actor, since.timestamp(), needle, pattern], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut max_bps: Option<i64> = None;
+        for r in rows {
+            let id = r?;
+            if let Some(bps) = parse_bps_from_band_id(&id) {
+                max_bps = Some(max_bps.map_or(bps, |m| m.max(bps)));
+            }
+        }
+        Ok(max_bps)
     }
 
     pub fn last_digest_success_at(&self, actor: &str) -> anyhow::Result<Option<DateTime<Utc>>> {
@@ -649,7 +719,7 @@ impl EventStore {
         Ok(out)
     }
 
-    /// 列出在 `since` 之后有 `quiet_held` 行的 distinct actor key。供 DigestScheduler
+    /// 列出在 `since` 之后有 `quiet_held` 行的 distinct actor key。供 UnifiedDigestScheduler
     /// 在 quiet.to 分钟把这些 actor 也加入 tick 迭代集合 —— 否则只 buffer 为空、
     /// 仅靠 router hold 的 actor 永远等不到 quiet_flush。
     pub fn list_actors_with_quiet_held_since(
@@ -833,8 +903,8 @@ impl EventStore {
     /// - RSS 源(Bloomberg/SpaceNews/STAT 等):无脑 High,severity 不再二次过滤
     /// - FMP `trusted` 域(reuters/wsj/cnbc/marketwatch 等):允许 Low 进入候选池
     ///   —— `pollers::news::classify_severity` 只在命中 distress/M&A 关键词时才升 High,
-    ///   导致 GOOGL 财报预告、Tokyo Electron 半导体上下游等 thesis 硬料被砍。
-    ///   POC 实测 24h 多出 19 条 trusted-Low,其中 ~25% 是 thesis 相关硬料,
+    ///   导致 GOOGL 财报预告、Tokyo Electron 半导体上下游等主线硬料被砍。
+    ///   POC 实测 24h 多出 19 条 trusted-Low,其中 ~25% 是主线相关硬料,
     ///   工作日扩量 ~80-180 条仍在 Pass1 prompt 容量内。
     /// - FMP 非 trusted 域(opinion_blog / pr_wire / uncertain):仍按 high/medium 严格门槛,
     ///   防止 seekingalpha listicle、律所 PR 灌进来。
@@ -963,6 +1033,103 @@ impl EventStore {
         )?;
         Ok(())
     }
+
+    pub fn list_recent_delivery_logs(
+        &self,
+        filter: &DeliveryLogFilter,
+    ) -> anyhow::Result<Vec<DeliveryLogRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from(
+            r#"
+            SELECT
+                d.id, d.event_id, d.actor, d.channel, d.severity,
+                d.sent_at_ts, d.status, d.body,
+                e.title, e.summary, e.kind_json, e.source, e.url, e.symbols_json
+            FROM delivery_log d
+            LEFT JOIN events e ON e.id = d.event_id
+            WHERE 1=1
+            "#,
+        );
+        let mut values: Vec<SqlValue> = Vec::new();
+
+        if let Some(ts) = filter.since_ts {
+            sql.push_str(" AND d.sent_at_ts >= ?");
+            values.push(SqlValue::Integer(ts));
+        }
+        if let Some(ts) = filter.until_ts {
+            sql.push_str(" AND d.sent_at_ts <= ?");
+            values.push(SqlValue::Integer(ts));
+        }
+        if let Some(actor) = filter.actor.as_deref().filter(|v| !v.is_empty()) {
+            sql.push_str(" AND d.actor = ?");
+            values.push(SqlValue::Text(actor.to_string()));
+        } else {
+            if let Some(channel) = filter.actor_channel.as_deref().filter(|v| !v.is_empty()) {
+                sql.push_str(" AND d.actor LIKE ?");
+                values.push(SqlValue::Text(format!("{channel}::%")));
+            }
+            if let Some(user_id) = filter.actor_user_id.as_deref().filter(|v| !v.is_empty()) {
+                sql.push_str(" AND d.actor LIKE ?");
+                values.push(SqlValue::Text(format!("%::{user_id}")));
+            }
+        }
+        if let Some(event_id) = filter.event_id.as_deref().filter(|v| !v.is_empty()) {
+            sql.push_str(" AND d.event_id = ?");
+            values.push(SqlValue::Text(event_id.to_string()));
+        }
+        if let Some(status) = filter.status.as_deref().filter(|v| !v.is_empty()) {
+            sql.push_str(" AND d.status = ?");
+            values.push(SqlValue::Text(status.to_string()));
+        }
+        if let Some(channel) = filter.delivery_channel.as_deref().filter(|v| !v.is_empty()) {
+            sql.push_str(" AND d.channel = ?");
+            values.push(SqlValue::Text(channel.to_string()));
+        }
+        if filter.top_level_only {
+            sql.push_str(" AND d.channel NOT IN ('router', 'digest_item', 'global_digest_item')");
+        }
+
+        sql.push_str(" ORDER BY d.sent_at_ts DESC, d.id DESC LIMIT ?");
+        values.push(SqlValue::Integer(filter.limit.max(1) as i64));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values), |row| {
+            let kind_json: Option<String> = row.get(10)?;
+            let symbols_json: Option<String> = row.get(13)?;
+            let event_kind = kind_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|value| {
+                    value
+                        .get("type")
+                        .and_then(|type_value| type_value.as_str())
+                        .map(str::to_string)
+                });
+            let event_symbols = symbols_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+                .unwrap_or_default();
+            Ok(DeliveryLogRecord {
+                id: row.get(0)?,
+                event_id: row.get(1)?,
+                actor: row.get(2)?,
+                channel: row.get(3)?,
+                severity: row.get(4)?,
+                sent_at_ts: row.get(5)?,
+                status: row.get(6)?,
+                body: row.get(7)?,
+                event_title: row.get(8)?,
+                event_summary: row.get(9)?,
+                event_kind,
+                event_source: row.get(11)?,
+                event_url: row.get(12)?,
+                event_symbols,
+            })
+        })?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(anyhow::Error::from)
+    }
 }
 
 /// 按 `source` 分组的事件入库数——用于 daily report 展示"各 poller 产出多少"。
@@ -1023,13 +1190,8 @@ fn severity_tag(s: &crate::event::Severity) -> &'static str {
 
 fn category_kind_tags(category: &str) -> Option<&'static [&'static str]> {
     match category {
-        "price" => Some(&[
-            "price_alert",
-            "weekly52_high",
-            "weekly52_low",
-            "volume_spike",
-        ]),
-        "news" => Some(&["news_critical", "press_release", "social_post"]),
+        "price" => Some(&["price_alert", "weekly52_high", "weekly52_low"]),
+        "news" => Some(&["news_critical", "social_post"]),
         "filing" => Some(&["sec_filing"]),
         "earnings" => Some(&[
             "earnings_upcoming",
@@ -1037,11 +1199,17 @@ fn category_kind_tags(category: &str) -> Option<&'static [&'static str]> {
             "earnings_call_transcript",
         ]),
         "macro" => Some(&["macro_event"]),
-        "corp_action" => Some(&["dividend", "split", "buyback"]),
+        "corp_action" => Some(&["dividend", "split"]),
         "analyst" => Some(&["analyst_grade"]),
-        "portfolio" => Some(&["portfolio_pre_market", "portfolio_post_market"]),
         _ => None,
     }
+}
+
+fn parse_bps_from_band_id(id: &str) -> Option<i64> {
+    if !id.starts_with("price_band:") {
+        return None;
+    }
+    id.rsplit(':').next().and_then(|s| s.parse::<i64>().ok())
 }
 
 fn price_band_id_pattern(symbol: &str, direction: &str) -> Option<String> {
@@ -1154,6 +1322,85 @@ mod tests {
             )
             .unwrap();
         assert_eq!(last_status, "sent");
+    }
+
+    #[test]
+    fn list_recent_delivery_logs_keeps_operator_level_rows() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::open(dir.path().join("events.db")).unwrap();
+        store
+            .log_delivery(
+                "ev-no-actor",
+                "event_engine::::no_actor",
+                "router",
+                Severity::Low,
+                "no_actor",
+                None,
+            )
+            .unwrap();
+        store
+            .log_delivery(
+                "ev-item",
+                "discord::::u1",
+                "digest_item",
+                Severity::Medium,
+                "omitted",
+                None,
+            )
+            .unwrap();
+        store
+            .log_delivery(
+                "ev-sink",
+                "discord::::u1",
+                "sink",
+                Severity::High,
+                "sent",
+                Some("body"),
+            )
+            .unwrap();
+
+        let rows = store
+            .list_recent_delivery_logs(&DeliveryLogFilter {
+                top_level_only: true,
+                limit: 20,
+                ..DeliveryLogFilter::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_id, "ev-sink");
+        assert_eq!(rows[0].channel, "sink");
+    }
+
+    #[test]
+    fn list_recent_delivery_logs_exposes_event_kind_type() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::open(dir.path().join("events.db")).unwrap();
+        let mut event = sample_event("ev-kind");
+        event.kind = EventKind::SecFiling {
+            form: "8-K".to_string(),
+        };
+        store.insert_event(&event).unwrap();
+        store
+            .log_delivery(
+                "ev-kind",
+                "discord::::u1",
+                "sink",
+                Severity::High,
+                "sent",
+                Some("body"),
+            )
+            .unwrap();
+
+        let rows = store
+            .list_recent_delivery_logs(&DeliveryLogFilter {
+                actor: Some("discord::::u1".to_string()),
+                top_level_only: true,
+                limit: 20,
+                ..DeliveryLogFilter::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_kind.as_deref(), Some("sec_filing"));
     }
 
     #[test]
@@ -1315,6 +1562,130 @@ mod tests {
                 .last_high_sink_send_for_symbol(actor, "TSLA")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn last_high_sink_send_with_firm_filter_distinguishes_grading_company() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::open(dir.path().join("events.db")).unwrap();
+        let actor = "tg::::u1";
+
+        let mk = |id: &str, firm: &str| MarketEvent {
+            id: id.into(),
+            kind: EventKind::AnalystGrade,
+            severity: Severity::High,
+            symbols: vec!["SNDK".into()],
+            occurred_at: Utc::now(),
+            title: "grade".into(),
+            summary: String::new(),
+            url: None,
+            source: "fmp.grade".into(),
+            payload: serde_json::json!({"gradingCompany": firm}),
+        };
+        let goldman = mk("g1", "Goldman Sachs");
+        let raymond = mk("r1", "Raymond James");
+        store.insert_event(&goldman).unwrap();
+        store.insert_event(&raymond).unwrap();
+        store
+            .log_delivery("g1", actor, "sink", Severity::High, "sent", None)
+            .unwrap();
+
+        // 不带 firm 过滤 → 命中 Goldman 的 sent
+        assert!(
+            store
+                .last_high_sink_send_for_symbol_category(actor, "SNDK", "analyst", None)
+                .unwrap()
+                .is_some()
+        );
+        // 带 firm = Goldman → 命中
+        assert!(
+            store
+                .last_high_sink_send_for_symbol_category(
+                    actor,
+                    "SNDK",
+                    "analyst",
+                    Some("Goldman Sachs"),
+                )
+                .unwrap()
+                .is_some()
+        );
+        // 带 firm = Raymond James → 没记录,应返回 None
+        assert!(
+            store
+                .last_high_sink_send_for_symbol_category(
+                    actor,
+                    "SNDK",
+                    "analyst",
+                    Some("Raymond James"),
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn last_high_sink_send_for_analyst_news_url_matches_same_article_fanout() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::open(dir.path().join("events.db")).unwrap();
+        let actor = "tg::::u1";
+        let url = "https://thefly.com/ajax/news_get.php?id=4346982";
+
+        let mk = |id: &str, firm: &str, news_url: &str| MarketEvent {
+            id: id.into(),
+            kind: EventKind::AnalystGrade,
+            severity: Severity::High,
+            symbols: vec!["AMD".into()],
+            occurred_at: Utc::now(),
+            title: format!("AMD {firm} action"),
+            summary: String::new(),
+            url: Some(news_url.to_string()),
+            source: "fmp.upgrades_downgrades".into(),
+            payload: serde_json::json!({
+                "gradingCompany": firm,
+                "newsURL": news_url
+            }),
+        };
+        let needham = mk("grade:AMD:t:Needham", "Needham", url);
+        let jefferies = mk("grade:AMD:t:Jefferies", "Jefferies", url);
+        let other_url = mk(
+            "grade:AMD:t:RBC",
+            "RBC Capital",
+            "https://thefly.com/ajax/news_get.php?id=4346812",
+        );
+        store.insert_event(&needham).unwrap();
+        store.insert_event(&jefferies).unwrap();
+        store.insert_event(&other_url).unwrap();
+        store
+            .log_delivery(&needham.id, actor, "sink", Severity::High, "sent", None)
+            .unwrap();
+
+        let since = Utc::now() - chrono::Duration::minutes(5);
+        assert!(
+            store
+                .last_high_sink_send_for_analyst_news_url(actor, "AMD", url, since)
+                .unwrap()
+                .is_some(),
+            "same ticker + same newsURL fanout should be found"
+        );
+        assert!(
+            store
+                .last_high_sink_send_for_analyst_news_url(
+                    actor,
+                    "AMD",
+                    "https://thefly.com/ajax/news_get.php?id=4346812",
+                    since,
+                )
+                .unwrap()
+                .is_none(),
+            "different source article should not be cooled"
+        );
+        assert!(
+            store
+                .last_high_sink_send_for_analyst_news_url(actor, "NVDA", url, since)
+                .unwrap()
+                .is_none(),
+            "same URL for another ticker should not match"
         );
     }
 

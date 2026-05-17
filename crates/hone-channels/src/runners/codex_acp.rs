@@ -15,7 +15,7 @@ use crate::mcp_bridge::hone_mcp_servers;
 use super::acp_common::{
     ACP_NEEDS_SP_RESEED_KEY, ACP_PREV_PROMPT_PEAK_KEY, AcpEventLogContext, AcpPermissionDecision,
     AcpPromptState, AcpRenderedToolStatus, AcpResponseTimeouts, AcpToolRenderPhase, CliVersion,
-    acp_prompt_succeeded, build_acp_prompt_text, create_acp_session, finalize_context_messages,
+    acp_prompt_succeeded, create_acp_session, finalize_context_messages,
     log_acp_prompt_stop_diagnostics, parse_cli_version, set_acp_session_model, wait_for_response,
     wait_for_response_with_timeouts_and_renderer, write_jsonrpc_request,
 };
@@ -27,22 +27,32 @@ use super::types::{
 const CODEX_ACP_SESSION_KEY: &str = "codex_acp_session_id";
 const MIN_CODEX_VERSION: CliVersion = CliVersion {
     major: 0,
-    minor: 115,
+    minor: 125,
     patch: 0,
 };
 const MIN_CODEX_ACP_VERSION: CliVersion = CliVersion {
     major: 0,
-    minor: 9,
-    patch: 5,
+    minor: 12,
+    patch: 0,
 };
 
-pub struct CodexAcpRunner {
+pub(crate) fn reusable_codex_acp_session_id(
+    _session_metadata: &HashMap<String, Value>,
+) -> Option<String> {
+    // codex-acp can replay historical `session/update` events during `session/load`.
+    // Those replayed prompt/tool updates are raw ACP diagnostics, not current-turn
+    // user-visible output. Hone already restores local transcript context into each
+    // prompt, so fresh remote ACP sessions are the safer default.
+    None
+}
+
+pub(crate) struct CodexAcpRunner {
     config: CodexAcpConfig,
     timeouts: RunnerTimeouts,
 }
 
 impl CodexAcpRunner {
-    pub fn new(config: CodexAcpConfig, timeouts: RunnerTimeouts) -> Self {
+    pub(crate) fn new(config: CodexAcpConfig, timeouts: RunnerTimeouts) -> Self {
         Self { config, timeouts }
     }
 }
@@ -343,13 +353,13 @@ async fn run_codex_acp(
     })?;
     let stderr = child.stderr.take();
 
-    let stderr_buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let stderr_buffer = Arc::new(tokio::sync::Mutex::new(String::new()));
     let stderr_task = stderr.map(|stderr| {
-        let stderr_buf = stderr_buf.clone();
+        let stderr_buffer = stderr_buffer.clone();
         tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let mut guard = stderr_buf.lock().await;
+                let mut guard = stderr_buffer.lock().await;
                 if !guard.is_empty() {
                     guard.push('\n');
                 }
@@ -381,7 +391,7 @@ async fn run_codex_acp(
             next_id,
             None,
             None,
-            Some(stderr_buf.clone()),
+            Some(stderr_buffer.clone()),
             Some(&acp_log),
         ),
     )
@@ -392,104 +402,29 @@ async fn run_codex_acp(
     })??;
     next_id += 1;
 
-    let existing_session_id = request
-        .session_metadata
-        .get(CODEX_ACP_SESSION_KEY)
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string())
-        .filter(|value| !value.trim().is_empty());
-
-    let (codex_session_id, seeded_from_local_context) =
-        if let Some(session_id) = existing_session_id {
-            write_jsonrpc_request(
-                &mut stdin,
-                next_id,
-                "session/load",
-                serde_json::json!({
-                    "sessionId": session_id,
-                    "cwd": request.working_directory,
-                    "mcpServers": mcp_servers.clone(),
-                }),
-                Some(&acp_log),
-            )
-            .await?;
-            match tokio::time::timeout(
-                startup_timeout,
-                wait_for_response(
-                    "codex",
-                    &mut reader,
-                    &mut stdin,
-                    next_id,
-                    None,
-                    None,
-                    Some(stderr_buf.clone()),
-                    Some(&acp_log),
-                ),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
-                    next_id += 1;
-                    (session_id, false)
-                }
-                Ok(Err(err)) => {
-                    tracing::warn!(
-                        "[AgentRunner/codex] failed to load ACP session {}, creating new one: {}",
-                        session_id,
-                        err.message
-                    );
-                    let new_session_id = create_acp_session(
-                        "codex",
-                        &mut stdin,
-                        &mut reader,
-                        next_id + 1,
-                        &request.working_directory,
-                        mcp_servers.clone(),
-                        startup_timeout,
-                        stderr_buf.clone(),
-                        Some(&acp_log),
-                    )
-                    .await?;
-                    next_id += 2;
-                    (new_session_id, true)
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "[AgentRunner/codex] ACP session/load timed out for {}, creating new one",
-                        session_id
-                    );
-                    let new_session_id = create_acp_session(
-                        "codex",
-                        &mut stdin,
-                        &mut reader,
-                        next_id + 1,
-                        &request.working_directory,
-                        mcp_servers.clone(),
-                        startup_timeout,
-                        stderr_buf.clone(),
-                        Some(&acp_log),
-                    )
-                    .await?;
-                    next_id += 2;
-                    (new_session_id, true)
-                }
-            }
-        } else {
-            let new_session_id = create_acp_session(
-                "codex",
-                &mut stdin,
-                &mut reader,
-                next_id,
-                &request.working_directory,
-                mcp_servers.clone(),
-                startup_timeout,
-                stderr_buf.clone(),
-                Some(&acp_log),
-            )
-            .await?;
-            next_id += 1;
-            (new_session_id, true)
-        };
+    if let Some(session_id) = reusable_codex_acp_session_id(&request.session_metadata) {
+        tracing::debug!(
+            "[AgentRunner/codex] session={} ignoring reusable acp session candidate={session_id}",
+            request.session_id,
+        );
+    }
+    tracing::info!(
+        "[AgentRunner/codex] session={} creating fresh acp session",
+        request.session_id,
+    );
+    let codex_session_id = create_acp_session(
+        "codex",
+        &mut stdin,
+        &mut reader,
+        next_id,
+        &request.working_directory,
+        mcp_servers.clone(),
+        startup_timeout,
+        stderr_buffer.clone(),
+        Some(&acp_log),
+    )
+    .await?;
+    next_id += 1;
 
     metadata_updates.insert(
         CODEX_ACP_SESSION_KEY.to_string(),
@@ -505,7 +440,7 @@ async fn run_codex_acp(
             &codex_session_id,
             &model_id,
             model_timeout,
-            stderr_buf.clone(),
+            stderr_buffer.clone(),
             Some(&acp_log),
         )
         .await?;
@@ -519,15 +454,11 @@ async fn run_codex_acp(
             .and_then(|value| value.as_u64()),
         ..AcpPromptState::default()
     };
-    let prompt_text = if seeded_from_local_context {
-        build_codex_acp_prompt_text(
-            &request.system_prompt,
-            &request.runtime_input,
-            Some(&request.context),
-        )
-    } else {
-        build_acp_prompt_text(&request.system_prompt, &request.runtime_input)
-    };
+    let prompt_text = build_codex_acp_prompt_text(
+        &request.system_prompt,
+        &request.runtime_input,
+        Some(&request.context),
+    );
     write_jsonrpc_request(
         &mut stdin,
         next_id,
@@ -551,7 +482,7 @@ async fn run_codex_acp(
         next_id,
         Some(emitter.clone()),
         Some(&mut codex_state),
-        Some(stderr_buf.clone()),
+        Some(stderr_buffer.clone()),
         AcpResponseTimeouts {
             idle: prompt_idle_timeout,
             overall: prompt_overall_timeout,
@@ -575,7 +506,7 @@ async fn run_codex_acp(
             stop_reason,
             &prompt_result,
             &codex_state,
-            &stderr_buf,
+            &stderr_buffer,
         )
         .await;
     }
@@ -593,6 +524,8 @@ async fn run_codex_acp(
         ACP_PREV_PROMPT_PEAK_KEY.to_string(),
         Value::from(codex_state.current_prompt_peak_used),
     );
+    // Do not write `false` when compact was not detected: the prompt builder owns
+    // clearing a pending reseed flag after it has been consumed.
     if codex_state.compact_detected {
         tracing::info!(
             "[AgentRunner/codex] session={} ACP compact detected (peak_used={}); marking next turn for SP reseed",
@@ -600,10 +533,6 @@ async fn run_codex_acp(
             codex_state.current_prompt_peak_used
         );
         metadata_updates.insert(ACP_NEEDS_SP_RESEED_KEY.to_string(), Value::Bool(true));
-    } else {
-        // 显式清掉上一轮可能残留的 reseed 标志，确保只在 reseed 完成后才清
-        // —— 实际清理由 prompt 构建层负责（看到 true → 重塞 → 写 false）。
-        // 这里不主动写 false，避免覆盖 prompt 构建层尚未消费的 true。
     }
 
     let context_messages = finalize_context_messages(&mut codex_state);
@@ -647,8 +576,8 @@ pub(crate) fn render_codex_tool_status(
         };
     }
 
-    let rendered_command = render_codex_execute_command(update)
-        .unwrap_or_else(|| truncate_codex_execute_label(default_tool));
+    let rendered_command =
+        render_codex_execute_command(update).unwrap_or_else(|| "本地命令".to_string());
     let purpose_suffix = codex_execute_purpose(update)
         .map(|purpose| format!("；目的：{}", truncate_codex_purpose(&purpose)))
         .unwrap_or_default();
@@ -717,26 +646,10 @@ fn render_codex_execute_command(update: &Value) -> Option<String> {
                 .and_then(|value| value.get("command"))
         })
         .and_then(|value| value.as_array())?;
-    let parts = command
-        .iter()
-        .filter_map(|value| value.as_str())
-        .collect::<Vec<_>>();
-    if parts.is_empty() {
+    if command.is_empty() {
         return None;
     }
-
-    let text = if parts.len() >= 3
-        && matches!(
-            parts[0],
-            "/bin/zsh" | "zsh" | "/bin/bash" | "bash" | "/bin/sh" | "sh"
-        )
-        && parts[1] == "-lc"
-    {
-        parts[2].to_string()
-    } else {
-        parts.join(" ")
-    };
-    Some(truncate_codex_execute_label(&text))
+    Some("本地命令".to_string())
 }
 
 fn codex_execute_purpose(update: &Value) -> Option<String> {
@@ -752,18 +665,6 @@ fn codex_execute_purpose(update: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-}
-
-fn truncate_codex_execute_label(text: &str) -> String {
-    const MAX_CHARS: usize = 96;
-    let trimmed = text.trim();
-    let total = trimmed.chars().count();
-    if total <= MAX_CHARS {
-        return trimmed.to_string();
-    }
-    let keep = 56.min(MAX_CHARS.saturating_sub(1));
-    let prefix = trimmed.chars().take(keep).collect::<String>();
-    format!("{prefix} [truncated, {total} chars]")
 }
 
 fn truncate_codex_purpose(text: &str) -> String {

@@ -3,7 +3,7 @@
 - **发现时间**: 2026-04-24 09:03 CST
 - **Bug Type**: System Error
 - **严重等级**: P1
-- **状态**: Later
+- **状态**: Closed
 
 ## 观测落地（2026-04-24）
 
@@ -134,3 +134,62 @@
 - 这样即使后续 agent run 卡住、进程中断或收尾逻辑没有执行，台账也能看到“本轮确实触发并进入运行中”，不再表现为完全缺失。
 - 已验证：`cargo test -p hone-feishu failed_reply_text`（同包编译通过；完整 Feishu 回归见本轮批次计划）。
 - 状态调整为 `Later`：台账缺失已代码止血；后续若真实长任务窗口仍停在 `running/pending`，或证明需要补超时终结器，再改回 `New`。
+
+## 复发证据（2026-05-07）
+
+- **2026-05-07 23:02 CST 巡检结论**：本缺陷从 `Later` 重新调整为 `New`。最新真实窗口里，台账缺失已被 2026-04-26 的 started 行止血覆盖，但 Feishu scheduler 仍能留下长时间不收口的 `running/pending` 任务，说明“需要超时终结器 / 失败收口”的后半段问题仍活跃。
+- **证据来源**：
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 截至 `2026-05-07 23:02 CST`，最近四小时共有 `5` 条 `execution_status=running + message_send_status=pending`，且当天全库新增 pending 也只有这 5 条，说明不是历史脏行误读。
+    - `run_id=16416`：`持仓与关注股交易日晚间合并研判`，`executed_at=2026-05-07T20:30:00.652439+08:00`，`detail_json={"delivery_key":"j_917c1c2e:2026-05-07:20:30","phase":"started"}`。
+    - `run_id=16418`：`每日仓位复盘`，`executed_at=2026-05-07T20:30:00.661211+08:00`，`phase=started`。
+    - `run_id=16421`：`美股盘前宏观与财报日历梳理`，`executed_at=2026-05-07T20:30:00.652664+08:00`，`phase=started`。
+    - `run_id=16423`：`老王说事与巴芒投资美股财报季个股判断`，`executed_at=2026-05-07T20:30:00.661616+08:00`，`phase=started`。
+    - `run_id=16424`：`持仓重大事件心跳检测`，`executed_at=2026-05-07T20:30:00.661492+08:00`，`delivery_key` 含 `heartbeat`，`phase=started`。
+  - `data/runtime/logs/sidecar.log`
+    - `2026-05-07 20:42:17-20:42:18` 当前 runtime 重新拉起 `hone-discord` 与 `hone-feishu`。
+    - 重启后同一日志中可见后续 `20:45`、`20:48`、`21:00` 之后的 Feishu 任务正常 `session.persist_assistant` / `reply.send`，但没有看到上述 20:30 五条 started row 被终态覆盖。
+  - `data/sessions/*.json`
+    - 受影响的 `20:30` 任务至少包含真实 `[定时任务触发]` user turn；例如 `Actor_feishu__direct__ou_5f44eaaa05cec98860b5336c3bddcc22d1.json` 在 `2026-05-07T20:30:00.660111+08:00` 记录 `持仓与关注股交易日晚间合并研判` 的触发正文，随后同会话在 `20:48` 与 `22:09` 有新的人工直聊成功收口，证明会话文件本身仍可写，而 20:30 定时任务没有完成态。
+
+## GitHub Issue
+
+- 2026-05-07 本轮巡检确认该 P1 缺陷重新活跃；已创建脱敏 GitHub Issue [#39](https://github.com/B-M-Capital-Research/honeclaw/issues/39)。
+
+## 修复与验证（2026-05-08）
+
+- `memory/src/cron_job/history.rs`
+  - 新增 `recover_stale_started_executions(...)`：按渠道扫描上一进程遗留的 `execution_status=running + message_send_status=pending + detail.phase=started` row，并统一收口为 `execution_failed + send_failed`。
+  - 恢复时会保留原 `delivery_key`，并在 `detail_json` 写入 `phase=recovered_stale_pending`、`recovered_by=feishu_scheduler_startup`、`recovered_at=...`，便于后续巡检和审计。
+- `bins/hone-feishu/src/scheduler.rs`
+  - Feishu scheduler 启动时会按 `agent.overall_timeout + 60s` 恢复窗口调用上述回收逻辑，确保 runtime 重启后旧的 started row 不再永久卡在 `running/pending`。
+  - 单次 `execute_scheduler_event(...)` 外层再包一层 `tokio::time::timeout`，deadline 为 `agent.overall_timeout + 30s`。超过 deadline 后，本轮 run 会立即落成 `scheduler_handler_timeout`，不再依赖底层 runner 自己收口。
+  - 超时分支会向对应 direct session 追加一次内部失败 transcript（`scheduler_failure=true`），保证会话中至少留下一条失败痕迹；该 transcript 做了尾部幂等保护，不会重复追加。
+- 本轮没有自动补发历史消息：对于已被 runtime 中断的旧 run，无法可靠判断是否曾经生成用户可见正文；自动补发存在重复投递风险，因此本修复只做可审计的失败收口。
+
+## 验证
+
+- `cargo test -p hone-memory stale_started_rows_can_be_recovered_as_failed -- --nocapture`
+- `cargo test -p hone-feishu persist_scheduler_timeout_failure_turn_is_idempotent -- --nocapture`
+- `cargo check -p hone-feishu --tests`
+
+## 剩余观察点
+
+- 本轮没有重启 live Feishu runtime，也没有做人肉补跑；因此“真实 20:30 长任务在下一次窗口是否按 timeout/启动恢复闭环”仍需后续巡检确认。
+- 当前修复优先保证“started row 必有终态、direct session 至少有失败痕迹”；如果后续发现 timeout 取消后仍残留底层 runner 子进程或重复副作用，应另立缺陷继续收口。
+
+## 关闭复核（2026-05-13）
+
+- **2026-05-13 11:08 CST 巡检结论**：本缺陷从 `Fixed` 更新为 `Closed`。最新 live 重启窗口证明 stale started row 回收逻辑已在真实 Feishu scheduler 启动路径生效。
+- **证据来源**：
+  - `data/runtime/logs/sidecar.log`
+    - `2026-05-13 10:22:39 CST` 记录 `[Feishu] 已回收上一进程遗留的 stale pending 定时任务: count=4380`。
+    - 同一时间 Feishu runtime 重新注册 `im.message.receive_v1` handler 并随后连接飞书长连接。
+  - `data/sessions.sqlite3` -> `cron_job_runs`
+    - 全库不再残留 `execution_status=running` 或 `message_send_status=pending` 的 row。
+    - 共 `4380` 条历史 started row 被统一改为 `execution_failed + send_failed`，`detail_json.phase=recovered_stale_pending`，`detail_json.recovered_by=feishu_scheduler_startup`，`recovered_at=2026-05-13T10:22:39.530610+08:00`。
+    - 样本包括 `run_id=16416/16418/16421/16423/16424` 这些 2026-05-07 20:30 CST 的复发证据行，均已补终态。
+    - 10:30 CST 后新 heartbeat 窗口已正常收口：`DRAM 心跳监控`、`持仓重大事件心跳检测`、`Cerebras IPO与业务进展心跳监控` 为 `completed + sent + delivered=1`，其余同窗为正常 `noop + skipped_noop`；11:00 CST 窗口也均正常收口。
+- **结论**：
+  - 本轮 10:22 CST 的 4380 条 `execution_failed + send_failed` 不是新的用户可见批量故障，而是既有修复对历史 `running/pending` 脏行的启动回收结果。
+  - 原 P1 关注点是“进入执行后长期无终态、台账停在 running/pending 或缺账”；当前 live 已证明启动恢复能补终态，且新窗口没有继续产生 pending 残留，因此关闭。

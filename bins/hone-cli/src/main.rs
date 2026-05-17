@@ -3,6 +3,7 @@ mod common;
 mod configure;
 mod discord_token;
 mod display;
+mod i18n;
 mod mutations;
 mod onboard;
 mod probe;
@@ -10,6 +11,7 @@ mod prompts;
 mod repl;
 mod reports;
 mod start;
+mod web;
 mod yaml_io;
 
 use cleanup::{CleanupArgs, run_cleanup};
@@ -23,6 +25,8 @@ use reports::{
     build_channel_reports, build_doctor_report, build_model_status, build_status_report,
     print_doctor_report_text,
 };
+use start::StartArgs;
+use web::{WebCommands, run_web_command};
 use yaml_io::{
     apply_message, apply_mutations_and_generate, print_json, value_to_pretty_text,
     yaml_value_from_cli,
@@ -33,6 +37,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use common::{load_cli_config, load_cli_core, resolve_runtime_paths};
 use hone_core::config::{ConfigMutation, read_config_path_value, redact_sensitive_value};
+use hone_memory::{ChannelTargetRecord, CronJobStorage};
 use serde::Serialize;
 use serde_yaml::Value;
 
@@ -79,8 +84,13 @@ enum Commands {
     Status(StatusArgs),
     /// 深度体检：路径 / 权限 / 二进制 / 渠道 auth 是否都 OK。
     Doctor(DoctorArgs),
-    /// 启动 hone-console-page + 各启用渠道(bundled CLI install 用)。
-    Start,
+    /// 启动 hone-console-page + 各启用渠道。
+    Start(StartArgs),
+    /// 启动 Web 前端入口：admin-ui / user-ui。
+    Web {
+        #[command(subcommand)]
+        command: WebCommands,
+    },
     /// 启动渠道协议 probe,方便排查外部渠道连接问题。
     Probe(ProbeArgs),
 }
@@ -111,8 +121,10 @@ enum ModelsCommands {
 enum ChannelsCommands {
     /// 列出四个渠道(iMessage / Feishu / Telegram / Discord)当前状态。
     List(ReadableArgs),
-    /// 按渠道写入启用状态 / 认证字段 / chat_scope。
+    /// 按渠道写入启用状态 / 认证字段 / chat_scope / allowlist。
     Set(ChannelSetArgs),
+    /// 列出已知投递目标(来源于 cron 任务和最近执行记录)。
+    Targets(ReadableArgs),
     /// 快捷启用某个渠道(等价于 `channels set <c> --enabled true`)。
     Enable(ChannelToggleArgs),
     /// 快捷禁用某个渠道。
@@ -215,6 +227,37 @@ pub(crate) fn non_empty(value: &str) -> bool {
     !value.trim().is_empty()
 }
 
+fn cron_storage_from_config(config: &hone_core::HoneConfig) -> CronJobStorage {
+    if config.storage.session_sqlite_db_path.trim().is_empty() {
+        CronJobStorage::new(&config.storage.cron_jobs_dir)
+    } else {
+        CronJobStorage::with_sqlite(
+            &config.storage.cron_jobs_dir,
+            &config.storage.session_sqlite_db_path,
+        )
+    }
+}
+
+fn print_channel_targets_text(targets: &[ChannelTargetRecord]) {
+    if targets.is_empty() {
+        println!("No channel targets found");
+        return;
+    }
+    for target in targets {
+        println!(
+            "{} scope={} target={} jobs={} enabled={} sources={} actors={} last_seen={}",
+            target.channel,
+            target.channel_scope.as_deref().unwrap_or("-"),
+            target.target,
+            target.scheduled_jobs,
+            target.enabled_jobs,
+            target.sources.join(","),
+            target.actor_user_ids.join(","),
+            target.last_seen_at.as_deref().unwrap_or("-")
+        );
+    }
+}
+
 async fn run_cli() -> Result<(), String> {
     let cli = Cli::parse();
     match cli.command {
@@ -273,7 +316,10 @@ async fn run_cli() -> Result<(), String> {
                     path: args.path,
                     value: updated,
                 };
-                println!("{}", apply_message(&applied.apply));
+                println!(
+                    "{}",
+                    apply_message(i18n::resolve_lang(cli.config.as_deref()), &applied.apply)
+                );
                 println!("Updated {} in {}", result.path, result.config_path);
                 println!("value={}", value_to_pretty_text(&result.value));
                 Ok(())
@@ -303,7 +349,10 @@ async fn run_cli() -> Result<(), String> {
                 if args.json {
                     print_json(&result)
                 } else {
-                    println!("{}", apply_message(&applied.apply));
+                    println!(
+                        "{}",
+                        apply_message(i18n::resolve_lang(cli.config.as_deref()), &applied.apply)
+                    );
                     println!("Unset {} in {}", result.path, result.config_path);
                     Ok(())
                 }
@@ -356,7 +405,10 @@ async fn run_cli() -> Result<(), String> {
                     .map_err(|e| e.to_string())?;
                 let mutations = build_model_mutations(&args)?;
                 let result = apply_mutations_and_generate(&paths, &mutations)?;
-                println!("{}", apply_message(&result.apply));
+                println!(
+                    "{}",
+                    apply_message(i18n::resolve_lang(cli.config.as_deref()), &result.apply)
+                );
                 println!(
                     "config={} effective={}",
                     paths.canonical_config_path.to_string_lossy(),
@@ -374,8 +426,13 @@ async fn run_cli() -> Result<(), String> {
                     print_json(&report)
                 } else {
                     for channel in report {
+                        let details = if channel.details.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", channel.details.join(" "))
+                        };
                         println!(
-                            "{} enabled={} auth_configured={}{}",
+                            "{} enabled={} auth_configured={}{}{}",
                             channel.channel,
                             channel.enabled,
                             channel.auth_configured,
@@ -383,7 +440,8 @@ async fn run_cli() -> Result<(), String> {
                                 .chat_scope
                                 .as_ref()
                                 .map(|scope| format!(" chat_scope={scope}"))
-                                .unwrap_or_default()
+                                .unwrap_or_default(),
+                            details
                         );
                     }
                     Ok(())
@@ -394,13 +452,28 @@ async fn run_cli() -> Result<(), String> {
                     .map_err(|e| e.to_string())?;
                 let mutations = build_channel_mutations(&args)?;
                 let result = apply_mutations_and_generate(&paths, &mutations)?;
-                println!("{}", apply_message(&result.apply));
+                println!(
+                    "{}",
+                    apply_message(i18n::resolve_lang(cli.config.as_deref()), &result.apply)
+                );
                 println!(
                     "config={} effective={}",
                     paths.canonical_config_path.to_string_lossy(),
                     paths.effective_config_path.to_string_lossy()
                 );
                 Ok(())
+            }
+            ChannelsCommands::Targets(args) => {
+                let (config, _) =
+                    load_cli_config(cli.config.as_deref(), false).map_err(|e| e.to_string())?;
+                let storage = cron_storage_from_config(&config);
+                let targets = storage.list_channel_targets();
+                if args.json {
+                    print_json(&targets)
+                } else {
+                    print_channel_targets_text(&targets);
+                    Ok(())
+                }
             }
             ChannelsCommands::Enable(args) => {
                 let paths = resolve_runtime_paths(cli.config.as_deref(), true)
@@ -418,7 +491,10 @@ async fn run_cli() -> Result<(), String> {
                         value: Value::Bool(true),
                     }],
                 )?;
-                println!("{}", apply_message(&result.apply));
+                println!(
+                    "{}",
+                    apply_message(i18n::resolve_lang(cli.config.as_deref()), &result.apply)
+                );
                 println!("Enabled {path}");
                 Ok(())
             }
@@ -438,7 +514,10 @@ async fn run_cli() -> Result<(), String> {
                         value: Value::Bool(false),
                     }],
                 )?;
-                println!("{}", apply_message(&result.apply));
+                println!(
+                    "{}",
+                    apply_message(i18n::resolve_lang(cli.config.as_deref()), &result.apply)
+                );
                 println!("Disabled {path}");
                 Ok(())
             }
@@ -450,14 +529,18 @@ async fn run_cli() -> Result<(), String> {
             } else {
                 println!("canonical_config={}", report.canonical_config_path);
                 println!("effective_config={}", report.effective_config_path);
-                let primary_model = if report.models.opencode_inherits_local_config {
+                let primary_model = if report.models.runner == "hone_cloud" {
+                    report.models.hone_cloud_model.as_str()
+                } else if report.models.opencode_inherits_local_config {
                     "<opencode default>"
                 } else if non_empty(&report.models.opencode_model) {
                     report.models.opencode_model.as_str()
                 } else {
                     "<unset>"
                 };
-                let primary_variant = if report.models.opencode_inherits_local_config {
+                let primary_variant = if report.models.runner == "hone_cloud" {
+                    "<n/a>"
+                } else if report.models.opencode_inherits_local_config {
                     "<inherited>"
                 } else if non_empty(&report.models.opencode_variant) {
                     report.models.opencode_variant.as_str()
@@ -507,7 +590,8 @@ async fn run_cli() -> Result<(), String> {
                 Ok(())
             }
         }
-        Some(Commands::Start) => start::run_start(cli.config.as_deref()).await,
+        Some(Commands::Start(args)) => start::run_start(cli.config.as_deref(), args).await,
+        Some(Commands::Web { command }) => run_web_command(cli.config.as_deref(), command).await,
         Some(Commands::Probe(args)) => {
             let (core, paths) = load_cli_core(cli.config.as_deref()).map_err(|e| e.to_string())?;
             probe::run_probe(core, &paths.canonical_config_path.to_string_lossy(), args).await
@@ -559,6 +643,80 @@ mod tests {
                 assert_eq!(args.runner.as_deref(), Some("opencode_acp"));
                 assert_eq!(args.model.as_deref(), Some("openrouter/openai/gpt-5.4"));
                 assert_eq!(args.variant.as_deref(), Some("medium"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_channels_targets_command() {
+        let cli = Cli::try_parse_from(["hone-cli", "channels", "targets", "--json"]).unwrap();
+        match cli.command {
+            Some(Commands::Channels {
+                command: ChannelsCommands::Targets(args),
+            }) => assert!(args.json),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_start_build_source_root() {
+        let cli = Cli::try_parse_from([
+            "hone-cli",
+            "start",
+            "--build",
+            "--source-root",
+            "/tmp/hone-source",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Start(args)) => {
+                assert!(args.build);
+                assert_eq!(args.source_root, Some(PathBuf::from("/tmp/hone-source")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_web_admin_ui_source_mode() {
+        let cli = Cli::try_parse_from([
+            "hone-cli",
+            "web",
+            "admin-ui",
+            "--dev",
+            "--port",
+            "3010",
+            "--backend-url",
+            "http://127.0.0.1:8077",
+            "--source-root",
+            "/tmp/hone-source",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Web {
+                command: WebCommands::AdminUi(args),
+            }) => {
+                assert!(args.dev);
+                assert_eq!(args.port, Some(3010));
+                assert_eq!(args.backend_url.as_deref(), Some("http://127.0.0.1:8077"));
+                assert_eq!(args.source_root, Some(PathBuf::from("/tmp/hone-source")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_web_user_ui_preview_mode() {
+        let cli =
+            Cli::try_parse_from(["hone-cli", "web", "user-ui", "--no-build", "--port", "3011"])
+                .unwrap();
+        match cli.command {
+            Some(Commands::Web {
+                command: WebCommands::UserUi(args),
+            }) => {
+                assert!(args.no_build);
+                assert_eq!(args.port, Some(3011));
             }
             other => panic!("unexpected command: {other:?}"),
         }
