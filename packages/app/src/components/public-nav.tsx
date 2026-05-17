@@ -47,8 +47,10 @@ export function PublicNav() {
   // the CONTENT proxy inside JSX and tracks the locale signal.
   const links = [
     { labelKey: "home", path: "/" },
-    { labelKey: "roadmap", path: "/roadmap" },
+    { labelKey: "chat", path: "/chat" },
+    { labelKey: "portfolio", path: "/portfolio" },
     { labelKey: "me", path: "/me" },
+    { labelKey: "roadmap", path: "/roadmap" },
   ] as const
 
   const go = (path: string) => {

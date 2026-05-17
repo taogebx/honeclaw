@@ -54,12 +54,9 @@ body {
 }
 
 /* Shared public product header used by the home, roadmap, and chat pages. */
+/* Performance fix (finhub local): 3 个大圆 + blur(100px) + 持续 animation 让 Chrome GPU 飙到 76% / 风扇狂转，整个 .animated-bg 隐藏即可（纯装饰） */
 .animated-bg {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  overflow: hidden;
-  pointer-events: none;
+  display: none;
 }
 .circle {
   position: absolute;

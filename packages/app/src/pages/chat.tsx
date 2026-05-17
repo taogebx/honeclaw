@@ -225,6 +225,12 @@ function Header() {
         <PrefsButton />
 
         <div style={{ display: "flex", gap: "10px" }}>
+          <button onClick={() => navigate("/portfolio")} class="btn-roadmap-nav mobile-hide">
+            {useLocale() === 'zh' ? '持仓' : 'Portfolio'}
+          </button>
+          <button onClick={() => navigate("/me")} class="btn-roadmap-nav mobile-hide">
+            {useLocale() === 'zh' ? '我的' : 'Me'}
+          </button>
           <button onClick={() => navigate("/roadmap")} class="btn-roadmap-nav mobile-hide">
             {useLocale() === 'zh' ? '产品路线图' : 'Roadmap'}
           </button>
