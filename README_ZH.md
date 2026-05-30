@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <strong>简体中文</strong> | <a href="./README.md">English</a> | <strong>官网：</strong><a href="https://hone-claw.com" target="_blank">hone-claw.com</a> | <strong>💬 社群：</strong> <a href="https://discord.gg/TyDNfYXDGF" target="_blank">Discord</a>
+  <strong>简体中文</strong> | <a href="./README.md">English</a> | <strong>官网：</strong><a href="https://hone-claw.com" target="_blank">hone-claw.com</a> | <strong>博客：</strong><a href="https://hone-claw.com/blog" target="_blank">hone-claw.com/blog</a> | <strong>💬 社群：</strong> <a href="https://discord.gg/TyDNfYXDGF" target="_blank">Discord</a>
 </p>
 
 ---
@@ -37,7 +37,7 @@ Honeclaw（或称 Hone）是一个使用 **Rust** 编写的开源个人投研辅
 - 🧠 **绝对理性的投研内核**：不附和、不盲从。在你做出投资决策时，它会基于数据和预设纪律进行交叉验证，指出你的逻辑漏洞。
 - 📱 **全平台无缝接入**：支持 Web 控制台、iMessage、飞书 (Lark)、Telegram、Discord，随时随地与你的投资大脑进行对话。
 - 🗂️ **公司画像与长期记忆**：Hone 可以把公司主画像与关键事件时间线持续沉淀为 Markdown 档案，长期保留投资主线、核心经营指标、风险台账与重大变化。
-- 📊 **持仓监控与纪律执行**：设定你的止盈止损线、加仓逻辑与核心关注指标，Hone 会像冷酷的守望者一样帮你盯盘并主动提醒。
+- 📊 **持仓监控与纪律执行**：设定你的止盈止损线、加仓逻辑与核心关注指标，Hone 会持续监控市场，并在你设定的条件触发时主动提醒。
 - ⏰ **强大的定时任务 (Cron)**：支持复杂的定时监控任务，例如盘前摘要、盘后总结、特定财报发布后的自动分析等。
 - ⚡ **Rust 驱动的极致性能**：底层完全使用 Rust 构建，确保毫秒级响应速度，同时保持极低的内存占用和极高的稳定性。
 
@@ -72,7 +72,7 @@ Honeclaw（或称 Hone）是一个使用 **Rust** 编写的开源个人投研辅
 ## 前置依赖
 
 - **运行环境**：类 Unix 环境（推荐 **macOS** 或 **Ubuntu**）。
-- **Rust**：**2021 Edition** 及以上工具链。
+- **Rust**：支持 **Edition 2024** 的稳定工具链。
 
 ### 技术栈
 
@@ -80,6 +80,8 @@ Honeclaw（或称 Hone）是一个使用 **Rust** 编写的开源个人投研辅
 - **后端**：Rust
 - **客户端**（桌面端）：Rust（Tauri）
 - **前端**：TypeScript（SolidJS + Tailwind v4）
+
+为什么使用 Rust：详见第一篇 Hone Blog，[Hone 为什么采用 Rust，以及推荐大家都开始使用 Rust](https://hone-claw.com/blog/why-hone-uses-rust)。
 
 ### 支持渠道
 

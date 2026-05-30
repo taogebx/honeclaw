@@ -12,11 +12,11 @@
 //! 3. Missing keys fall back to the key itself so a stray `t(lang, "foo.bar")`
 //!    surfaces visibly in dev rather than silently rendering empty.
 //!
-//! The string table is intentionally compact — only Step 1 and a handful of
-//! shared chrome strings (banner, apply summary) are translated here. Other
-//! prompts in `onboard.rs` keep their original Chinese for now; they can be
-//! migrated to `t!()` in a follow-up commit without touching this module's
-//! shape.
+//! The string table stays focused on onboard chrome and reusable prompts:
+//! language, runner, channel, admin, provider, notifications, recovery, and
+//! apply strings live here. Some long-form input handling still stays in
+//! `onboard.rs`; those can move behind `t()` without changing this module's
+//! lookup contract.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Lang {
@@ -53,10 +53,10 @@ impl Default for Lang {
 /// config first; falls back to host-locale detection so subcommands run
 /// before onboarding still pick a sensible language.
 pub(crate) fn resolve_lang(config_path: Option<&std::path::Path>) -> Lang {
-    if let Ok(paths) = crate::common::resolve_runtime_paths(config_path, false) {
-        if let Ok(config) = hone_core::HoneConfig::from_file(&paths.canonical_config_path) {
-            return Lang::from_locale(config.language);
-        }
+    if let Ok(paths) = crate::common::resolve_runtime_paths(config_path, false)
+        && let Ok(config) = hone_core::HoneConfig::from_file(&paths.canonical_config_path)
+    {
+        return Lang::from_locale(config.language);
     }
     detect_initial_lang()
 }
@@ -97,8 +97,8 @@ fn leak(key: &str) -> &'static str {
     Box::leak(key.to_string().into_boxed_str())
 }
 
-/// (key, zh, en). Keys are dotted namespaces — `step.<n>` for step labels,
-/// `lang.*` for the language step itself, `apply.*` for the apply summary.
+/// (key, zh, en). Keys are dotted namespaces such as `step.*`, `lang.*`,
+/// `runner.*`, `channel.*`, `provider.*`, `notifications.*`, and `apply.*`.
 const STRINGS: &[(&str, &str, &str)] = &[
     // ── Banner / chrome ──────────────────────────────────────────────────
     ("banner.title", "Hone onboarding", "Hone onboarding"),
@@ -140,7 +140,7 @@ const STRINGS: &[(&str, &str, &str)] = &[
     // ── Apply summary ────────────────────────────────────────────────────
     (
         "apply.fields_written",
-        "(共写入 {n} 条字段)",
+        "（共写入 {n} 条字段）",
         "({n} fields written)",
     ),
     (
@@ -231,8 +231,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "runner.hone_cloud.note_1",
-        "前置：一把 Hone Cloud API key。",
-        "Requires: one Hone Cloud API key.",
+        "前置：一个 Hone Cloud API key。",
+        "Requires: a Hone Cloud API key.",
     ),
     (
         "runner.hone_cloud.note_2",
@@ -256,8 +256,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "runner.multi_agent.note_1",
-        "前置：multi-agent search API key，以及本机可运行的 opencode；answer 可复用 OpenRouter key。",
-        "Requires: a multi-agent search API key plus local opencode; answer can reuse an OpenRouter key.",
+        "前置：multi-agent search API key、本机可运行的 opencode，以及 answer key 或 `llm.providers.openrouter.api_key/api_keys`。",
+        "Requires: a multi-agent search API key, local opencode, and an answer key or `llm.providers.openrouter.api_key/api_keys`.",
     ),
     (
         "runner.multi_agent.note_2",
@@ -376,8 +376,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "runner.multi_agent.setup_note_2",
-        "实际跑起来还需要 `agent.multi_agent.search.api_key` 或 legacy `llm.auxiliary.api_key`，以及本机 opencode。",
-        "It also needs `agent.multi_agent.search.api_key` or legacy `llm.auxiliary.api_key`, plus local opencode.",
+        "实际跑起来还需要 `agent.multi_agent.search.api_key` 或 legacy `llm.auxiliary.api_key`、answer key 或 `llm.providers.openrouter.api_key/api_keys`，以及本机 opencode。",
+        "It also needs `agent.multi_agent.search.api_key` or legacy `llm.auxiliary.api_key`, an answer key or `llm.providers.openrouter.api_key/api_keys`, plus local opencode.",
     ),
     (
         "runner.multi_agent.setup_note_3",
@@ -426,8 +426,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "runner.opencode_acp.warn_not_connected",
-        "继续写入 runner 配置；请记得稍后执行 `opencode` 并 `/connect` 配好 provider，否则 Hone 起 chat 会立刻失败。",
-        "Writing the runner config anyway. Remember to run `opencode` and `/connect` later — Hone chat will fail immediately otherwise.",
+        "继续写入 runner 配置；请记得稍后执行 `opencode` 并 `/connect` 配好 provider，否则 Hone 聊天会立即失败。",
+        "Writing the runner config anyway. Remember to run `opencode` and `/connect` later — Hone chat requests will fail immediately otherwise.",
     ),
     // ── Channels step ────────────────────────────────────────────────────
     (
@@ -541,8 +541,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("channel.telegram.label", "Telegram", "Telegram"),
     (
         "channel.telegram.status_note",
-        "当前仍偏实验/占位模式，不建议当成熟生产渠道使用。",
-        "Currently experimental / placeholder — not yet recommended for production.",
+        "Telegram 渠道仍是实验性能力，暂不建议作为成熟生产渠道使用。",
+        "Telegram is still experimental and is not yet recommended as a production channel.",
     ),
     (
         "channel.telegram.note_1",
@@ -577,7 +577,7 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "channel.discord.note_2",
-        "需要把 bot 邀请进目标 server/channel。",
+        "需要把 bot 邀请进目标服务器 / 频道。",
         "Invite the bot to the target server / channel.",
     ),
     (
@@ -686,12 +686,12 @@ const STRINGS: &[(&str, &str, &str)] = &[
     (
         "provider.configure_prompt",
         "现在配置 {label} API key 吗？",
-        "Configure {label} API keys now?",
+        "Set up {label} API keys now?",
     ),
     (
         "provider.skip_message",
-        "已跳过 {label} API key 配置。",
-        "Skipped {label} API key configuration.",
+        "已跳过 {label} API key 设置。",
+        "Skipped {label} API key setup.",
     ),
     (
         "provider.saved_message",
@@ -700,8 +700,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "provider.keep_existing_message",
-        "保留现有 {label} API key 配置。",
-        "Kept existing {label} API key configuration.",
+        "保留现有 {label} API key 设置。",
+        "Kept existing {label} API key setup.",
     ),
     (
         "provider.keys_required_or_skip",
@@ -726,8 +726,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "provider.openrouter.note_3",
-        "支持一次填写多个 key，运行时会自动 fallback。",
-        "Multiple keys are supported; runtime will fall back automatically.",
+        "支持一次填写多个 key，Hone 会自动尝试备用 key。",
+        "Multiple keys are supported; Hone will try backup keys automatically.",
     ),
     ("provider.fmp.label", "FMP", "FMP"),
     (
@@ -742,8 +742,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "provider.fmp.note_2",
-        "支持一次填写多个 key，运行时会自动 fallback。",
-        "Multiple keys are supported; runtime will fall back automatically.",
+        "支持一次填写多个 key，Hone 会自动尝试备用 key。",
+        "Multiple keys are supported; Hone will try backup keys automatically.",
     ),
     ("provider.tavily.label", "Tavily", "Tavily"),
     (
@@ -758,8 +758,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "provider.tavily.note_2",
-        "支持一次填写多个 key，运行时会自动 fallback。",
-        "Multiple keys are supported; runtime will fall back automatically.",
+        "支持一次填写多个 key，Hone 会自动尝试备用 key。",
+        "Multiple keys are supported; Hone will try backup keys automatically.",
     ),
     // ── Notifications step ───────────────────────────────────────────────
     (
@@ -769,18 +769,18 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "notifications.defaults_1",
-        "Global digest：默认对所有新用户**开启**，LLM 精读后每天按窗口推送到 chat。",
+        "全局摘要：默认对所有新用户**开启**，LLM 精读后每天按窗口推送到对话。",
         "Global digest: enabled by default for all new users — an LLM curates and pushes it to chat once per window.",
     ),
     (
         "notifications.defaults_2",
-        "Per-event 通知：默认开启（Severity::Low 起、不限 portfolio）。",
-        "Per-event notifications: enabled by default (from Severity::Low, all portfolios).",
+        "单事件通知：默认开启（低严重度起、不限持仓）。",
+        "Per-event notifications: enabled by default for low severity and above, across all portfolios.",
     ),
     (
         "notifications.defaults_3",
-        "投资主线自动蒸馏：后台 cron 周扫 sandbox `company_profiles/*/profile.md`，无需用户操作。",
-        "Investment mainline auto-distillation: a background cron weekly-scans sandbox `company_profiles/*/profile.md` — no user action needed.",
+        "投资主线自动蒸馏：Hone 会在后台每周检查公司画像文件，无需用户操作。",
+        "Investment mainline auto-distillation: Hone checks company profile files weekly in the background — no user action needed.",
     ),
     (
         "notifications.user_adjust_title",
@@ -789,13 +789,13 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "notifications.user_adjust_1",
-        "用自然语言告诉 bot 即可，例如「关闭 digest」「不要每天推送」「只看 portfolio」。",
-        "Tell the bot in natural language, e.g. \"disable digest\", \"stop daily pushes\", \"portfolio only\".",
+        "用自然语言告诉 Hone 即可，例如「关闭摘要」「不要每天推送」「只看持仓相关」。",
+        "Tell Hone in natural language, e.g. \"disable digest\", \"stop daily pushes\", \"portfolio only\".",
     ),
     (
         "notifications.user_adjust_2",
-        "对应 `notification_prefs_tool`，无需 Web UI。",
-        "Backed by `notification_prefs_tool` — no web UI required.",
+        "Hone 会在背后调用通知偏好工具，无需 Web UI。",
+        "Hone updates notification preferences behind the scenes — no web UI required.",
     ),
     (
         "notifications.change_default_title",
@@ -831,13 +831,13 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "recovery.option_provider_skip",
-        "跳过 {label} API key 配置",
-        "Skip {label} API key configuration",
+        "跳过 {label} API key 设置",
+        "Skip {label} API key setup",
     ),
     (
         "recovery.provider_empty_prompt",
-        "{label} API key 为空，下一步？",
-        "{label} API key is empty — what next?",
+        "{label} API keys 为空，下一步？",
+        "{label} API keys are empty — what next?",
     ),
     (
         "recovery.option_discord_token_retry",

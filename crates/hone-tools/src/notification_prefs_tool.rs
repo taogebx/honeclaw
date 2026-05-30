@@ -88,19 +88,130 @@ fn extract_string_array(value: &Value) -> HoneResult<Vec<String>> {
 }
 
 fn validate_tags(tags: &[String]) -> HoneResult<()> {
-    if let Some(bad) = first_invalid_kind_tag(tags.iter().map(|s| s.as_str())) {
+    if let Some(invalid_tag) = first_invalid_kind_tag(tags.iter().map(|tag| tag.as_str())) {
         return Err(HoneError::Tool(format!(
-            "未知的 kind tag '{bad}';合法清单:{}",
+            "未知的 kind tag '{invalid_tag}';合法清单:{}",
             ALL_KIND_TAGS.join(", ")
         )));
     }
     Ok(())
 }
 
-fn validate_hhmm(s: &str) -> HoneResult<()> {
-    chrono::NaiveTime::parse_from_str(s, "%H:%M")
+fn validate_hhmm(time_text: &str) -> HoneResult<()> {
+    chrono::NaiveTime::parse_from_str(time_text, "%H:%M")
         .map(|_| ())
-        .map_err(|_| HoneError::Tool(format!("时间格式必须为 HH:MM (24h),收到 {s:?}")))
+        .map_err(|_| HoneError::Tool(format!("时间格式必须为 HH:MM (24h),收到 {time_text:?}")))
+}
+
+fn parse_bool_flag(value: &Value, action: &str) -> HoneResult<bool> {
+    match value {
+        Value::Bool(flag) => Ok(*flag),
+        Value::String(raw) => Ok(matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on"
+        )),
+        _ => Err(HoneError::Tool(format!("{action} 需要 true/false"))),
+    }
+}
+
+fn optional_kind_tags(value: &Value) -> HoneResult<Option<Vec<String>>> {
+    let tags = extract_string_array(value)?;
+    validate_tags(&tags)?;
+    Ok((!tags.is_empty()).then_some(tags))
+}
+
+fn parse_digest_slots(value: &Value) -> HoneResult<Vec<DigestSlot>> {
+    let slot_values = value.as_array().ok_or_else(|| {
+        HoneError::Tool(
+            "set_digest_slots 需要 HH:MM 字符串数组,例 [\"19:00\",\"09:00\"];传 [] 关 digest"
+                .into(),
+        )
+    })?;
+    let mut slots: Vec<DigestSlot> = Vec::with_capacity(slot_values.len());
+    for (idx, slot_value) in slot_values.iter().enumerate() {
+        let slot_time = slot_value
+            .as_str()
+            .ok_or_else(|| HoneError::Tool("digest_slots 元素必须是 HH:MM 字符串".into()))?
+            .trim()
+            .to_string();
+        if slot_time.is_empty() {
+            continue;
+        }
+        validate_hhmm(&slot_time)?;
+        slots.push(DigestSlot {
+            id: format!("slot_{idx}"),
+            time: slot_time,
+            label: None,
+            floor_macro: None,
+        });
+    }
+    Ok(slots)
+}
+
+fn digest_slot_times_inside_quiet(slots: &[DigestSlot], quiet_hours: &QuietHours) -> Vec<String> {
+    slots
+        .iter()
+        .filter(|slot| crate::schedule_view::time_in_quiet(&slot.time, Some(quiet_hours)))
+        .map(|slot| slot.time.clone())
+        .collect()
+}
+
+fn parse_price_high_pct(value: &Value) -> HoneResult<f64> {
+    let percentage = match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(raw_text) => raw_text.trim().parse::<f64>().ok(),
+        Value::Null => None,
+        _ => None,
+    }
+    .ok_or_else(|| {
+        HoneError::Tool(
+            "set_price_high_pct 需要数字 (0<x≤50,例 3.5);传 null 清空回到全局阈值".into(),
+        )
+    })?;
+    if !(percentage.is_finite() && percentage > 0.0 && percentage <= 50.0) {
+        return Err(HoneError::Tool(format!(
+            "price_high_pct 必须在 (0, 50] 范围,收到 {percentage}"
+        )));
+    }
+    Ok(percentage)
+}
+
+fn parse_quiet_hours(value: &Value) -> HoneResult<QuietHours> {
+    let quiet_hours_object = value.as_object().ok_or_else(|| {
+        HoneError::Tool(
+            "set_quiet_hours 需要对象 {from, to, exempt_kinds?},例 {\"from\":\"23:00\",\"to\":\"07:00\"}"
+                .into(),
+        )
+    })?;
+    let from = quiet_hours_object
+        .get("from")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| HoneError::Tool("set_quiet_hours 缺少 from (HH:MM)".into()))?
+        .trim()
+        .to_string();
+    let to = quiet_hours_object
+        .get("to")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| HoneError::Tool("set_quiet_hours 缺少 to (HH:MM)".into()))?
+        .trim()
+        .to_string();
+    validate_hhmm(&from)?;
+    validate_hhmm(&to)?;
+    if from == to {
+        return Err(HoneError::Tool(
+            "set_quiet_hours 的 from 与 to 不能相等(空区间);若想全天静音请用 disable".into(),
+        ));
+    }
+    let exempt_kinds = match quiet_hours_object.get("exempt_kinds") {
+        Some(v) if !v.is_null() => extract_string_array(v)?,
+        _ => Vec::new(),
+    };
+    validate_tags(&exempt_kinds)?;
+    Ok(QuietHours {
+        from,
+        to,
+        exempt_kinds,
+    })
 }
 
 fn prefs_to_json(prefs: &NotificationPrefs) -> Value {
@@ -120,10 +231,10 @@ fn prefs_to_json(prefs: &NotificationPrefs) -> Value {
         "immediate_kinds": prefs.immediate_kinds,
         "mainline_style": prefs.mainline_style,
         "mainline_by_ticker": prefs.mainline_by_ticker,
-        "quiet_hours": prefs.quiet_hours.as_ref().map(|qh| json!({
-            "from": qh.from,
-            "to": qh.to,
-            "exempt_kinds": qh.exempt_kinds,
+        "quiet_hours": prefs.quiet_hours.as_ref().map(|quiet_hours| json!({
+            "from": quiet_hours.from,
+            "to": quiet_hours.to,
+            "exempt_kinds": quiet_hours.exempt_kinds,
         })),
     })
 }
@@ -153,10 +264,10 @@ impl Tool for NotificationPrefsTool {
          (PriceAlert 2h, Weekly52 8h, Social 12h, 其它事实性事件不过期)。\
          exempt_kinds 命中的 kind 即使在 quiet 内仍立即推(例如想财报夜里也响:[\"earnings_released\"])。\
          clear_quiet_hours 关掉勿扰。\
-         **注意**:每只持仓的 thesis 与整体 investment_style 现在由系统每周自动从用户\
-         自己写的公司画像(走 company_portrait skill)蒸馏,**不再支持手动通过本工具编辑**。\
+         **注意**:每只持仓的 thesis 与整体 investment_style 现在由系统从用户\
+         自己写的公司画像(走 company_portrait skill)按需蒸馏,**不再支持手动通过本工具编辑**。\
          若用户问\"为什么我的 thesis 是 X / 想改 Y\",指引他更新对应公司画像即可,\
-         系统会在下次蒸馏(默认 7 天周期)自动反映。\
+         新建画像/新增持仓后通常在下一次小时级检查里尝试更新;覆盖完整后约每 7 天刷新一次。\
          kind tag 必须选自:earnings_upcoming / earnings_released / earnings_call_transcript / \
          news_critical / price_alert / weekly52_high / weekly52_low / dividend / split / \
          sec_filing / analyst_grade / macro_event / social_post。"
@@ -261,24 +372,10 @@ impl Tool for NotificationPrefsTool {
                 prefs.min_severity = parse_severity(raw)?;
             }
             "set_portfolio_only" => {
-                let flag = match &value {
-                    Value::Bool(b) => *b,
-                    Value::String(s) => {
-                        matches!(
-                            s.trim().to_ascii_lowercase().as_str(),
-                            "true" | "1" | "yes" | "on"
-                        )
-                    }
-                    _ => {
-                        return Err(HoneError::Tool("set_portfolio_only 需要 true/false".into()));
-                    }
-                };
-                prefs.portfolio_only = flag;
+                prefs.portfolio_only = parse_bool_flag(&value, "set_portfolio_only")?;
             }
             "allow_kinds" => {
-                let tags = extract_string_array(&value)?;
-                validate_tags(&tags)?;
-                prefs.allow_kinds = if tags.is_empty() { None } else { Some(tags) };
+                prefs.allow_kinds = optional_kind_tags(&value)?;
             }
             "block_kinds" => {
                 let tags = extract_string_array(&value)?;
@@ -309,129 +406,43 @@ impl Tool for NotificationPrefsTool {
                 }
             }
             "set_digest_slots" => {
-                let slot_values = value.as_array().ok_or_else(|| {
-                    HoneError::Tool(
-                        "set_digest_slots 需要 HH:MM 字符串数组,例 [\"19:00\",\"09:00\"];传 [] 关 digest".into(),
-                    )
-                })?;
-                let mut slots: Vec<DigestSlot> = Vec::with_capacity(slot_values.len());
-                for (idx, slot_value) in slot_values.iter().enumerate() {
-                    let slot_time = slot_value
-                        .as_str()
-                        .ok_or_else(|| {
-                            HoneError::Tool("digest_slots 元素必须是 HH:MM 字符串".into())
-                        })?
-                        .trim()
-                        .to_string();
-                    if slot_time.is_empty() {
-                        continue;
-                    }
-                    validate_hhmm(&slot_time)?;
-                    slots.push(DigestSlot {
-                        id: format!("slot_{idx}"),
-                        time: slot_time,
-                        label: None,
-                        floor_macro: None,
-                    });
-                }
+                let slots = parse_digest_slots(&value)?;
                 // 任何 slot 落在现有 quiet_hours 内都会被 scheduler 让位给
                 // quiet_flush,等于 digest slot 配置静默失效。这里 hard error,
                 // 逼 LLM 自动改时间或先 clear_quiet_hours。
-                if let Some(qh) = prefs.quiet_hours.as_ref() {
-                    let blocked_slots: Vec<String> = slots
-                        .iter()
-                        .filter(|slot| crate::schedule_view::time_in_quiet(&slot.time, Some(qh)))
-                        .map(|slot| slot.time.clone())
-                        .collect();
+                if let Some(quiet_hours) = prefs.quiet_hours.as_ref() {
+                    let blocked_slots = digest_slot_times_inside_quiet(&slots, quiet_hours);
                     if !blocked_slots.is_empty() {
                         return Err(HoneError::Tool(format!(
                             "digest slot 时间 [{}] 落在 quiet_hours {}–{} 内,scheduler 不会触发;\
                              改 slot 时间或先 clear_quiet_hours / 缩短 quiet 区间。",
                             blocked_slots.join(", "),
-                            qh.from,
-                            qh.to,
+                            quiet_hours.from,
+                            quiet_hours.to,
                         )));
                     }
                 }
                 prefs.digest_slots = Some(slots);
             }
             "set_price_high_pct" => {
-                let pct = match &value {
-                    Value::Number(n) => n.as_f64(),
-                    Value::String(s) => s.trim().parse::<f64>().ok(),
-                    Value::Null => None,
-                    _ => None,
-                }
-                .ok_or_else(|| {
-                    HoneError::Tool(
-                        "set_price_high_pct 需要数字 (0<x≤50,例 3.5);传 null 清空回到全局阈值"
-                            .into(),
-                    )
-                })?;
-                if !(pct > 0.0 && pct <= 50.0) || !pct.is_finite() {
-                    return Err(HoneError::Tool(format!(
-                        "price_high_pct 必须在 (0, 50] 范围,收到 {pct}"
-                    )));
-                }
-                prefs.price_high_pct_override = Some(pct);
+                prefs.price_high_pct_override = Some(parse_price_high_pct(&value)?);
             }
             "set_immediate_kinds" => {
-                let tags = extract_string_array(&value)?;
-                validate_tags(&tags)?;
-                prefs.immediate_kinds = if tags.is_empty() { None } else { Some(tags) };
+                prefs.immediate_kinds = optional_kind_tags(&value)?;
             }
             "set_quiet_hours" => {
-                let quiet_hours_object = value.as_object().ok_or_else(|| {
-                    HoneError::Tool(
-                        "set_quiet_hours 需要对象 {from, to, exempt_kinds?},例 {\"from\":\"23:00\",\"to\":\"07:00\"}"
-                            .into(),
-                    )
-                })?;
-                let from = quiet_hours_object
-                    .get("from")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| HoneError::Tool("set_quiet_hours 缺少 from (HH:MM)".into()))?
-                    .trim()
-                    .to_string();
-                let to = quiet_hours_object
-                    .get("to")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| HoneError::Tool("set_quiet_hours 缺少 to (HH:MM)".into()))?
-                    .trim()
-                    .to_string();
-                validate_hhmm(&from)?;
-                validate_hhmm(&to)?;
-                if from == to {
-                    return Err(HoneError::Tool(
-                        "set_quiet_hours 的 from 与 to 不能相等(空区间);若想全天静音请用 disable"
-                            .into(),
-                    ));
-                }
-                let exempt_kinds: Vec<String> = match quiet_hours_object.get("exempt_kinds") {
-                    Some(v) if !v.is_null() => extract_string_array(v)?,
-                    _ => Vec::new(),
-                };
-                validate_tags(&exempt_kinds)?;
                 // 反向校验:新 quiet 区间会吞掉现有 digest_slots(同样会被 scheduler 跳过),
                 // 报错让用户先调 slot。
-                let candidate = QuietHours {
-                    from: from.clone(),
-                    to: to.clone(),
-                    exempt_kinds: exempt_kinds.clone(),
-                };
+                let candidate = parse_quiet_hours(&value)?;
                 if let Some(slots) = prefs.digest_slots.as_ref() {
-                    let bad: Vec<String> = slots
-                        .iter()
-                        .filter(|s| crate::schedule_view::time_in_quiet(&s.time, Some(&candidate)))
-                        .map(|s| s.time.clone())
-                        .collect();
-                    if !bad.is_empty() {
+                    let overlapping_slots = digest_slot_times_inside_quiet(slots, &candidate);
+                    if !overlapping_slots.is_empty() {
                         return Err(HoneError::Tool(format!(
                             "新 quiet_hours {}–{} 会吞掉现有 digest slot [{}],它们将不再触发;\
                              请先 set_digest_slots 调整时间,或缩短 quiet 区间。",
-                            from,
-                            to,
-                            bad.join(", "),
+                            candidate.from,
+                            candidate.to,
+                            overlapping_slots.join(", "),
                         )));
                     }
                 }
@@ -460,51 +471,55 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn mk(dir: &std::path::Path) -> NotificationPrefsTool {
+    fn digest_defaults_fixture() -> crate::schedule_view::DigestDefaults {
+        crate::schedule_view::DigestDefaults {
+            slots: vec![
+                crate::schedule_view::DigestDefaultSlot {
+                    time: "08:30".into(),
+                    label: Some("盘前摘要".into()),
+                },
+                crate::schedule_view::DigestDefaultSlot {
+                    time: "09:00".into(),
+                    label: Some("晨间摘要".into()),
+                },
+            ],
+        }
+    }
+
+    fn make_tool(prefs_dir: &std::path::Path) -> NotificationPrefsTool {
         let actor = ActorIdentity::new("telegram", "u1", None::<&str>).unwrap();
-        let cron_dir = dir.join("__test_cron__");
+        let cron_dir = prefs_dir.join("__test_cron__");
         std::fs::create_dir_all(&cron_dir).unwrap();
         NotificationPrefsTool::new(
-            dir.to_path_buf(),
+            prefs_dir.to_path_buf(),
             Some(actor),
             cron_dir,
-            crate::schedule_view::DigestDefaults {
-                slots: vec![
-                    crate::schedule_view::DigestDefaultSlot {
-                        time: "08:30".into(),
-                        label: Some("盘前摘要".into()),
-                    },
-                    crate::schedule_view::DigestDefaultSlot {
-                        time: "09:00".into(),
-                        label: Some("晨间摘要".into()),
-                    },
-                ],
-            },
+            digest_defaults_fixture(),
         )
     }
 
     #[tokio::test]
     async fn get_returns_default_when_file_absent() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["enabled"], json!(true));
-        assert_eq!(out["prefs"]["min_severity"], json!("low"));
+        let tool = make_tool(dir.path());
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["enabled"], json!(true));
+        assert_eq!(response["prefs"]["min_severity"], json!("low"));
     }
 
     #[tokio::test]
     async fn disable_then_get_shows_enabled_false() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         let _ = tool.execute(json!({"action":"disable"})).await.unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["enabled"], json!(false));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["enabled"], json!(false));
     }
 
     #[tokio::test]
     async fn allow_kinds_rejects_unknown_tag() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         let err = tool
             .execute(json!({"action":"allow_kinds","value":["not_a_tag"]}))
             .await
@@ -518,18 +533,18 @@ mod tests {
     #[tokio::test]
     async fn set_min_severity_writes_json_roundtrip() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         tool.execute(json!({"action":"set_min_severity","value":"high"}))
             .await
             .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["min_severity"], json!("high"));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["min_severity"], json!("high"));
     }
 
     #[tokio::test]
     async fn allow_and_block_kinds_persisted() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         tool.execute(json!({
             "action": "allow_kinds",
             "value": ["earnings_released", "sec_filing"]
@@ -542,52 +557,52 @@ mod tests {
         }))
         .await
         .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
         assert_eq!(
-            out["prefs"]["allow_kinds"],
+            response["prefs"]["allow_kinds"],
             json!(["earnings_released", "sec_filing"])
         );
-        assert_eq!(out["prefs"]["blocked_kinds"], json!(["social_post"]));
+        assert_eq!(response["prefs"]["blocked_kinds"], json!(["social_post"]));
     }
 
     #[tokio::test]
     async fn reset_restores_defaults() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         tool.execute(json!({"action":"disable"})).await.unwrap();
         tool.execute(json!({"action":"reset"})).await.unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["enabled"], json!(true));
-        assert_eq!(out["prefs"]["portfolio_only"], json!(false));
-        assert_eq!(out["prefs"]["allow_kinds"], json!(null));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["enabled"], json!(true));
+        assert_eq!(response["prefs"]["portfolio_only"], json!(false));
+        assert_eq!(response["prefs"]["allow_kinds"], json!(null));
     }
 
     #[tokio::test]
     async fn set_portfolio_only_accepts_bool_and_string() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         tool.execute(json!({"action":"set_portfolio_only","value":true}))
             .await
             .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["portfolio_only"], json!(true));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["portfolio_only"], json!(true));
 
         tool.execute(json!({"action":"set_portfolio_only","value":"false"}))
             .await
             .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["portfolio_only"], json!(false));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["portfolio_only"], json!(false));
     }
 
     #[tokio::test]
     async fn set_timezone_validates_iana_and_persists() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         tool.execute(json!({"action":"set_timezone","value":"America/New_York"}))
             .await
             .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["timezone"], json!("America/New_York"));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["timezone"], json!("America/New_York"));
 
         let err = tool
             .execute(json!({"action":"set_timezone","value":"Mars/Olympus"}))
@@ -602,26 +617,26 @@ mod tests {
         tool.execute(json!({"action":"set_timezone","value":""}))
             .await
             .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["timezone"], json!(null));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["timezone"], json!(null));
     }
 
     #[tokio::test]
     async fn set_digest_slots_round_trips_and_validates_format() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         tool.execute(json!({
             "action": "set_digest_slots",
             "value": ["19:00", "02:30", "09:00"]
         }))
         .await
         .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        let times: Vec<String> = out["prefs"]["digest_slots"]
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        let times: Vec<String> = response["prefs"]["digest_slots"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| v["time"].as_str().unwrap().to_string())
+            .map(|slot_value| slot_value["time"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(times, vec!["19:00", "02:30", "09:00"]);
 
@@ -639,19 +654,19 @@ mod tests {
         tool.execute(json!({"action":"set_digest_slots","value":[]}))
             .await
             .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["digest_slots"], json!([]));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["digest_slots"], json!([]));
     }
 
     #[tokio::test]
     async fn set_price_high_pct_enforces_range() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         tool.execute(json!({"action":"set_price_high_pct","value":3.5}))
             .await
             .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["price_high_pct_override"], json!(3.5));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["price_high_pct_override"], json!(3.5));
 
         // 0 与负数被拒
         let err = tool
@@ -672,23 +687,23 @@ mod tests {
         tool.execute(json!({"action":"set_price_high_pct","value":"4.2"}))
             .await
             .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["price_high_pct_override"], json!(4.2));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["price_high_pct_override"], json!(4.2));
     }
 
     #[tokio::test]
     async fn set_immediate_kinds_validates_and_clears_on_empty() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         tool.execute(json!({
             "action": "set_immediate_kinds",
             "value": ["weekly52_high", "analyst_grade"]
         }))
         .await
         .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
         assert_eq!(
-            out["prefs"]["immediate_kinds"],
+            response["prefs"]["immediate_kinds"],
             json!(["weekly52_high", "analyst_grade"])
         );
 
@@ -705,8 +720,8 @@ mod tests {
         tool.execute(json!({"action":"set_immediate_kinds","value":[]}))
             .await
             .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["immediate_kinds"], json!(null));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["immediate_kinds"], json!(null));
     }
 
     #[tokio::test]
@@ -718,18 +733,7 @@ mod tests {
             dir.path().to_path_buf(),
             None,
             cron_dir,
-            crate::schedule_view::DigestDefaults {
-                slots: vec![
-                    crate::schedule_view::DigestDefaultSlot {
-                        time: "08:30".into(),
-                        label: Some("盘前摘要".into()),
-                    },
-                    crate::schedule_view::DigestDefaultSlot {
-                        time: "09:00".into(),
-                        label: Some("晨间摘要".into()),
-                    },
-                ],
-            },
+            digest_defaults_fixture(),
         );
         let err = tool.execute(json!({"action":"get"})).await.unwrap_err();
         match err {
@@ -741,18 +745,18 @@ mod tests {
     #[tokio::test]
     async fn set_quiet_hours_round_trips() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         tool.execute(json!({
             "action": "set_quiet_hours",
             "value": { "from": "23:00", "to": "07:00", "exempt_kinds": ["earnings_released"] },
         }))
         .await
         .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["quiet_hours"]["from"], json!("23:00"));
-        assert_eq!(out["prefs"]["quiet_hours"]["to"], json!("07:00"));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["quiet_hours"]["from"], json!("23:00"));
+        assert_eq!(response["prefs"]["quiet_hours"]["to"], json!("07:00"));
         assert_eq!(
-            out["prefs"]["quiet_hours"]["exempt_kinds"],
+            response["prefs"]["quiet_hours"]["exempt_kinds"],
             json!(["earnings_released"])
         );
     }
@@ -760,21 +764,21 @@ mod tests {
     #[tokio::test]
     async fn set_quiet_hours_without_exempt_defaults_to_empty() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         tool.execute(json!({
             "action": "set_quiet_hours",
             "value": { "from": "22:30", "to": "06:30" },
         }))
         .await
         .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["quiet_hours"]["exempt_kinds"], json!([]));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["quiet_hours"]["exempt_kinds"], json!([]));
     }
 
     #[tokio::test]
     async fn set_quiet_hours_validates_hhmm() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         let err = tool
             .execute(json!({
                 "action": "set_quiet_hours",
@@ -791,7 +795,7 @@ mod tests {
     #[tokio::test]
     async fn set_quiet_hours_rejects_equal_from_to() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         let err = tool
             .execute(json!({
                 "action": "set_quiet_hours",
@@ -808,7 +812,7 @@ mod tests {
     #[tokio::test]
     async fn set_quiet_hours_rejects_invalid_kind() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         let err = tool
             .execute(json!({
                 "action": "set_quiet_hours",
@@ -825,22 +829,22 @@ mod tests {
     #[tokio::test]
     async fn get_overview_returns_display_text_and_overview() {
         let dir = tempdir().unwrap();
-        // mk() 用的是 telegram actor → display_text 应是 <pre> 包的等宽块
-        let tool = mk(dir.path());
-        let out = tool
+        // make_tool() 用的是 telegram actor → display_text 应是 <pre> 包的等宽块
+        let tool = make_tool(dir.path());
+        let response = tool
             .execute(json!({"action":"get_overview"}))
             .await
             .unwrap();
-        assert_eq!(out["status"], json!("ok"));
-        let txt = out["display_text"].as_str().expect("display_text");
-        assert!(txt.contains("你的推送日程"));
-        assert!(txt.contains("时刻"));
+        assert_eq!(response["status"], json!("ok"));
+        let display_text = response["display_text"].as_str().expect("display_text");
+        assert!(display_text.contains("你的推送日程"));
+        assert!(display_text.contains("时刻"));
         // telegram → 走 <pre>
-        assert!(txt.contains("<pre>"));
+        assert!(display_text.contains("<pre>"));
         // 不应再出现 markdown table 字符
-        assert!(!txt.contains("| --- |"));
-        assert_eq!(out["render_format"], json!("TelegramHtml"));
-        let entries = out["overview"]["schedule"].as_array().unwrap();
+        assert!(!display_text.contains("| --- |"));
+        assert_eq!(response["render_format"], json!("TelegramHtml"));
+        let entries = response["overview"]["schedule"].as_array().unwrap();
         assert_eq!(entries.len(), 2);
     }
 
@@ -854,27 +858,19 @@ mod tests {
             dir.path().to_path_buf(),
             Some(actor),
             cron_dir,
-            crate::schedule_view::DigestDefaults {
-                slots: vec![
-                    crate::schedule_view::DigestDefaultSlot {
-                        time: "08:30".into(),
-                        label: Some("盘前摘要".into()),
-                    },
-                    crate::schedule_view::DigestDefaultSlot {
-                        time: "09:00".into(),
-                        label: Some("晨间摘要".into()),
-                    },
-                ],
-            },
+            digest_defaults_fixture(),
         );
-        let out = tool
+        let response = tool
             .execute(json!({"action":"get_overview"}))
             .await
             .unwrap();
-        let txt = out["display_text"].as_str().unwrap();
-        assert!(txt.contains("```"), "discord 应用代码块: {txt}");
-        assert!(!txt.contains("<pre>"));
-        assert_eq!(out["render_format"], json!("DiscordMarkdown"));
+        let display_text = response["display_text"].as_str().unwrap();
+        assert!(
+            display_text.contains("```"),
+            "discord 应用代码块: {display_text}"
+        );
+        assert!(!display_text.contains("<pre>"));
+        assert_eq!(response["render_format"], json!("DiscordMarkdown"));
     }
 
     #[tokio::test]
@@ -887,34 +883,26 @@ mod tests {
             dir.path().to_path_buf(),
             Some(actor),
             cron_dir,
-            crate::schedule_view::DigestDefaults {
-                slots: vec![
-                    crate::schedule_view::DigestDefaultSlot {
-                        time: "08:30".into(),
-                        label: Some("盘前摘要".into()),
-                    },
-                    crate::schedule_view::DigestDefaultSlot {
-                        time: "09:00".into(),
-                        label: Some("晨间摘要".into()),
-                    },
-                ],
-            },
+            digest_defaults_fixture(),
         );
-        let out = tool
+        let response = tool
             .execute(json!({"action":"get_overview"}))
             .await
             .unwrap();
-        let txt = out["display_text"].as_str().unwrap();
-        assert!(!txt.contains("```"));
-        assert!(!txt.contains("<pre>"));
-        assert!(txt.contains("• "), "imessage 应该是项目符号列表: {txt}");
-        assert_eq!(out["render_format"], json!("Plain"));
+        let display_text = response["display_text"].as_str().unwrap();
+        assert!(!display_text.contains("```"));
+        assert!(!display_text.contains("<pre>"));
+        assert!(
+            display_text.contains("• "),
+            "imessage 应该是项目符号列表: {display_text}"
+        );
+        assert_eq!(response["render_format"], json!("Plain"));
     }
 
     #[tokio::test]
     async fn clear_quiet_hours_removes_field() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         tool.execute(json!({
             "action": "set_quiet_hours",
             "value": { "from": "23:00", "to": "07:00" },
@@ -924,14 +912,14 @@ mod tests {
         tool.execute(json!({"action":"clear_quiet_hours"}))
             .await
             .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["quiet_hours"], json!(null));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["quiet_hours"], json!(null));
     }
 
     #[tokio::test]
     async fn set_digest_slots_rejects_slot_inside_existing_quiet() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         tool.execute(json!({
             "action": "set_quiet_hours",
             "value": { "from": "00:00", "to": "08:00" },
@@ -953,14 +941,14 @@ mod tests {
             other => panic!("unexpected err {other:?}"),
         }
         // 落盘的 slots 应保持未变(default 即 None)
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["digest_slots"], json!(null));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["digest_slots"], json!(null));
     }
 
     #[tokio::test]
     async fn set_digest_slots_outside_quiet_succeeds() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         tool.execute(json!({
             "action": "set_quiet_hours",
             "value": { "from": "00:00", "to": "08:00" },
@@ -973,12 +961,12 @@ mod tests {
         }))
         .await
         .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        let times: Vec<String> = out["prefs"]["digest_slots"]
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        let times: Vec<String> = response["prefs"]["digest_slots"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| v["time"].as_str().unwrap().to_string())
+            .map(|slot_value| slot_value["time"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(times, vec!["09:00", "19:00"]);
     }
@@ -986,7 +974,7 @@ mod tests {
     #[tokio::test]
     async fn set_quiet_hours_rejects_when_existing_slot_falls_in() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         tool.execute(json!({
             "action": "set_digest_slots",
             "value": ["02:30", "09:00"]
@@ -1008,14 +996,14 @@ mod tests {
             other => panic!("unexpected err {other:?}"),
         }
         // quiet 没落盘
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["quiet_hours"], json!(null));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["quiet_hours"], json!(null));
     }
 
     #[tokio::test]
     async fn set_quiet_hours_safe_when_no_slot_overlap() {
         let dir = tempdir().unwrap();
-        let tool = mk(dir.path());
+        let tool = make_tool(dir.path());
         tool.execute(json!({
             "action": "set_digest_slots",
             "value": ["09:00", "19:00"]
@@ -1028,7 +1016,7 @@ mod tests {
         }))
         .await
         .unwrap();
-        let out = tool.execute(json!({"action":"get"})).await.unwrap();
-        assert_eq!(out["prefs"]["quiet_hours"]["from"], json!("23:00"));
+        let response = tool.execute(json!({"action":"get"})).await.unwrap();
+        assert_eq!(response["prefs"]["quiet_hours"]["from"], json!("23:00"));
     }
 }

@@ -42,6 +42,174 @@
 ## 证据来源
 
 - 最近一小时真实调度窗口：`data/sessions.sqlite3` -> `cron_job_runs`
+  - `2026-05-22 23:01 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/未确认部署运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-22T19:01:33+08:00` 到 `2026-05-22T23:01:39+08:00` 内仍有 `115` 条 Feishu `execution_status=running + message_send_status=pending + detail.phase=started` 残留。
+    - 其中 `84` 条为 heartbeat started 行，覆盖 19:30、20:00、20:30、21:00、21:30、22:00、22:30 等 heartbeat 窗口；另有 `31` 条普通 scheduler started 行，覆盖 20:00、20:30、21:00、21:30、21:45 等窗口。
+    - 同窗已有 `105` 条 heartbeat quota 失败终态、`10` 条 heartbeat 结构化失败终态、`4` 条 heartbeat `noop + skipped_noop` 终态，以及 `32` 条 Feishu、`5` 条 Web 普通 scheduler `completed + sent + delivered=1` 终态。
+    - 22:39 / 22:52 CST Feishu scheduler 启动回收 `5134` 条历史 `running/pending` row 为 `execution_failed + send_failed`，`detail_json.phase=recovered_stale_pending`、`detail_json.recovered_by=feishu_scheduler_startup`。这说明启动 stale recovery 仍在生效；剩余新增 started 残留继续按旧/未确认部署运行态处理。
+    - 用户可见直聊 / 普通 scheduler 主链路没有因此被阻断；最近四小时 `54` 个 user turn 与 `51` 个 assistant final，Feishu / Web 直聊均有收口。受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+  - `2026-05-22 19:02 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/未确认部署运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-22T15:02:00+08:00` 到 `2026-05-22T19:02:00+08:00` 内共有 `96` 条 Feishu `execution_status=running + message_send_status=pending` started 残留。
+    - 这 `96` 条均为 heartbeat started 行，覆盖 15:30、16:00、16:30、17:00、17:30、18:00、18:30、19:00 等 heartbeat 窗口；本窗未见普通 scheduler started 残留。
+    - 同窗已有 `96` 条 Feishu heartbeat `execution_failed + skipped_error + delivered=0` 终态和 `24` 条 Web heartbeat 失败终态。
+    - 用户可见直聊主链路没有因此被阻断；最近四小时 `9` 个 user turn 与 `9` 个 assistant final，Feishu / Web 直聊均有收口。受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+  - `2026-05-22 15:02 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/未确认部署运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-22T11:00:00+08:00` 到 `2026-05-22T15:02:15+08:00` 内共有 `109` 条 Feishu `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `108` 条为 heartbeat started 行，覆盖 11:30、12:00、12:30、13:00、13:30、14:00、14:30、15:00 等 heartbeat 窗口；另有 `1` 条普通 scheduler started 行。
+    - 同窗已有 `96` 条 Feishu heartbeat `execution_failed + skipped_error + delivered=0` 终态、`27` 条 Web heartbeat 失败终态，以及 `1` 条 Feishu、`1` 条 Web 普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见直聊 / 普通 scheduler 主链路没有因此被阻断；最近四小时 `26` 个 user turn 与 `26` 个 assistant final，Feishu / Web 直聊均有收口。受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+  - `2026-05-22 11:01 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/未确认部署运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-22T07:01:02+08:00` 到 `2026-05-22T11:01:16+08:00` 内共有 `111` 条 Feishu `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `96` 条为 heartbeat started 行，覆盖 07:30、08:00、08:30、09:00、09:30、10:00、10:30、11:00 等 heartbeat 窗口；另有 `15` 条普通 scheduler started 行。
+    - 同窗已有 `120` 条 heartbeat `execution_failed + skipped_error + delivered=0` 终态，以及 `16` 条 Feishu、`2` 条 Web、`1` 条 Discord 普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见直聊 / 普通 scheduler 主链路没有因此被阻断；最近四小时 `43` 个 user turn 与 `44` 个 assistant final，Feishu / Web / Discord 直聊和普通 scheduler 均有收口。受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+  - `2026-05-22 07:05 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/未确认部署运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-22T03:01:31+08:00` 到 `2026-05-22T07:03:03+08:00` 内共有 `101` 条 Feishu `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `96` 条为 heartbeat started 行，覆盖 03:30、04:00、04:30、05:00、05:30、06:00、06:30、07:00 等 heartbeat 窗口；另有 `5` 条普通 scheduler started 行。
+    - 同窗已有 `120` 条 heartbeat `execution_failed + skipped_error + delivered=0` 终态，以及 `5` 条普通 scheduler `completed + sent + delivered=1` 终态；07:00 刚触发的 `美股持仓收盘后早报` 已在 07:03 CST 成功送达，但 started 行仍作为旧运行态残留存在。
+    - 用户可见直聊 / 普通 scheduler 主链路没有因此被阻断；最近四小时 `20` 个 user turn 与 `19` 个 assistant final，Feishu / Web 直聊均有 assistant final 收口。受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+  - `2026-05-22 03:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/未确认部署运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-21T23:03:00+08:00` 到 `2026-05-22T03:03:00+08:00` 内共有 `96` 条 Feishu heartbeat `execution_status=running + message_send_status=pending` started 残留。
+    - 这 `96` 条覆盖 23:30、00:00、00:30、01:00、01:30、02:00、02:30、03:00 等 heartbeat 窗口；同窗已有 `120` 条 heartbeat `execution_failed + skipped_error + delivered=0` 终态。
+    - 普通 scheduler 同窗有 `4` 条 Feishu `completed + sent + delivered=1` 终态，且本轮未新增普通 scheduler target resolution 失败。
+    - 用户可见直聊主链路没有因此被阻断；最近四小时 `39` 个 user turn 与 `39` 个 assistant final 均有收口。受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+  - `2026-05-21 23:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/未确认部署运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-21T19:03:00+08:00` 到 `2026-05-21T23:03:00+08:00` 内共有 `96` 条 Feishu heartbeat `execution_status=running + message_send_status=pending` started 残留。
+    - 这 `96` 条覆盖 19:30、20:00、20:30、21:00、21:30、22:00、22:30、23:00 等 heartbeat 窗口；同窗已有 `120` 条 heartbeat `execution_failed + skipped_error + delivered=0` 终态。
+    - 普通 scheduler 同窗有 `31` 条 Feishu 和 `3` 条 Web `completed + sent + delivered=1`，另有 `1` 条 Feishu 普通 scheduler target resolution 失败已归入 `feishu_scheduler_target_resolution_failed.md`。
+    - 用户可见直聊主链路没有因此被阻断；本轮受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+  - `2026-05-21 19:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/未确认部署运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-21T15:30:01+08:00` 到 `2026-05-21T19:00:01+08:00` 内共有 `96` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 这 `96` 条全部为 heartbeat started 行，覆盖 15:30、16:00、16:30、17:00、17:30、18:00、18:30、19:00 等窗口；本窗未见普通 scheduler started 残留。
+    - 同窗已有 `120` 条 heartbeat `execution_failed + skipped_error + delivered=0` 终态。
+    - 用户可见直聊主链路没有因此被阻断，最近四小时 `7` 个 user turn 与 `8` 个 assistant final 均有收口；受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+    - 当前 `hone-console-page-prod.log` 仍可见 Web/API scheduler 进程启动早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-21 15:02 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/未确认部署运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-21T11:30:01+08:00` 到 `2026-05-21T15:00:04+08:00` 内共有 `97` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `96` 条为 heartbeat started 行，覆盖 11:30、12:00、12:30、13:00、13:30、14:00、14:30、15:00 等窗口；另有 `1` 条普通 scheduler started 行，代表任务为 `每日公司资讯与分析总结`。
+    - 同窗已有 `120` 条 heartbeat `execution_failed + skipped_error + delivered=0` 终态，以及 `1` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见直聊 / 普通 scheduler 主链路没有因此被阻断，最近四小时 `20` 个 user turn 与 `20` 个 assistant final 均有收口；受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+    - 当前 `hone-console-page-prod.log` 仍可见 Web/API scheduler 进程启动早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-21 11:02 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/未确认部署运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-21T07:02:28+08:00` 到 `2026-05-21T11:02:00+08:00` 内共有 `111` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `96` 条为 heartbeat started 行，覆盖 07:30、08:00、08:30、09:00、09:30、10:00、10:30、11:00 等窗口；另有 `15` 条普通 scheduler started 行，覆盖 08:00、08:30、10:00、10:30 窗口。
+    - 同窗已有 `120` 条 heartbeat `execution_failed + skipped_error + delivered=0` 终态，以及 `18` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见直聊 / 普通 scheduler 主链路没有因此被阻断，最近四小时 `50` 个 user turn 与 `50` 个 assistant final 均有收口；受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+    - 当前 `hone-console-page-prod.log` 仍可见 Web/API scheduler 进程启动早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-21 07:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/未确认部署运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-21T03:03:00+08:00` 到 `2026-05-21T07:03:00+08:00` 内共有 `102` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `96` 条为 heartbeat started 行，覆盖 03:30、04:00、04:30、05:00、05:30、06:00、06:30、07:00 等窗口；另有 `6` 条普通 scheduler started 行，覆盖 04:00、04:20、04:30、05:00、06:00、07:00 窗口。
+    - 同窗已有 `120` 条 heartbeat `execution_failed + skipped_error + delivered=0` 终态，以及 `7` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见直聊 / 普通 scheduler 主链路没有因此被阻断，最近四小时 `9` 个 user turn 与 `9` 个 assistant final 均有收口；受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+    - 当前 `hone-console-page-prod.log` 可见 Web/API scheduler 进程启动于 `2026-05-13T07:20:57Z`，早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-21 03:02 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/未确认部署运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-20T23:02:00+08:00` 到 `2026-05-21T03:02:00+08:00` 内共有 `100` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `96` 条为 heartbeat started 行，覆盖 23:30、00:00、00:30、01:00、01:30、02:00、02:30、03:00 等窗口；另有 `4` 条普通 scheduler started 行，覆盖 00:00 与 03:00 窗口。
+    - 同窗已有 `120` 条 heartbeat `execution_failed + skipped_error + delivered=0` 终态、`3` 条普通 scheduler `noop + skipped_noop` 终态与 `1` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见直聊主链路没有因此被阻断，最近四小时 Feishu / Web 直聊均有 assistant final 收口；唯一最新停在 user 的 Feishu direct 会话对应 3 条每日动态 scheduler 触发，终态已分别落为 `noop + skipped_noop`。受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+    - 当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-20 23:02 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-20T19:00:00+08:00` 到 `2026-05-20T23:02:00+08:00` 内共有 `140` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `108` 条为 heartbeat started 行，覆盖 19:00、19:30、20:00、20:30、21:00、21:30、22:00、22:30、23:00 等窗口；另有 `32` 条普通 scheduler started 行，覆盖 20:00、20:30、20:45、21:00、21:30、21:35、21:45、23:00 等窗口。
+    - 同窗已有 `123` 条 heartbeat `execution_failed + skipped_error + delivered=0` 终态，以及 `34` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见直聊主链路没有因此被阻断，最近四小时按消息时间统计 `52` 个 user turn 与 `52` 个 assistant final 均有收口；受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+    - 当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-20 19:04 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-20T15:30:00+08:00` 到 `2026-05-20T19:00:00+08:00` 内共有 `93` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - `93` 条全部为 heartbeat started 行；同窗已有 `100` 条 heartbeat `execution_failed + skipped_error` 与 `5` 条 heartbeat `noop + skipped_noop` 终态，没有普通 scheduler 终态。
+    - 用户可见直聊主链路没有因此被阻断，最近四小时按消息时间统计 `49` 个 user turn 与 `49` 个 assistant final 均有收口；受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+    - 当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-19 19:02 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-19T15:30:03+08:00` 到 `2026-05-19T19:00:03+08:00` 内共有 `88` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - `88` 条全部为 heartbeat started 行；同窗已有 `81` 条 heartbeat `execution_failed + skipped_error` 与 `7` 条 heartbeat `noop + skipped_noop` 终态，没有普通 scheduler 终态。
+    - 用户可见直聊主链路没有因此被阻断，最近四小时 `21` 个 user turn 与 `21` 个 assistant final 均有收口；受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+    - 当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-19 15:02 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-19T11:30:03+08:00` 到 `2026-05-19T15:00:03+08:00` 内共有 `89` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `88` 条为 heartbeat started 行，另有 `1` 条普通 scheduler started 行；同窗已有 `81` 条 heartbeat `execution_failed + skipped_error`、`7` 条 heartbeat `noop + skipped_noop` 与 `1` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 代表普通 scheduler 为 `每日公司资讯与分析总结`：`run_id=26349` 先写入 `running + pending + phase=started`，同一 `delivery_key=j_7c688485:2026-05-19:12:00` 的终态 `run_id=26367` 已另起为 `completed + sent + delivered=1`。
+    - 用户可见投递主链路没有因此被阻断，最近四小时 `10` 个 user turn 与 `10` 个 assistant final 均有收口；受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+    - 当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-19 11:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-19T07:02:00+08:00` 到 `2026-05-19T11:00:03+08:00` 内共有 `103` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `88` 条为 heartbeat started 行，另有 `15` 条普通 scheduler started 行；同窗已有 `80` 条 heartbeat `execution_failed + skipped_error`、`8` 条 heartbeat `noop + skipped_noop` 与 `18` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见投递主链路没有因此被阻断，最近四小时 `30` 个 user turn 与 `31` 个 assistant final 均有收口；受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+    - 当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-18 23:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-18T19:30:02+08:00` 到 `2026-05-18T23:00:02+08:00` 内共有 `119` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `88` 条为 heartbeat started 行，另有 `31` 条普通 scheduler started 行；同窗已有 `81` 条 heartbeat `execution_failed + skipped_error`、`7` 条 heartbeat `noop + skipped_noop` 与 `33` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见投递主链路没有因此被阻断，最近四小时 `48` 个 user turn 均有 assistant final 收口；受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+    - 当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-18 19:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-18T15:30:02+08:00` 到 `2026-05-18T19:00:02+08:00` 内共有 `88` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - `88` 条全部为 heartbeat started 行；同窗已有 `80` 条 heartbeat `execution_failed + skipped_error` 与 `8` 条 heartbeat `noop + skipped_noop` 终态，没有普通 scheduler 终态。
+    - 用户可见直聊主链路没有因此被阻断，最近四小时 `14` 个 user turn 均有 assistant final 收口；受损点仍是调度台账一致性和巡检噪音，严重等级仍不高于 `P3`。
+    - 当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-18 15:02 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-18T11:30:02+08:00` 到 `2026-05-18T15:00:02+08:00` 内共有 `89` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `88` 条为 heartbeat started 行，另有 `1` 条普通 scheduler started 行；同窗已有 `81` 条 heartbeat `execution_failed + skipped_error`、`7` 条 heartbeat `noop + skipped_noop` 与 `1` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见投递主链路没有因此被阻断，受损点仍是调度台账一致性和巡检噪音；严重等级仍不高于 `P3`。
+    - 当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-18 11:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-18T07:30:02+08:00` 到 `2026-05-18T11:00:02+08:00` 内共有 `103` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `88` 条为 heartbeat started 行，另有 `15` 条普通 scheduler started 行；同窗已有 `80` 条 heartbeat `execution_failed + skipped_error`、`8` 条 heartbeat `noop + skipped_noop` 与 `18` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见投递主链路没有因此被阻断，受损点仍是调度台账一致性和巡检噪音；严重等级仍不高于 `P3`。
+    - 当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-18 07:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-18T03:30:02+08:00` 到 `2026-05-18T07:00:02+08:00` 内共有 `93` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `88` 条为 heartbeat started 行，另有 `5` 条普通 scheduler started 行；同窗已有 `80` 条 heartbeat `execution_failed + skipped_error`、`8` 条 heartbeat `noop + skipped_noop` 与 `7` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见投递主链路没有因此被阻断，受损点仍是调度台账一致性和巡检噪音；严重等级仍不高于 `P3`。
+    - 当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-18 03:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-17T23:30:02+08:00` 到 `2026-05-18T03:00:02+08:00` 内共有 `91` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `88` 条为 heartbeat started 行，另有 `3` 条普通 scheduler started 行；同窗已有 `82` 条 heartbeat `execution_failed + skipped_error`、`6` 条 heartbeat `noop + skipped_noop` 与 `3` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见投递主链路没有因此被阻断，受损点仍是调度台账一致性和巡检噪音；严重等级仍不高于 `P3`。
+    - 当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-17 23:04 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-17T19:30:02+08:00` 到 `2026-05-17T23:00:02+08:00` 内共有 `102` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `88` 条为 heartbeat started 行，另有 `14` 条普通 scheduler started 行；同窗已有 `81` 条 heartbeat `execution_failed + skipped_error`、`7` 条 heartbeat `noop + skipped_noop` 与 `16` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见投递主链路没有因此被阻断，受损点仍是调度台账一致性和巡检噪音；严重等级仍不高于 `P3`。
+    - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，`hone-feishu` 仍启动于 `2026-05-13 21:01 CST`，早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-17 15:02 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-17T11:30:02+08:00` 到 `2026-05-17T15:00:02+08:00` 内共有 `89` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `88` 条为 heartbeat started 行，另有 `1` 条普通 scheduler started 行；同窗已有 `82` 条 heartbeat `execution_failed + skipped_error`、`6` 条 heartbeat `noop + skipped_noop` 与 `1` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见投递主链路没有因此被阻断，受损点仍是调度台账一致性和巡检噪音；严重等级仍不高于 `P3`。
+    - 当前 `hone-feishu` 仍启动于 `2026-05-13 21:01 CST`，早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-17 11:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-17T07:30:02+08:00` 到 `2026-05-17T11:00:02+08:00` 内共有 `96` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `88` 条为 heartbeat started 行，另有 `8` 条普通 scheduler started 行；同窗已有 `81` 条 heartbeat `execution_failed + skipped_error`、`7` 条 heartbeat `noop + skipped_noop` 与 `10` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见投递主链路没有因此被阻断，受损点仍是调度台账一致性和巡检噪音；严重等级仍不高于 `P3`。
+    - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-17 07:02 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-17T03:30:02+08:00` 到 `2026-05-17T07:00:02+08:00` 内共有 `89` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `88` 条为 heartbeat started 行，另有 `1` 条普通 scheduler started 行；同窗已有 `79` 条 heartbeat `execution_failed + skipped_error`、`9` 条 heartbeat `noop + skipped_noop` 与 `1` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见投递主链路没有因此被阻断，受损点仍是调度台账一致性和巡检噪音；严重等级仍不高于 `P3`。
+    - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，`hone-feishu` 仍启动于 `2026-05-13 21:01 CST`，早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-17 03:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-16T23:03:00+08:00` 到 `2026-05-17T03:00:02+08:00` 内共有 `91` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `88` 条为 heartbeat started 行，另有 `3` 条普通 scheduler started 行；同窗已有 `82` 条 heartbeat `execution_failed + skipped_error`、`6` 条 heartbeat `noop + skipped_noop` 与 `3` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见投递主链路没有因此被阻断，受损点仍是调度台账一致性和巡检噪音；严重等级仍不高于 `P3`。
+    - 当前 `hone-console-page` 仍启动于 `2026-05-13`，`hone-feishu` 仍启动于 `2026-05-13 21:01 CST`，早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-16 23:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-16T19:00:01+08:00` 到 `2026-05-16T23:00:01+08:00` 内共有 `113` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `99` 条为 heartbeat started 行，另有 `14` 条普通 scheduler started 行；同窗已有 `91` 条 heartbeat `execution_failed + skipped_error`、`8` 条 heartbeat `noop + skipped_noop` 与 `16` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见投递主链路没有因此被阻断，受损点仍是调度台账一致性和巡检噪音；严重等级仍不高于 `P3`。
+    - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-16 19:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-16T15:30:01+08:00` 到 `2026-05-16T19:00:01+08:00` 内共有 `88` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 这 `88` 条均为 heartbeat started 行；同窗已有 `80` 条 heartbeat `execution_failed + skipped_error` 与 `8` 条 heartbeat `noop + skipped_noop` 终态，未见普通 scheduler started 残留。
+    - 用户可见投递主链路没有因此被阻断，受损点仍是调度台账一致性和巡检噪音；严重等级仍不高于 `P3`。
+    - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，`hone-feishu` 仍启动于 `2026-05-13 21:01 CST`，早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-16 15:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-16T11:30:01+08:00` 到 `2026-05-16T15:00:01+08:00` 内共有 `89` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `88` 条为 heartbeat started 行，另有 `1` 条普通 scheduler started 行；同窗已有 `81` 条 heartbeat `execution_failed + skipped_error`、`7` 条 heartbeat `noop + skipped_noop` 与 `1` 条普通 scheduler `completed + sent + delivered=1` 终态。
+    - 用户可见投递主链路没有因此被阻断，受损点仍是调度台账一致性和巡检噪音；严重等级仍不高于 `P3`。
+    - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，`hone-feishu` 仍启动于 `2026-05-13 21:01 CST`，早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
+  - `2026-05-16 11:03 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
+    - 最近四小时窗口 `2026-05-16T07:30:01+08:00` 到 `2026-05-16T11:00:01+08:00` 内共有 `96` 条 `execution_status=running + message_send_status=pending` started 残留。
+    - 其中 `88` 条为 heartbeat started 行，另有 `8` 条普通 scheduler started 行；同窗已有 `79` 条 heartbeat `execution_failed + skipped_error`、`9` 条 heartbeat `noop + skipped_noop` 与 `10` 条普通 scheduler `completed + sent` 终态。
+    - 用户可见投递主链路没有因此被阻断，受损点仍是调度台账一致性和巡检噪音；严重等级仍不高于 `P3`。
+    - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，`hone-feishu` 仍启动于 `2026-05-13 21:01 CST`，早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核；后续只有在本地可复现测试或当前代码路径证明终态仍会另起行时再改回 `New`。
   - `2026-05-16 07:02 CST` 复核，当前机器运行态在最近四小时仍继续新增 started-row 残留；但 2026-05-15 04:05 CST 已按当前 HEAD 回归验证确认 `delivery_key` 终态覆盖、最近 started fallback 与启动 stale recovery 仍生效，本轮仅补充旧/非生产运行态证据，不把状态从 `Fixed` 回退为 `New`：
     - 最近四小时窗口 `2026-05-16T03:30:01+08:00` 到 `2026-05-16T07:00:01+08:00` 内共有 `89` 条 `execution_status=running + message_send_status=pending` started 残留。
     - 其中 `88` 条为 heartbeat started 行，另有 `1` 条普通 scheduler started 行；同窗已有 `81` 条 heartbeat `execution_failed + skipped_error`、`7` 条 heartbeat `noop + skipped_noop` 与 `1` 条普通 scheduler `completed + sent + delivered=1` 终态。
@@ -1014,6 +1182,8 @@
 
 ## 当前实现效果
 
+- 2026-05-19 19:02 CST 的最新复核继续只作为当前机器旧/非生产运行态证据：15:30-19:00 CST 仍新增 `88` 条 `execution_status=running + message_send_status=pending` started 残留，全部为 heartbeat started 行；同窗已有 `81` 条 heartbeat `execution_failed + skipped_error` 与 `7` 条 `noop + skipped_noop` 终态。用户可见直聊主链路没有因此被阻断，最近四小时 21 个 user turn 与 21 个 assistant final 均有收口；当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程，本轮不重新打开。
+
 - `2026-05-04 09:02` 的最新三轮窗口说明，这条缺陷仍持续活跃：即使 `08:30`、`08:45`、`09:00` 同窗里已有 `completed + sent` 与 `noop + skipped_noop` 终态，started 行仍继续悬挂为 `running + pending`。
 - 当前 started 残留总量已升到 `4375` 条，且最近一小时不再只是 heartbeat，连 `港股持仓与关注股早间行情研判`、`核心观察池早间简报`、`特斯拉与火箭实验室新闻日报`、`A股盘前高景气产业链推演` 这类普通 scheduler 任务也继续堆积 started 行。
 
@@ -1102,3 +1272,15 @@
 - 状态更新为 `Fixed`；历史已悬挂 `running + pending` 行仍可另做数据清理，但不再作为当前代码活跃 bug。
 - 验证：
   - `cargo test -p hone-memory started_row --lib -- --nocapture`
+
+## 旧运行态观察（2026-05-19 11:03 CST）
+
+- 最近四小时 `2026-05-19 07:02-11:00 CST` 继续新增 `103` 条 `running + pending` started 残留，其中 `88` 条为 heartbeat、`15` 条为普通 scheduler。
+- 同窗真实终态仍有 `18` 条普通 scheduler `completed + sent + delivered=1`，另有 `80` 条 heartbeat `execution_failed + skipped_error` 与 `8` 条 heartbeat `noop + skipped_noop`；这与“started 行未被终态覆盖”的历史形态一致。
+- 当前机器没有可确认已重启到 `2026-05-15 04:05 CST` 当前 HEAD 修复后的 live 进程；本轮仅追加旧运行态证据，不把状态从 `Fixed` 回退为 `New`。
+
+## 旧运行态观察（2026-05-19 07:03 CST）
+
+- 最近四小时 `2026-05-19 03:30-07:00 CST` 继续新增 `93` 条 `running + pending` started 残留，其中 `88` 条为 heartbeat、`5` 条为普通 scheduler；全库 `running + pending` 残留当前为 `3104` 条。
+- 同窗真实终态仍有 `5` 条普通 scheduler `completed + sent + delivered=1`，另有 heartbeat `execution_failed + skipped_error` 因旧运行态 `mimo-v2.5-pro` `Param Incorrect` 失败；这与“started 行未被终态覆盖”的历史形态一致。
+- 当前机器没有可确认已重启到 `2026-05-15 04:05 CST` 当前 HEAD 修复后的 live 进程；本轮仅追加旧运行态证据，不把状态从 `Fixed` 回退为 `New`。

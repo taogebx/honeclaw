@@ -1,4 +1,5 @@
 mod cleanup;
+mod cloud;
 mod common;
 mod configure;
 mod discord_token;
@@ -15,6 +16,7 @@ mod web;
 mod yaml_io;
 
 use cleanup::{CleanupArgs, run_cleanup};
+use cloud::{CloudCommands, run_cloud_command};
 use configure::{ConfigureArgs, run_configure};
 use mutations::{
     ChannelKind, ChannelSetArgs, ChannelToggleArgs, ModelsSetArgs, build_channel_mutations,
@@ -56,9 +58,9 @@ struct Cli {
 // rustdoc 才不会被当成 help 文本暴露到 CLI。
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// 启动本地 chat REPL（默认子命令)。
+    /// 启动本地 chat REPL（默认子命令）。
     Chat,
-    /// 首次安装向导：写入 canonical config,可选跑 doctor / start。
+    /// 首次安装向导：写入 canonical config，可选运行 doctor / start。
     #[command(visible_alias = "setup")]
     Onboard(OnboardArgs),
     /// 删除 `$HONE_HOME` 下的 runtime data / config / 已下载 bundle。
@@ -68,9 +70,9 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
-    /// 按 section 交互式编辑配置(agent / channels / providers)。
+    /// 按 section 交互式编辑配置（agent / channels / providers）。
     Configure(ConfigureArgs),
-    /// 查看 / 修改 agent model 路由配置。
+    /// 查看 / 修改 Agent model 路由配置。
     Models {
         #[command(subcommand)]
         command: ModelsCommands,
@@ -91,7 +93,12 @@ enum Commands {
         #[command(subcommand)]
         command: WebCommands,
     },
-    /// 启动渠道协议 probe,方便排查外部渠道连接问题。
+    /// 云端 PG/OSS 运行时诊断与迁移。
+    Cloud {
+        #[command(subcommand)]
+        command: CloudCommands,
+    },
+    /// 启动渠道协议 probe，方便排查外部渠道连接问题。
     Probe(ProbeArgs),
 }
 
@@ -99,7 +106,7 @@ enum Commands {
 enum ConfigCommands {
     /// 打印 canonical config 文件路径。
     File,
-    /// 读取指定路径的配置值(敏感字段会自动脱敏)。
+    /// 读取指定路径的配置值（敏感字段会自动脱敏）。
     Get(ConfigPathArgs),
     /// 按路径写入配置值并立即重新生成 effective config。
     Set(ConfigSetArgs),
@@ -113,19 +120,19 @@ enum ConfigCommands {
 enum ModelsCommands {
     /// 以人类可读 / JSON 形式打印当前 model 路由配置。
     Status(ReadableArgs),
-    /// 按字段写入 model 路由(runner / base_url / api_key / model 等)。
+    /// 按字段写入 model 路由（runner / base_url / api_key / model 等）。
     Set(ModelsSetArgs),
 }
 
 #[derive(Subcommand, Debug)]
 enum ChannelsCommands {
-    /// 列出四个渠道(iMessage / Feishu / Telegram / Discord)当前状态。
+    /// 列出四个渠道（iMessage / Feishu / Telegram / Discord）当前状态。
     List(ReadableArgs),
     /// 按渠道写入启用状态 / 认证字段 / chat_scope / allowlist。
     Set(ChannelSetArgs),
-    /// 列出已知投递目标(来源于 cron 任务和最近执行记录)。
+    /// 列出已知投递目标（来源于 cron 任务和最近执行记录）。
     Targets(ReadableArgs),
-    /// 快捷启用某个渠道(等价于 `channels set <c> --enabled true`)。
+    /// 快捷启用某个渠道（等价于 `channels set <c> --enabled true`）。
     Enable(ChannelToggleArgs),
     /// 快捷禁用某个渠道。
     Disable(ChannelToggleArgs),
@@ -180,7 +187,7 @@ struct ConfigSetArgs {
     value: String,
 }
 
-/// `config set` / `config get` 的输出结构（用于 `--json` 模式序列化)。
+/// `config set` / `config get` 的输出结构（用于 `--json` 模式序列化）。
 #[derive(Debug, Serialize)]
 struct MutationResult {
     config_path: String,
@@ -592,6 +599,9 @@ async fn run_cli() -> Result<(), String> {
         }
         Some(Commands::Start(args)) => start::run_start(cli.config.as_deref(), args).await,
         Some(Commands::Web { command }) => run_web_command(cli.config.as_deref(), command).await,
+        Some(Commands::Cloud { command }) => {
+            run_cloud_command(cli.config.as_deref(), command).await
+        }
         Some(Commands::Probe(args)) => {
             let (core, paths) = load_cli_core(cli.config.as_deref()).map_err(|e| e.to_string())?;
             probe::run_probe(core, &paths.canonical_config_path.to_string_lossy(), args).await
@@ -601,6 +611,7 @@ async fn run_cli() -> Result<(), String> {
 
 #[tokio::main]
 async fn main() {
+    hone_core::cloud_runtime::load_dotenv_if_present();
     if let Err(error) = run_cli().await {
         eprintln!("❌ {error}");
         std::process::exit(1);
@@ -738,6 +749,77 @@ mod tests {
             Some(Commands::Cleanup(args)) => {
                 assert!(args.all);
                 assert!(args.yes);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_cloud_doctor_command() {
+        let cli = Cli::try_parse_from(["hone-cli", "cloud", "doctor", "--ensure-schema", "--json"])
+            .unwrap();
+        match cli.command {
+            Some(Commands::Cloud {
+                command: CloudCommands::Doctor(args),
+            }) => {
+                assert!(args.ensure_schema);
+                assert!(args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_cloud_migrate_command() {
+        let cli = Cli::try_parse_from([
+            "hone-cli",
+            "cloud",
+            "migrate",
+            "--from-data-dir",
+            "./data",
+            "--upload-oss",
+            "--apply",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Cloud {
+                command: CloudCommands::Migrate(args),
+            }) => {
+                assert_eq!(args.from_data_dir, PathBuf::from("./data"));
+                assert!(args.upload_oss);
+                assert!(!args.reuse_existing);
+                assert_eq!(args.concurrency, 6);
+                assert!(args.apply);
+                assert!(args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_cloud_object_bench_command() {
+        let cli = Cli::try_parse_from([
+            "hone-cli",
+            "cloud",
+            "object-bench",
+            "--size-kib",
+            "256",
+            "--iterations",
+            "2",
+            "--cleanup",
+            "false",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Cloud {
+                command: CloudCommands::ObjectBench(args),
+            }) => {
+                assert_eq!(args.size_kib, 256);
+                assert_eq!(args.iterations, 2);
+                assert!(!args.cleanup);
+                assert!(args.json);
             }
             other => panic!("unexpected command: {other:?}"),
         }

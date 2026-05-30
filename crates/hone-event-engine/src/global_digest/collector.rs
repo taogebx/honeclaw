@@ -5,8 +5,8 @@
 //! - 纯查询 + 内存过滤,不做副作用(不写 delivery_log,不调网络)
 //! - 不挂 ticker 也保留 —— 全局 digest 的核心价值就是覆盖 portfolio 之外的"全球
 //!   要闻",所以 collector 不按 symbols 过滤
-//! - 跨批次去重粒度 = `event.id`(news url 派生),只看 channel='global_digest'
-//!   的过往成功投递,不与 per-actor digest 共享去重(per-actor 推过的 portfolio
+//! - 跨批次去重粒度 = `event.id`(news url 派生),当前查询 channel='global_digest'
+//!   的过往广播标记,不与 per-actor digest 共享去重(per-actor 推过的 portfolio
 //!   命中事件,这边仍可作为全球候选 —— 受众不同)
 
 use chrono::{DateTime, Utc};
@@ -16,8 +16,7 @@ use crate::pollers::news::{NewsSourceClass, is_earnings_call_transcript_title};
 use crate::prefs::kind_tag;
 use crate::store::EventStore;
 
-/// channel 标记;`scheduler` 写 delivery_log 时也用同一字符串,collector
-/// 通过它做跨批次去重。
+/// 广播级 channel 标记;collector 通过它查询跨批次去重记录。
 pub const GLOBAL_DIGEST_CHANNEL: &str = "global_digest";
 
 /// 候选池的回看上限(小时)。即使 `lookback_hours` 配得很大,采集窗口也不会超过
@@ -120,8 +119,8 @@ impl<'a> CandidateCollector<'a> {
     }
 }
 
-fn parse_source_class(s: Option<&str>) -> NewsSourceClass {
-    match s.unwrap_or("uncertain") {
+fn parse_source_class(source_class: Option<&str>) -> NewsSourceClass {
+    match source_class.unwrap_or("uncertain") {
         "trusted" => NewsSourceClass::Trusted,
         "pr_wire" => NewsSourceClass::PrWire,
         "opinion_blog" => NewsSourceClass::OpinionBlog,

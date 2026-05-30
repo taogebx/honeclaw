@@ -175,19 +175,16 @@ impl WebSearchTool {
 }
 
 fn sanitize_tavily_error_detail(text: &str) -> String {
-    let mut output = redact_tavily_marker_value(text, "Bearer ");
-    for key in [
-        "access_token",
-        "accessToken",
-        "api_key",
-        "apiKey",
-        "apikey",
-        "token",
-        "secret",
-        "password",
-    ] {
+    let mut output = redact_url_userinfo(text);
+    for marker in ["Bearer ", "bearer ", "Basic ", "basic "] {
+        output = redact_tavily_marker_value(&output, marker);
+    }
+    for key in SENSITIVE_TAVILY_ERROR_KEYS {
         output = redact_tavily_marker_value(&output, &format!("{key}="));
         output = redact_tavily_marker_value(&output, &format!("{key}:"));
+        output = redact_tavily_json_string_field(&output, key);
+    }
+    for key in ["authorization", "Authorization"] {
         output = redact_tavily_json_string_field(&output, key);
     }
     if output.chars().count() <= MAX_TAVILY_ERROR_CHARS {
@@ -198,6 +195,62 @@ fn sanitize_tavily_error_detail(text: &str) -> String {
         .take(MAX_TAVILY_ERROR_CHARS)
         .collect::<String>()
         + "..."
+}
+
+const SENSITIVE_TAVILY_ERROR_KEYS: &[&str] = &[
+    "access_token",
+    "accessToken",
+    "api_key",
+    "apiKey",
+    "apikey",
+    "client_secret",
+    "clientSecret",
+    "refresh_token",
+    "refreshToken",
+    "id_token",
+    "idToken",
+    "session_token",
+    "sessionToken",
+    "bot_token",
+    "botToken",
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "TAVILY_API_KEY",
+    "FMP_API_KEY",
+    "HONE_CLOUD_API_KEY",
+    "token",
+    "secret",
+    "password",
+    "X-API-Key",
+    "x-api-key",
+];
+
+fn redact_url_userinfo(text: &str) -> String {
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find("://") {
+        let authority_start = index + 3;
+        let authority = &remaining[authority_start..];
+        let authority_end = authority
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                (ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | ')')).then_some(idx)
+            })
+            .unwrap_or(authority.len());
+        let authority_slice = &authority[..authority_end];
+        if let Some(at_index) = authority_slice.rfind('@') {
+            output.push_str(&remaining[..authority_start]);
+            output.push_str("<redacted>@");
+            remaining = &remaining[authority_start + at_index + 1..];
+        } else {
+            output.push_str(&remaining[..authority_start]);
+            remaining = &remaining[authority_start..];
+        }
+    }
+    output.push_str(remaining);
+    output
 }
 
 fn redact_tavily_marker_value(text: &str, marker: &str) -> String {
@@ -219,6 +272,7 @@ fn redact_tavily_marker_value(text: &str, marker: &str) -> String {
                 (ch == '&'
                     || ch == ')'
                     || ch == ','
+                    || ch == ';'
                     || ch == '"'
                     || ch == '\''
                     || ch == '}'
@@ -348,10 +402,15 @@ impl Tool for WebSearchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{assert_text_contains_all, assert_text_contains_none};
     use hone_core::config::HoneConfig;
 
     fn owned_keys(keys: &[&str]) -> Vec<String> {
         keys.iter().map(|key| (*key).to_string()).collect()
+    }
+
+    fn assert_message_hides_raw_tavily_upgrade_copy(message: &str) {
+        assert_text_contains_none(message, &["support@tavily.com", "upgrade your plan"]);
     }
 
     #[test]
@@ -404,13 +463,13 @@ mod tests {
     fn response_error_message_reads_nested_detail_error() {
         let payload = serde_json::json!({
             "detail": {
-                "error": "This request exceeds your plan's set usage limit. Please upgrade your plan or contact support@tavily.com apiKey: leaked-key"
+                "error": "This request exceeds your plan's set usage limit. Please upgrade your plan or contact support@tavily.com apiKey: leaked-key; TAVILY_API_KEY=env-secret Authorization: Basic basic-secret authorization: bearer lower-secret"
             }
         });
         assert_eq!(
             WebSearchTool::response_error_message(&payload).as_deref(),
             Some(
-                "This request exceeds your plan's set usage limit. Please upgrade your plan or contact support@tavily.com apiKey: <redacted>"
+                "This request exceeds your plan's set usage limit. Please upgrade your plan or contact support@tavily.com apiKey: <redacted>; TAVILY_API_KEY=<redacted> Authorization: Basic <redacted> authorization: bearer <redacted>"
             )
         );
     }
@@ -419,16 +478,40 @@ mod tests {
     fn response_error_message_redacts_json_secret_fields_in_detail() {
         let payload = serde_json::json!({
             "detail": {
-                "error": r#"backend rejected {"api_key":"json-key","token":"tok","safe":"kept"}"#
+                "error": r#"backend rejected {"api_key":"json-key","token":"tok","client_secret":"json-client","authorization":"Basic json-basic","safe":"kept"}"#
             }
         });
 
         let message = WebSearchTool::response_error_message(&payload).expect("message");
-        assert!(message.contains("\"api_key\":\"<redacted>\""));
-        assert!(message.contains("\"token\":\"<redacted>\""));
-        assert!(message.contains("\"safe\":\"kept\""));
-        assert!(!message.contains("json-key"));
-        assert!(!message.contains("\"tok\""));
+        assert_text_contains_all(
+            &message,
+            &[
+                "\"api_key\":\"<redacted>\"",
+                "\"token\":\"<redacted>\"",
+                "\"client_secret\":\"<redacted>\"",
+                "\"authorization\":\"<redacted>\"",
+                "\"safe\":\"kept\"",
+            ],
+        );
+        assert_text_contains_none(
+            &message,
+            &["json-key", "\"tok\"", "json-client", "json-basic"],
+        );
+    }
+
+    #[test]
+    fn response_error_message_redacts_url_userinfo_in_detail() {
+        let payload = serde_json::json!({
+            "detail": {
+                "error": "callback failed for https://user:secret@example.test/search"
+            }
+        });
+
+        let message = WebSearchTool::response_error_message(&payload).expect("message");
+        assert_eq!(
+            message,
+            "callback failed for https://<redacted>@example.test/search"
+        );
     }
 
     #[test]
@@ -442,7 +525,7 @@ mod tests {
         let message = WebSearchTool::response_error_message(&payload).expect("message");
         assert!(message.ends_with("..."));
         assert!(message.chars().count() <= MAX_TAVILY_ERROR_CHARS + 3);
-        assert!(!message.contains("secret"));
+        assert_text_contains_none(&message, &["secret"]);
     }
 
     #[test]
@@ -459,7 +542,7 @@ mod tests {
         )
         .expect_err("quota response should fail");
 
-        assert!(error.contains("exceeds your plan"));
+        assert_text_contains_all(&error, &["exceeds your plan"]);
     }
 
     #[test]
@@ -479,9 +562,8 @@ mod tests {
     fn final_error_message_hides_raw_tavily_text() {
         let tool = WebSearchTool::new(vec!["key1".to_string(), "key2".to_string()], 5);
         let message = tool.final_user_error_message(2, 0);
-        assert!(message.contains("已尝试 2 个 API Key"));
-        assert!(!message.contains("support@tavily.com"));
-        assert!(!message.contains("upgrade your plan"));
+        assert_text_contains_all(&message, &["已尝试 2 个 API Key"]);
+        assert_message_hides_raw_tavily_upgrade_copy(&message);
     }
 
     #[tokio::test]
@@ -492,9 +574,8 @@ mod tests {
             .await
             .expect_err("missing keys should be a tool error");
         let message = error.to_string();
-        assert!(message.contains("Tavily 搜索当前不可用"));
-        assert!(!message.contains("support@tavily.com"));
-        assert!(!message.contains("upgrade your plan"));
+        assert_text_contains_all(&message, &["Tavily 搜索当前不可用"]);
+        assert_message_hides_raw_tavily_upgrade_copy(&message);
     }
 
     #[tokio::test]
@@ -538,8 +619,7 @@ mod tests {
             .await
             .expect_err("failed keys should be a tool error");
         let message = error.to_string();
-        assert!(message.contains("Tavily 搜索当前"), "{message}");
-        assert!(!message.contains("support@tavily.com"), "{message}");
-        assert!(!message.contains("upgrade your plan"), "{message}");
+        assert_text_contains_all(&message, &["Tavily 搜索当前"]);
+        assert_message_hides_raw_tavily_upgrade_copy(&message);
     }
 }

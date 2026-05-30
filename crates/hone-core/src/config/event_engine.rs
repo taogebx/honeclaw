@@ -80,15 +80,16 @@ fn default_news_importance_prompt() -> String {
 }
 
 fn default_news_classifier_model() -> String {
-    "x-ai/grok-4.1-fast".to_string()
+    "x-ai/grok-4.3".to_string()
 }
 
 /// 财报 poller 特有参数。
 ///
 /// `window_days` 决定 EarningsPoller 每 tick 向 FMP earning_calendar 拉 `[today, today+N]`
 /// 的天数;也就是 Hone 开始"关注"一家公司财报的提前量。**v0.1.46 起**,Poller 只产出
-/// 稳定 id 的 `earnings:{SYM}:{DATE}` teaser(Medium);T-3/T-2/T-1 倒计时由 DigestScheduler
-/// 在每次 flush 时刻从 EventStore 现算(见 `pollers::earnings::synthesize_countdowns`),
+/// 稳定 id 的 `earnings:{SYM}:{DATE}` teaser(Medium);T-3/T-2/T-1 倒计时由
+/// `UnifiedDigestScheduler` 在每个 slot 触发时从 EventStore 现算
+/// (见 `pollers::earnings::synthesize_countdowns`),
 /// 这样 poller cron 漂移不会让倒计时 off-by-one。整条 lifecycle 仍共享 `earnings_upcoming`
 /// kind,用户把它放进 `blocked_kinds` 就能一次静音 teaser + 所有倒计时。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,7 +156,7 @@ impl Default for EarningsQualityReviewConfig {
 }
 
 fn default_earnings_quality_review_model() -> String {
-    "x-ai/grok-4.1-fast".into()
+    "x-ai/grok-4.3".into()
 }
 
 fn default_earnings_quality_review_max_tokens() -> u32 {
@@ -186,8 +187,9 @@ fn default_earnings_quality_review_context_max_chars() -> usize {
 /// 在事件构造时按 form 类型映射,**不是**在 config 里配置。
 ///
 /// `enrichment` 子配置控制是否调 LLM 给每条 filing 生成 ~200 字业务摘要(长期主线投资者
-/// 视角,跳过 GAAP 数字、抓 backlog/资本配置/风险)。POC 实证 grok-4.1-fast 在 11 持仓
-/// 一年 ~70 条 filing × $0.012 ≈ $0.82/年,质量、成本、延迟均第一。
+/// 视角,跳过 GAAP 数字、抓 backlog/资本配置/风险)。当前默认模型是
+/// `x-ai/grok-4.3`,用于替代已下线的 Grok 4.1 Fast;实际质量、延迟和成本以
+/// OpenRouter 当前模型为准。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecFilingsConfig {
     #[serde(default = "default_sec_forms")]
@@ -223,10 +225,10 @@ pub struct SecFilingsEnrichmentConfig {
     /// 可选 LLM profile 名称。配置后优先于 `model`。
     #[serde(default)]
     pub llm: String,
-    /// LLM 模型名(OpenRouter 风格)。POC 验证 `x-ai/grok-4.1-fast` 质量、成本、延迟均最佳。
+    /// LLM 模型名(OpenRouter 风格)。默认使用当前 OpenRouter 可用的 `x-ai/grok-4.3`。
     #[serde(default = "default_sec_summary_model")]
     pub model: String,
-    /// 摘要 max_tokens 上限。grok-4.1-fast 在 ~200 字目标下,800 token 充足且不会被截断。
+    /// 摘要 max_tokens 上限。~200 字目标下,800 token 通常充足且不会被截断。
     #[serde(default = "default_sec_summary_max_tokens")]
     pub max_summary_tokens: u32,
     /// fetch SEC.gov 时使用的 User-Agent。**SEC 强制要求格式包含联系邮箱**,否则会被
@@ -248,7 +250,7 @@ impl Default for SecFilingsEnrichmentConfig {
 }
 
 fn default_sec_summary_model() -> String {
-    "x-ai/grok-4.1-fast".into()
+    "x-ai/grok-4.3".into()
 }
 
 fn default_sec_summary_max_tokens() -> u32 {
@@ -264,9 +266,11 @@ fn default_sec_user_agent() -> String {
 /// 全局 digest LLM 子配置,由 unified pipeline 复用来承载 curator / fetcher /
 /// event_dedupe 旋钮。触发由 per-actor `prefs.digest_slots` 驱动。
 ///
-/// 候选池(trusted-source High/Medium news + macro_event)由 unified scheduler
-/// 在每个 slot 触发时拉取,经 Pass 1 聚类 + Pass 2 精读后,与 buffer/synth 候选
-/// 在 per-actor fan-out 阶段合流。
+/// 候选池由 unified scheduler 在每个 slot 触发时拉取:RSS 源直接进入 SQL
+/// 预选,FMP trusted news 允许 Low 进入,最终由 collector 过滤成 trusted news。
+/// 经事件级 dedup + Pass 1 聚类 + Pass 2 精读后,与 buffer/synth 候选在
+/// per-actor fan-out 阶段合流。Macro floor 来自 personalize 阶段的分类,不是
+/// collector 的输入源。
 ///
 /// 默认 `enabled=false`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,7 +322,8 @@ pub struct GlobalDigestConfig {
     pub event_dedupe_enabled: bool,
 
     /// 事件级 dedup 的 legacy OpenRouter 模型 —— 仅在 `event_dedupe_llm` 留空时使用。
-    /// POC 验证 grok-4.1-fast 在 17-236 候选量级上稳定保守(只合明显同事件)。
+    /// 原 POC 验证 grok 4.1 fast 在 17-236 候选量级上稳定保守(只合明显同事件);
+    /// 当前默认切到 OpenRouter 可用的 grok 4.3。
     /// 务必用强模型,nova-lite 这种会过度归类成 theme。
     #[serde(default = "default_event_dedupe_model")]
     pub event_dedupe_model: String,
@@ -362,7 +367,7 @@ impl Default for GlobalDigestConfig {
 }
 
 fn default_event_dedupe_model() -> String {
-    "x-ai/grok-4.1-fast".into()
+    "x-ai/grok-4.3".into()
 }
 
 fn default_global_digest_tz() -> String {
@@ -372,10 +377,10 @@ fn default_global_digest_lookback_hours() -> u32 {
     24
 }
 fn default_global_digest_pass1_model() -> String {
-    "x-ai/grok-4.1-fast".into()
+    "x-ai/grok-4.3".into()
 }
 fn default_global_digest_pass2_model() -> String {
-    "x-ai/grok-4.1-fast".into()
+    "x-ai/grok-4.3".into()
 }
 fn default_global_digest_pass2_top_n() -> u32 {
     15

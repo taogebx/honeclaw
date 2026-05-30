@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use hone_core::agent::{AgentResponse, ToolCallMade};
+use serde_json::Value;
 
 use crate::HoneBotCore;
 use crate::outbound::{ResponseContentSegment, split_response_content_segments};
@@ -96,7 +97,7 @@ pub(crate) fn finalize_agent_response(
 
 fn recover_successful_side_effect_confirmation(tool_calls: &[ToolCallMade]) -> Option<String> {
     tool_calls.iter().rev().find_map(|call| {
-        if call.result.get("success").and_then(|value| value.as_bool()) != Some(true) {
+        if !tool_call_succeeded_for_recovery(call) {
             return None;
         }
         match call.name.as_str() {
@@ -105,6 +106,16 @@ fn recover_successful_side_effect_confirmation(tool_calls: &[ToolCallMade]) -> O
             _ => None,
         }
     })
+}
+
+fn tool_call_succeeded_for_recovery(call: &ToolCallMade) -> bool {
+    if call.result.get("success").and_then(|value| value.as_bool()) == Some(true) {
+        return true;
+    }
+
+    call.name == "portfolio"
+        && tool_action(call).as_deref() == Some("view")
+        && call.result.get("portfolio").is_some()
 }
 
 fn recover_cron_job_confirmation(call: &ToolCallMade) -> Option<String> {
@@ -145,6 +156,10 @@ fn cron_job_confirmation_message(prefix: &str, call: &ToolCallMade) -> Option<St
 
 fn recover_portfolio_confirmation(call: &ToolCallMade) -> Option<String> {
     let action = tool_action(call)?;
+    if action == "view" {
+        return recover_portfolio_view_confirmation(call);
+    }
+
     let tickers = portfolio_tickers(call);
     if tickers.is_empty() {
         return None;
@@ -173,6 +188,60 @@ fn recover_portfolio_confirmation(call: &ToolCallMade) -> Option<String> {
     Some(message)
 }
 
+fn recover_portfolio_view_confirmation(call: &ToolCallMade) -> Option<String> {
+    let portfolio = call.result.get("portfolio")?;
+    let holdings = portfolio_array(portfolio, "holdings");
+    let watchlist = portfolio_array(portfolio, "watchlist");
+    let mut entries: Vec<&Value> = holdings.iter().chain(watchlist.iter()).copied().collect();
+
+    let requested_tickers = portfolio_argument_tickers(call);
+    if !requested_tickers.is_empty() {
+        entries.retain(|holding| {
+            portfolio_ticker(holding)
+                .map(|ticker| {
+                    requested_tickers
+                        .iter()
+                        .any(|requested| requested == &ticker)
+                })
+                .unwrap_or(false)
+        });
+    }
+
+    if entries.is_empty() {
+        if portfolio
+            .get("message")
+            .and_then(|value| value.as_str())
+            .map(|value| value.contains("暂无持仓"))
+            .unwrap_or(false)
+        {
+            return Some("当前还没有记录持仓或关注标的。".to_string());
+        }
+        return None;
+    }
+
+    let total = entries.len();
+    let shown: Vec<String> = entries
+        .iter()
+        .take(3)
+        .filter_map(|holding| format_portfolio_view_entry(holding))
+        .collect();
+    if shown.is_empty() {
+        return None;
+    }
+
+    let prefix = if requested_tickers.is_empty() {
+        "已读取当前持仓/关注记录"
+    } else {
+        "已读取相关持仓记录"
+    };
+    let mut message = format!("{prefix}：{}", shown.join("；"));
+    if total > shown.len() {
+        message.push_str(&format!("；另有 {} 个标的", total - shown.len()));
+    }
+    message.push('。');
+    Some(message)
+}
+
 fn tool_action(call: &ToolCallMade) -> Option<String> {
     call.result
         .get("action")
@@ -188,6 +257,21 @@ fn tool_action(call: &ToolCallMade) -> Option<String> {
 fn portfolio_tickers(call: &ToolCallMade) -> Vec<String> {
     let mut tickers = Vec::new();
     push_portfolio_ticker(&mut tickers, &call.result);
+    if let Some(portfolio) = call.result.get("portfolio") {
+        if let Some(holdings) = portfolio.get("holdings").and_then(|value| value.as_array()) {
+            for holding in holdings {
+                push_portfolio_ticker(&mut tickers, holding);
+            }
+        }
+        if let Some(watchlist) = portfolio
+            .get("watchlist")
+            .and_then(|value| value.as_array())
+        {
+            for holding in watchlist {
+                push_portfolio_ticker(&mut tickers, holding);
+            }
+        }
+    }
     if let Some(holdings) = call
         .result
         .get("holdings")
@@ -210,19 +294,92 @@ fn portfolio_tickers(call: &ToolCallMade) -> Vec<String> {
     tickers
 }
 
+fn portfolio_argument_tickers(call: &ToolCallMade) -> Vec<String> {
+    let mut tickers = Vec::new();
+    if let Some(holdings) = call
+        .arguments
+        .get("holdings")
+        .and_then(|value| value.as_array())
+    {
+        for holding in holdings {
+            push_portfolio_ticker(&mut tickers, holding);
+        }
+    }
+    push_portfolio_ticker(&mut tickers, &call.arguments);
+    tickers
+}
+
+fn portfolio_array<'a>(portfolio: &'a Value, key: &str) -> Vec<&'a Value> {
+    portfolio
+        .get(key)
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().collect())
+        .unwrap_or_default()
+}
+
 fn push_portfolio_ticker(tickers: &mut Vec<String>, value: &serde_json::Value) {
-    let Some(ticker) = value
-        .get("ticker")
-        .or_else(|| value.get("symbol"))
-        .and_then(|value| value.as_str())
-        .map(|value| value.trim().to_ascii_uppercase())
-        .filter(|value| !value.is_empty())
-    else {
+    let Some(ticker) = portfolio_ticker(value) else {
         return;
     };
     if !tickers.iter().any(|existing| existing == &ticker) {
         tickers.push(ticker);
     }
+}
+
+fn portfolio_ticker(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("ticker")
+        .or_else(|| value.get("symbol"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_ascii_uppercase())
+        .filter(|value| !value.is_empty())
+}
+
+fn format_portfolio_view_entry(holding: &Value) -> Option<String> {
+    let ticker = portfolio_ticker(holding)?;
+    let mut parts = vec![ticker];
+
+    if let Some(shares) = holding.get("shares").and_then(format_number_value) {
+        parts.push(format!("{shares} 股"));
+    }
+    if let Some(cost_basis) = holding.get("avg_cost").and_then(format_number_value) {
+        parts.push(format!("成本价 {cost_basis}"));
+    }
+
+    let is_watchlist = holding
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .map(|value| value == "watchlist")
+        .or_else(|| {
+            holding
+                .get("tracking_only")
+                .and_then(|value| value.as_bool())
+        })
+        .unwrap_or(false);
+    if is_watchlist {
+        parts.push("关注中".to_string());
+    }
+
+    if let Some(note) = holding
+        .get("notes")
+        .or_else(|| holding.get("strategy_notes"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(format!("备注：{}", truncate_portfolio_note(note)));
+    }
+
+    Some(parts.join("，"))
+}
+
+fn truncate_portfolio_note(note: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let mut truncated: String = note.chars().take(MAX_CHARS).collect();
+    if note.chars().count() > MAX_CHARS {
+        truncated.push('…');
+    }
+    truncated
 }
 
 fn portfolio_cost_basis(call: &ToolCallMade) -> Option<String> {
@@ -344,7 +501,9 @@ pub(crate) fn normalize_local_image_references(
                 if let Some(stable_path) =
                     stabilize_local_image_path(core, session_id, &marker.path)
                 {
-                    normalized.push_str("file://");
+                    if !stable_path.starts_with("oss://") {
+                        normalized.push_str("file://");
+                    }
                     normalized.push_str(&stable_path);
                 } else {
                     normalized.push_str(MISSING_LOCAL_IMAGE_FALLBACK_MESSAGE);
@@ -369,6 +528,52 @@ fn stabilize_local_image_path(core: &HoneBotCore, session_id: &str, path: &str) 
     let sandbox_root = sandbox_base_dir();
     if !source.starts_with(&sandbox_root) {
         return Some(source.to_string_lossy().to_string());
+    }
+
+    if core.config.cloud.effective_mode().is_cloud_authoritative()
+        && let Some(oss) =
+            hone_core::cloud_runtime::OssObjectStore::from_config(&core.config.cloud.oss)
+        && let Ok(bytes) = std::fs::read(source)
+    {
+        let target_name = unique_stable_image_name(source);
+        let key = format!(
+            "migration/generated/images/{}/{}",
+            hone_core::cloud_runtime::sanitize_key_component(session_id),
+            hone_core::cloud_runtime::sanitize_key_component(&target_name)
+        );
+        let content_type = match source
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            _ => "application/octet-stream",
+        };
+        let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| {
+                handle.block_on(oss.put_object(&key, bytes, content_type))
+            })
+        } else {
+            tokio::runtime::Runtime::new()
+                .ok()
+                .and_then(|rt| rt.block_on(oss.put_object(&key, bytes, content_type)).ok())
+                .map(|_| ())
+                .ok_or_else(|| "runtime unavailable".to_string())
+        };
+        match result {
+            Ok(()) => return Some(oss.object_uri(&key)),
+            Err(err) => tracing::warn!(
+                "[AgentSession] failed to upload generated image to OSS session_id={} source={} err={}",
+                session_id,
+                source.display(),
+                err
+            ),
+        }
     }
 
     let target_dir = gen_images_root.join(session_id);

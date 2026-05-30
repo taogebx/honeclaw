@@ -13,7 +13,7 @@ Why the name Hone:
 </p>
 
 <p align="center">
-  <strong>English</strong> | <a href="./README_ZH.md">简体中文</a> | <strong>Website:</strong> <a href="https://hone-claw.com" target="_blank">hone-claw.com</a> | <strong>💬 Community:</strong> <a href="https://discord.gg/TyDNfYXDGF" target="_blank">Discord</a>
+  <strong>English</strong> | <a href="./README_ZH.md">简体中文</a> | <strong>Website:</strong> <a href="https://hone-claw.com" target="_blank">hone-claw.com</a> | <strong>Blog:</strong> <a href="https://hone-claw.com/blog" target="_blank">hone-claw.com/blog</a> | <strong>💬 Community:</strong> <a href="https://discord.gg/TyDNfYXDGF" target="_blank">Discord</a>
 </p>
 
 ---
@@ -85,6 +85,8 @@ The public product website is now live at **[hone-claw.com](https://hone-claw.co
 - **Client** (desktop): Rust (Tauri)
 - **Frontend**: SolidJS + Tailwind v4
 
+Why Rust: see the first Hone Blog post, [Why Hone uses Rust, and why more teams should start using Rust](https://hone-claw.com/blog/why-hone-uses-rust).
+
 ### Supported channels
 
 - **Web Console**: Modern browser interface with interactive charts.
@@ -138,7 +140,7 @@ hone-cli onboard
 hone-cli configure --section agent --section channels --section providers
 ```
 
-Pick Hone Cloud, a local runner such as Codex ACP or OpenCode ACP, or a legacy local CLI runner such as Gemini / Codex CLI. OpenRouter credentials are configured as provider keys for the routes that need them.
+Pick Hone Cloud, a local runner such as Codex ACP or OpenCode ACP, or a legacy local CLI runner such as Gemini / Codex CLI. OpenRouter credentials should live in `llm.providers.openrouter.api_key/api_keys`; legacy `llm.openrouter.*` key fields remain migration fallbacks only.
 
 The next section’s screenshots show the full **model and channel** setup.
 

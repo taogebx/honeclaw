@@ -3,10 +3,10 @@
 //! 通过 `std::process::Command` 调用本地 `gemini` CLI，
 //! 实现 `Agent` trait 以接入系统。
 //!
-//! ## 工具调用机制（Text-Based Tool Dispatch）
+//! ## 工具调用机制（Text-Tag Tool Dispatch）
 //!
-//! Gemini CLI 以 `--prompt` 非交互模式运行，无法使用原生 Function Calling API。
-//! 因此采用文本协议：在系统 prompt 中注入调用规范，要求 LLM 以
+//! Gemini CLI 在本地 `--prompt` 非交互路径下仍以文本协议驱动 Hone 工具调度：
+//! 在系统 prompt 中注入调用规范，要求 LLM 以
 //! `<tool_call>{"name":"...","arguments":{...},"reasoning":"正在..."}</tool_call>` 格式标记工具调用。
 //! Rust 层解析该标签，执行 ToolRegistry 中的工具，将结果注入对话，循环直到无工具调用。
 //!
@@ -15,10 +15,10 @@
 //! Gemini CLI 以 `-o stream-json` 模式运行，每行输出一个 JSON 事件对象。
 //! `parse_stream_event` 统一解析所有已知事件类型，同时兼容旧版 CLI 输出格式。
 //!
-//! 已知事件类型（对照 aioncli-core ServerGeminiEventType）：
+//! 当前解析器识别的事件类型：
 //! - `content`          — 模型输出的文本增量
 //! - `thought`          — 模型的思考过程（隐藏，不展示给用户）
-//! - `tool_call_request`— 模型请求调用工具（当前使用文本协议替代）
+//! - `tool_call_request`— 模型请求调用工具（当前识别并记录，实际派发仍走 `<tool_call>` 文本标签）
 //! - `error`            — 错误事件
 //! - `finished`         — 流结束，含 token 统计
 //! - `retry`            — 服务端要求重试
@@ -40,8 +40,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Gemini CLI `-o stream-json` 每行输出的结构化事件。
 ///
-/// 对照 AionUI / aioncli-core 的 `ServerGeminiEventType`，覆盖所有已知类型，
-/// 并兼容旧版 Gemini CLI 输出格式。
+/// 覆盖当前代码显式处理的 `stream-json` 事件类型，并兼容旧版 Gemini CLI 输出格式。
 #[derive(Debug, Clone)]
 pub enum GeminiStreamEvent {
     /// 模型输出的文本内容增量（新格式 `type=content`，旧格式 `type=message/role=assistant`）
@@ -98,7 +97,7 @@ impl GeminiStreamEvent {
 ///
 /// 支持格式：
 ///
-/// **新格式（aioncli-core / gemini CLI ≥ v0.3x）**
+/// **结构化 `stream-json` 格式**
 /// - `{"type":"content","value":"文本"}`
 /// - `{"type":"thought","value":"思考内容"}`
 /// - `{"type":"tool_call_request","value":{...}}`
@@ -116,12 +115,12 @@ impl GeminiStreamEvent {
 /// - `{"type":"init",...}` / `{"type":"result",...}` / `{"type":"user",...}`
 /// - 非 JSON 行（CLI 进度日志等）
 pub fn parse_stream_event(line: &str) -> Option<GeminiStreamEvent> {
-    let t = line.trim();
-    if t.is_empty() {
+    let trimmed_line = line.trim();
+    if trimmed_line.is_empty() {
         return None;
     }
 
-    let Ok(json) = serde_json::from_str::<Value>(t) else {
+    let Ok(json) = serde_json::from_str::<Value>(trimmed_line) else {
         // 非 JSON 行（进度日志等），忽略
         return None;
     };
@@ -136,11 +135,11 @@ pub fn parse_stream_event(line: &str) -> Option<GeminiStreamEvent> {
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            let s = text.trim();
-            if s.is_empty() {
+            let trimmed_text = text.trim();
+            if trimmed_text.is_empty() {
                 None
             } else {
-                Some(GeminiStreamEvent::Content(s.to_string()))
+                Some(GeminiStreamEvent::Content(trimmed_text.to_string()))
             }
         }
 
@@ -199,9 +198,9 @@ pub fn parse_stream_event(line: &str) -> Option<GeminiStreamEvent> {
             let role = json.get("role").and_then(|v| v.as_str()).unwrap_or("");
             if role == "assistant" {
                 if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
-                    let s = content.trim();
-                    if !s.is_empty() {
-                        return Some(GeminiStreamEvent::Content(s.to_string()));
+                    let trimmed_content = content.trim();
+                    if !trimmed_content.is_empty() {
+                        return Some(GeminiStreamEvent::Content(trimmed_content.to_string()));
                     }
                 }
             }
@@ -228,10 +227,10 @@ pub fn parse_stream_event(line: &str) -> Option<GeminiStreamEvent> {
 
         // ── 无 type 字段：尝试旧格式 {"response":"..."} ───────────────────────
         _ => {
-            if let Some(resp) = json.get("response").and_then(|v| v.as_str()) {
-                let s = resp.trim();
-                if !s.is_empty() {
-                    return Some(GeminiStreamEvent::Content(s.to_string()));
+            if let Some(response_text) = json.get("response").and_then(|v| v.as_str()) {
+                let trimmed_response = response_text.trim();
+                if !trimmed_response.is_empty() {
+                    return Some(GeminiStreamEvent::Content(trimmed_response.to_string()));
                 }
             }
             None
@@ -354,9 +353,9 @@ impl GeminiCliAgent {
         format!("{}…[内容过长已截断]", &s[..end])
     }
 
-    /// 公有静态版 build_prompt，供 hone-imessage / hone-feishu 流式路径直接调用
+    /// 公有静态版 `build_streaming_prompt`，供 channel runner 直接构建 Gemini prompt。
     ///
-    /// ## 内存安全策略
+    /// ## 参数大小安全策略
     ///
     /// 为防止 `--prompt` 参数超出 OS `ARG_MAX` 限制（E2BIG / os error 7），本函数
     /// 严格限制最终 prompt 的字节大小：
@@ -449,9 +448,9 @@ impl GeminiCliAgent {
 
     /// 构建发送给 Gemini CLI 的完整 prompt
     ///
-    /// 包含：System Instructions、工具调用协议说明、工具列表、对话历史、当前用户输入
+    /// 包含：System Instructions、工具调用协议说明、工具列表、对话历史、工具结果和输出要求
     ///
-    /// ## 内存安全策略
+    /// ## 参数大小安全策略
     ///
     /// 同 `build_streaming_prompt`，限制最终 prompt 字节大小以防止 E2BIG 错误。
     fn build_prompt(
@@ -543,7 +542,7 @@ impl GeminiCliAgent {
     ///
     /// 返回 `(visible_text, Option<(name, arguments_value, reasoning)>)`：
     /// - `visible_text`：去掉 `<tool_call>` 标签后用户可见的文本部分
-    /// - `Some((name, args))`：当检测到完整的工具调用标签时
+    /// - `Some((name, args, reasoning))`：当检测到完整的工具调用标签时
     pub fn parse_tool_call(text: &str) -> (String, Option<(String, Value, Option<String>)>) {
         const OPEN: &str = "<tool_call>";
         const CLOSE: &str = "</tool_call>";
@@ -656,26 +655,29 @@ impl GeminiCliAgent {
                                 remaining / 1000
                             ));
                         }
-                        Some(GeminiStreamEvent::Finished(val)) => {
+                        Some(GeminiStreamEvent::Finished(finish_event)) => {
                             self.dbg("[GeminiCliAgent] stream finished event received");
-                            if let Some(meta) = val.get("usageMetadata") {
-                                let p = meta
+                            if let Some(meta) = finish_event.get("usageMetadata") {
+                                let prompt_tokens = meta
                                     .get("promptTokenCount")
                                     .and_then(|v| v.as_u64())
                                     .map(|v| v as u32);
-                                let c = meta
+                                let completion_tokens = meta
                                     .get("candidatesTokenCount")
                                     .and_then(|v| v.as_u64())
                                     .map(|v| v as u32);
-                                let t = meta
+                                let total_tokens = meta
                                     .get("totalTokenCount")
                                     .and_then(|v| v.as_u64())
                                     .map(|v| v as u32);
-                                if p.is_some() || c.is_some() || t.is_some() {
+                                if prompt_tokens.is_some()
+                                    || completion_tokens.is_some()
+                                    || total_tokens.is_some()
+                                {
                                     usage = Some(hone_llm::provider::TokenUsage {
-                                        prompt_tokens: p,
-                                        completion_tokens: c,
-                                        total_tokens: t,
+                                        prompt_tokens,
+                                        completion_tokens,
+                                        total_tokens,
                                     });
                                 }
                             }
@@ -688,10 +690,10 @@ impl GeminiCliAgent {
                             tracing::warn!("[GeminiCliAgent] invalid stream event received");
                             // 不立即中止，继续读取剩余行
                         }
-                        Some(GeminiStreamEvent::ToolCallRequest(val)) => {
+                        Some(GeminiStreamEvent::ToolCallRequest(tool_call_event)) => {
                             self.dbg(&format!(
                                 "[GeminiCliAgent] native tool_call_request event (ignored, using text protocol): {}",
-                                val
+                                tool_call_event
                             ));
                         }
                         Some(GeminiStreamEvent::Unknown(type_name)) => {
@@ -748,7 +750,7 @@ impl GeminiCliAgent {
 
 #[async_trait]
 impl Agent for GeminiCliAgent {
-    /// 运行单次交互，支持 Text-Based Tool Dispatch 多轮循环
+    /// 运行单次交互，支持 `<tool_call>` 文本标签多轮工具调度。
     ///
     /// 流程：
     /// 1. 构建 prompt（含工具调用协议说明）
@@ -782,7 +784,7 @@ impl Agent for GeminiCliAgent {
             let call_started = std::time::Instant::now();
 
             let (content, usage) = match self.call_gemini(&prompt).await {
-                Ok(res) => res,
+                Ok(gemini_response) => gemini_response,
                 Err(e) => {
                     self.record_audit(
                         context,
@@ -905,7 +907,7 @@ impl Agent for GeminiCliAgent {
         let request_payload = serde_json::json!({ "prompt": prompt.clone() });
         let call_started = std::time::Instant::now();
         let (content, usage) = match self.call_gemini(&prompt).await {
-            Ok(res) => res,
+            Ok(gemini_response) => gemini_response,
             Err(e) => {
                 self.record_audit(
                     context,

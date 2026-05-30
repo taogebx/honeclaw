@@ -1,7 +1,7 @@
-// public-portfolio.tsx — 用户的"投资上下文"页:展示系统蒸馏的投资主线、整体投资风格、
-// sandbox 里的公司画像列表(read-only)。编辑画像走 /chat 与 agent 对话(company_portrait skill)。
+// public-portfolio.tsx — 用户的"投资上下文"页:展示并刷新系统蒸馏的投资主线、
+// 整体投资风格和 sandbox 里的只读公司画像列表。编辑画像走 /chat 与 agent 对话(company_portrait skill)。
 
-import { createEffect, createSignal, For, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createSignal, For, onMount, Show } from "solid-js"
 import { useNavigate } from "@solidjs/router"
 import { marked } from "marked"
 import DOMPurify from "dompurify"
@@ -14,7 +14,11 @@ import {
   getPublicAuthMe,
   type DigestContext,
 } from "@/lib/api"
-import { firstProfileTicker, profileTickerSet } from "@/lib/mainline-context-model"
+import {
+  mainlineHoldingCardState,
+  profileInventoryRowState,
+  profileTickerSet,
+} from "@/lib/mainline-context-model"
 import {
   canRefreshPublicMainline,
   formatPublicMainlineTimestamp,
@@ -82,12 +86,12 @@ function MainlineCard(props: {
               fallback={
                 <>
                   <strong style={{ color: "#d97706" }}>暂无公司画像</strong> —— 跟 Hone 说
-                  “建立 {props.ticker} 的公司画像”，下次自动更新就会带上它。
+                  “建立 {props.ticker} 的公司画像”，立即更新或下一次自动检查后就会带上它。
                 </>
               }
             >
               <strong style={{ color: "#d97706" }}>画像存在，但投资主线生成失败 / 跳过</strong>
-              {props.isSkipped ? "（上次跳过）" : ""}—— 点击「立即更新」重试。
+              {props.isSkipped ? "（上次跳过）" : ""}—— 可立即更新重试，或等下一次自动检查。
             </Show>
           </div>
         }
@@ -279,9 +283,7 @@ function PortfolioContextView() {
     setModalOpen(true)
   }
 
-  const profileTickers = () => {
-    return profileTickerSet(digestContext())
-  }
+  const profileTickers = createMemo(() => profileTickerSet(digestContext()))
 
   return (
     <div style={{ "padding-top": "56px", "min-height": "100vh", background: "#f8fafc" }}>
@@ -299,7 +301,7 @@ function PortfolioContextView() {
             投资上下文
           </h1>
           <p style={{ "font-size": "13px", color: "#64748b", "margin-top": "8px", "line-height": "1.7" }}>
-            Hone 每周自动从你的公司画像里整理出投资主线，用来过滤每日推送的相关性。要修改画像，直接跟 Hone 对话即可。
+            Hone 会从你的公司画像里整理投资主线；新增画像或持仓后通常会在下一次自动检查里尝试更新，覆盖完整后约每周刷新一次。要修改画像，直接跟 Hone 对话即可。
           </p>
         </div>
 
@@ -438,7 +440,7 @@ function PortfolioContextView() {
                   margin: "24px 0 12px",
                 }}
               >
-                各持仓投资主线 ({context().holdings.length} 只)
+                各持仓投资主线（{context().holdings.length} 只）
               </h2>
               <Show
                 when={context().holdings.length > 0}
@@ -487,15 +489,20 @@ function PortfolioContextView() {
                   }}
                 >
                   <For each={context().holdings}>
-                    {(ticker) => (
-                      <MainlineCard
-                        ticker={ticker}
-                        mainline={context().mainline_by_ticker[ticker]}
-                        hasProfile={profileTickers().has(ticker)}
-                        isSkipped={context().mainline_distill_skipped.includes(ticker)}
-                        onView={() => openProfile(ticker)}
-                      />
-                    )}
+                    {(ticker) => {
+                      const card = createMemo(() =>
+                        mainlineHoldingCardState(context(), ticker, profileTickers()),
+                      )
+                      return (
+                        <MainlineCard
+                          ticker={card().ticker}
+                          mainline={card().mainline}
+                          hasProfile={card().hasProfile}
+                          isSkipped={card().isSkipped}
+                          onView={() => openProfile(ticker)}
+                        />
+                      )
+                    }}
                   </For>
                 </div>
               </Show>
@@ -552,7 +559,7 @@ function PortfolioContextView() {
                 <div style={{ display: "flex", "flex-direction": "column", gap: "10px" }}>
                   <For each={context().profile_list}>
                     {(profile) => {
-                      const viewTicker = () => firstProfileTicker(profile)
+                      const row = createMemo(() => profileInventoryRowState(profile))
                       return (
                         <div
                           style={{
@@ -568,7 +575,7 @@ function PortfolioContextView() {
                         >
                           <div style={{ flex: "1" }}>
                             <div style={{ "font-size": "14px", "font-weight": "600", color: "#0f172a" }}>
-                              {profile.title || profile.dir}
+                              {row().title}
                               <span
                                 style={{
                                   "margin-left": "8px",
@@ -577,7 +584,7 @@ function PortfolioContextView() {
                                   color: "#64748b",
                                 }}
                               >
-                                {profile.tickers.join(" / ")}
+                                {row().tickerLabel}
                               </span>
                             </div>
                             <div
@@ -587,10 +594,10 @@ function PortfolioContextView() {
                                 "margin-top": "4px",
                               }}
                             >
-                              {(profile.bytes / 1024).toFixed(1)} KB · {profile.dir}
+                              {row().sizeLabel} · {row().dir}
                             </div>
                           </div>
-                          <Show when={viewTicker()}>
+                          <Show when={row().viewTicker}>
                             {(ticker) => (
                               <button
                                 type="button"

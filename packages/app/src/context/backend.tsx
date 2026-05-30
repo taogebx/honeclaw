@@ -219,10 +219,10 @@ function createBackendState() {
   }
 
   const loadDesktopBackendStatusSafe = async () =>
-    withTimeout(loadDesktopBackendStatus(), DESKTOP_STATUS_TIMEOUT_MS, "读取 desktop backend 状态")
+    withTimeout(loadDesktopBackendStatus(), DESKTOP_STATUS_TIMEOUT_MS, "读取桌面后端状态")
 
   const connectDesktopBackendSafe = async () =>
-    withTimeout(connectDesktopBackend(), DESKTOP_CONNECT_TIMEOUT_MS, "连接 desktop backend")
+    withTimeout(connectDesktopBackend(), DESKTOP_CONNECT_TIMEOUT_MS, "连接桌面后端")
 
   const initDesktop = async () => {
     try {
@@ -330,11 +330,11 @@ function createBackendState() {
       }
       setState("saving", true)
       try {
-        const result = await saveDesktopAgentSettings(settings)
-        if (result.backendStatus) {
-          await applyDesktopStatusWithRemoteFallback(result.backendStatus)
+        const saveResult = await saveDesktopAgentSettings(settings)
+        if (saveResult.backendStatus) {
+          await applyDesktopStatusWithRemoteFallback(saveResult.backendStatus)
         }
-        return result
+        return saveResult
       } finally {
         setState("saving", false)
       }
@@ -351,11 +351,11 @@ function createBackendState() {
         if (!state.isDesktop) {
           return await putChannelSettings(settings)
         }
-        const result = await saveDesktopChannelSettings(settings)
-        if (result.backendStatus) {
-          await applyDesktopStatusWithRemoteFallback(result.backendStatus)
+        const saveResult = await saveDesktopChannelSettings(settings)
+        if (saveResult.backendStatus) {
+          await applyDesktopStatusWithRemoteFallback(saveResult.backendStatus)
         }
-        return result
+        return saveResult
       } finally {
         setState("saving", false)
       }

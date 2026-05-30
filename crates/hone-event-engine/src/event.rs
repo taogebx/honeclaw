@@ -121,6 +121,37 @@ impl MarketEvent {
     pub fn touches(&self, symbol: &str) -> bool {
         self.symbols.iter().any(|s| s.eq_ignore_ascii_case(symbol))
     }
+
+    pub fn user_visible_url(&self) -> Option<&str> {
+        self.url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .filter(|url| is_user_visible_url(url))
+    }
+}
+
+pub fn is_user_visible_url(url: &str) -> bool {
+    !is_known_unstable_user_url(url)
+}
+
+fn is_known_unstable_user_url(url: &str) -> bool {
+    let normalized = url.trim().to_ascii_lowercase();
+    let without_scheme = normalized
+        .strip_prefix("https://")
+        .or_else(|| normalized.strip_prefix("http://"))
+        .unwrap_or(&normalized);
+    let without_www = without_scheme
+        .strip_prefix("www.")
+        .unwrap_or(without_scheme);
+    let host = without_www.split('/').next().unwrap_or_default();
+    let path_with_query = without_www
+        .strip_prefix(host)
+        .filter(|path| path.starts_with('/'))
+        .unwrap_or("");
+    let path = path_with_query.split('?').next().unwrap_or(path_with_query);
+    let is_thefly = host == "thefly.com" || host.ends_with(".thefly.com");
+    is_thefly && matches!(path, "/ajax/news_get.php" | "/news.php")
 }
 
 pub fn is_noop_analyst_grade(event: &MarketEvent) -> bool {
@@ -282,7 +313,7 @@ mod tests {
 
     #[test]
     fn touches_is_case_insensitive() {
-        let ev = MarketEvent {
+        let event = MarketEvent {
             id: "earnings:AAPL:2026-04-30".into(),
             kind: EventKind::EarningsUpcoming,
             severity: Severity::Medium,
@@ -294,14 +325,41 @@ mod tests {
             source: "fmp.earning_calendar".into(),
             payload: serde_json::Value::Null,
         };
-        assert!(ev.touches("aapl"));
-        assert!(ev.touches("AAPL"));
-        assert!(!ev.touches("TSLA"));
+        assert!(event.touches("aapl"));
+        assert!(event.touches("AAPL"));
+        assert!(!event.touches("TSLA"));
+    }
+
+    #[test]
+    fn user_visible_url_filters_unstable_thefly_entrypoints() {
+        let mut event = MarketEvent {
+            id: "grade:AMD:test".into(),
+            kind: EventKind::AnalystGrade,
+            severity: Severity::High,
+            symbols: vec!["AMD".into()],
+            occurred_at: Utc::now(),
+            title: "AMD · analyst call".into(),
+            summary: String::new(),
+            url: Some("https://www.thefly.com/ajax/news_get.php?id=4357265".into()),
+            source: "fmp.upgrades_downgrades".into(),
+            payload: serde_json::Value::Null,
+        };
+
+        assert_eq!(event.user_visible_url(), None);
+
+        event.url = Some("https://apim.thefly.com/news.php?symbol=AMD".into());
+        assert_eq!(event.user_visible_url(), None);
+
+        event.url = Some("https://thefly.com/permalinks/entry.php/id4191882/TEL-test".into());
+        assert_eq!(
+            event.user_visible_url(),
+            Some("https://thefly.com/permalinks/entry.php/id4191882/TEL-test")
+        );
     }
 
     #[test]
     fn detects_noop_analyst_grade_hold() {
-        let ev = MarketEvent {
+        let event = MarketEvent {
             id: "grade:GEV:test".into(),
             kind: EventKind::AnalystGrade,
             severity: Severity::Low,
@@ -318,12 +376,12 @@ mod tests {
             }),
         };
 
-        assert!(is_noop_analyst_grade(&ev));
+        assert!(is_noop_analyst_grade(&event));
     }
 
     #[test]
     fn detects_noop_analyst_grade_dirty_downgrade_label() {
-        let ev = MarketEvent {
+        let event = MarketEvent {
             id: "grade:AMD:test".into(),
             kind: EventKind::AnalystGrade,
             severity: Severity::High,
@@ -342,14 +400,14 @@ mod tests {
         };
 
         assert!(
-            is_noop_analyst_grade(&ev),
+            is_noop_analyst_grade(&event),
             "same-rating dirty downgrade rows should not force immediate delivery"
         );
     }
 
     #[test]
     fn target_change_with_same_rating_is_not_noop_grade() {
-        let ev = MarketEvent {
+        let event = MarketEvent {
             id: "grade:GEV:test".into(),
             kind: EventKind::AnalystGrade,
             severity: Severity::Medium,
@@ -366,12 +424,12 @@ mod tests {
             }),
         };
 
-        assert!(!is_noop_analyst_grade(&ev));
+        assert!(!is_noop_analyst_grade(&event));
     }
 
     #[test]
     fn target_change_news_title_with_hold_action_is_not_noop_grade() {
-        let ev = MarketEvent {
+        let event = MarketEvent {
             id: "grade:GOOGL:test".into(),
             kind: EventKind::AnalystGrade,
             severity: Severity::Low,
@@ -389,12 +447,12 @@ mod tests {
             }),
         };
 
-        assert!(!is_noop_analyst_grade(&ev));
+        assert!(!is_noop_analyst_grade(&event));
     }
 
     #[test]
     fn event_roundtrip_json() {
-        let ev = MarketEvent {
+        let event = MarketEvent {
             id: "price:NVDA:2026-04-21T15:00".into(),
             kind: EventKind::PriceAlert {
                 pct_change_bps: 1200,
@@ -409,9 +467,9 @@ mod tests {
             source: "fmp.quote".into(),
             payload: serde_json::json!({"price": 940.5}),
         };
-        let s = serde_json::to_string(&ev).unwrap();
-        let back: MarketEvent = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.id, ev.id);
+        let serialized = serde_json::to_string(&event).unwrap();
+        let back: MarketEvent = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(back.id, event.id);
         assert_eq!(back.severity, Severity::High);
     }
 }

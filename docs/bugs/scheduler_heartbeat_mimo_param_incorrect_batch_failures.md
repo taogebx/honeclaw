@@ -9,6 +9,74 @@
 ## 证据来源
 
 - `data/sessions.sqlite3` -> `cron_job_runs`
+  - `2026-05-19 19:02 CST` 复核：最近四小时真实运行窗口 `2026-05-19T15:30:11+08:00` 到 `2026-05-19T19:00:20+08:00` 又新增 `81` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 最近四小时 `21` 个 user turn 与 `21` 个 assistant final 均有收口；assistant final 未命中空回复、通用失败、绝对路径、工具轨迹、原始 ACP `session/update`、compact marker、飞书标签、`reasoning_content` 或 `Param Incorrect` 可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前机器没有可确认已重启到 `2026-05-15 04:05 CST` 当前 HEAD 修复后的 live 进程；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-19 15:02 CST` 复核：最近四小时真实运行窗口 `2026-05-19T11:30:09+08:00` 到 `2026-05-19T15:00:33+08:00` 又新增 `81` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗普通 scheduler 有 `1` 条 `completed + sent + delivered=1`，最近四小时 `10` 个 user turn 与 `10` 个 assistant final 均有收口；assistant final 未命中空回复、通用失败、绝对路径、工具轨迹、原始 ACP `session/update`、compact marker、飞书标签、`reasoning_content` 或 `Param Incorrect` 可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前机器没有可确认已重启到 `2026-05-15 04:05 CST` 当前 HEAD 修复后的 live 进程；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-19 11:03 CST` 复核：最近四小时真实运行窗口 `2026-05-19T07:30:09+08:00` 到 `2026-05-19T11:00:27+08:00` 又新增 `80` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗普通 scheduler 有 `18` 条 `completed + sent + delivered=1`，最近四小时 `30` 个 user turn 与 `31` 个 assistant final 均有收口；assistant final 未命中空回复、通用失败、绝对路径、工具轨迹、原始 ACP `session/update`、compact marker、飞书标签、`reasoning_content` 或 `Param Incorrect` 可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前机器没有可确认已重启到 `2026-05-15 04:05 CST` 当前 HEAD 修复后的 live 进程；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-18 23:03 CST` 复核：最近四小时真实运行窗口 `2026-05-18T19:30:10+08:00` 到 `2026-05-18T23:00:22+08:00` 又新增 `81` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗普通 scheduler 有 `33` 条 `completed + sent + delivered=1`，最近四小时按 `datetime(...)` 归一化后 `48` 个 user turn 均有 assistant final 收口；assistant final 未命中绝对路径、工具轨迹、原始 ACP `session/update`、compact marker、飞书标签、`reasoning_content`、`Param Incorrect` 或 Codex ACP 内部错误可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前机器没有可确认已重启到 `2026-05-15 04:05 CST` 当前 HEAD 修复后的 live 进程；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-18 19:03 CST` 复核：最近四小时真实运行窗口 `2026-05-18T15:30:08+08:00` 到 `2026-05-18T19:00:22+08:00` 又新增 `80` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗没有普通 scheduler 终态，最近四小时按 `datetime(...)` 归一化后 `14` 个 user turn 均有 assistant final 收口；assistant final 未命中绝对路径、工具轨迹、原始 ACP `session/update`、compact marker、飞书标签、`reasoning_content`、`Param Incorrect` 或 Codex ACP 内部错误可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前机器没有可确认已重启到 `2026-05-15 04:05 CST` 当前 HEAD 修复后的 live 进程；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-18 15:02 CST` 复核：最近四小时真实运行窗口 `2026-05-18T11:30:09+08:00` 到 `2026-05-18T15:00:20+08:00` 又新增 `81` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗普通 scheduler 有 `1` 条 `completed + sent + delivered=1`，最近四小时按 `datetime(...)` 归一化后 `7` 个 user turn 均有 assistant final 收口；assistant final 未命中绝对路径、工具轨迹、原始 ACP `session/update`、compact marker、飞书标签、`reasoning_content` 或 `Param Incorrect` 可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前机器没有可确认已重启到 `2026-05-15 04:05 CST` 当前 HEAD 修复后的 live 进程；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-18 11:03 CST` 复核：最近四小时真实运行窗口 `2026-05-18T07:30:08+08:00` 到 `2026-05-18T11:00:22+08:00` 又新增 `80` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗普通 scheduler 有 `18` 条 `completed + sent + delivered=1`，最近四小时 `27` 个 user turn 均有 assistant final 收口；assistant final 未命中绝对路径、工具轨迹、原始 ACP `session/update`、compact marker、飞书标签、`reasoning_content` 或 `Param Incorrect` 可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前机器没有可确认已重启到 `2026-05-15 04:05 CST` 当前 HEAD 修复后的 live 进程；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-18 07:03 CST` 复核：最近四小时真实运行窗口 `2026-05-18T03:30:08+08:00` 到 `2026-05-18T07:00:17+08:00` 又新增 `80` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗普通 scheduler 有 `7` 条 `completed + sent + delivered=1`，最近四小时 8 个 user turn 均有 assistant final 收口；assistant final 未命中绝对路径、工具轨迹、原始 ACP `session/update`、compact marker、飞书标签、`reasoning_content` 或 `Param Incorrect` 可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前机器没有可确认已重启到 `2026-05-15 04:05 CST` 当前 HEAD 修复后的 live 进程；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-18 03:03 CST` 复核：最近四小时真实运行窗口 `2026-05-17T23:30:09+08:00` 到 `2026-05-18T03:00:23+08:00` 又新增 `82` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗普通 scheduler 有 `3` 条 `completed + sent + delivered=1`，最近四小时 7 个 user turn 均有 assistant final 收口；assistant final 未命中绝对路径、工具轨迹、原始 ACP `session/update`、compact marker、飞书标签、`reasoning_content` 或 `Param Incorrect` 可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前机器没有可确认已重启到 `2026-05-15 04:05 CST` 当前 HEAD 修复后的 live 进程；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-17 23:04 CST` 复核：最近四小时真实运行窗口 `2026-05-17T19:30:09+08:00` 到 `2026-05-17T23:00:21+08:00` 又新增 `81` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗普通 scheduler 有 `16` 条 `completed + sent + delivered=1`，最近四小时 25 个 user turn 均有 assistant final 收口；assistant final 未命中绝对路径、工具轨迹、原始 ACP `session/update`、compact marker、飞书标签、`reasoning_content` 或 `Param Incorrect` 可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，`hone-feishu` 仍启动于 `2026-05-13 21:01 CST`，早于 `2026-05-15 04:05 CST` 的当前 HEAD 修复复核；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-17 15:02 CST` 复核：最近四小时真实运行窗口 `2026-05-17T11:30:08+08:00` 到 `2026-05-17T15:01:30+08:00` 又新增 `82` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗普通 Feishu scheduler `每日公司资讯与分析总结` 为 `completed + sent + delivered=1`，最近四小时 10 个 user turn 均有 assistant final 收口；assistant final 未命中绝对路径、工具轨迹、原始 ACP `session/update`、compact marker 或飞书标签可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前 `hone-feishu` 仍启动于 `2026-05-13 21:01 CST`，早于 `2026-05-15 04:05 CST` 的当前 HEAD 修复复核；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-17 07:02 CST` 复核：最近四小时真实运行窗口 `2026-05-17T03:30:08+08:00` 到 `2026-05-17T07:00:19+08:00` 又新增 `79` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗普通 Feishu scheduler `每日美股盘后收盘复盘` 为 `completed + sent + delivered=1`，最近四小时无 direct 用户新请求；assistant final 未命中绝对路径、工具轨迹、原始 ACP `session/update`、compact marker 或飞书标签可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，`hone-feishu` 仍启动于 `2026-05-13 21:01 CST`，早于 `2026-05-15 04:05 CST` 的当前 HEAD 修复复核；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-17 03:03 CST` 复核：最近四小时真实运行窗口 `2026-05-16T23:30:08+08:00` 到 `2026-05-17T03:00:20+08:00` 又新增 `82` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗普通 Feishu scheduler `RKLB / AAOI / TEM 每日动态监控` 均 `completed + sent + delivered=1`，最近四小时 Feishu direct 2 个用户请求均有 assistant final 收口；assistant final 未命中绝对路径、工具轨迹、原始 ACP `session/update`、compact marker 或飞书标签可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前 `hone-console-page` 仍启动于 `2026-05-13`，`hone-feishu` 仍启动于 `2026-05-13 21:01 CST`，早于 `2026-05-15 04:05 CST` 的当前 HEAD 修复复核；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-16 23:03 CST` 复核：最近四小时真实运行窗口 `2026-05-16T19:00:13+08:00` 到 `2026-05-16T23:00:22+08:00` 又新增 `91` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗普通 scheduler 有 `16` 条 `completed + sent + delivered=1`，Feishu / Web direct 均有 assistant final 收口；assistant final 未命中绝对路径、工具轨迹、原始 ACP `session/update`、compact marker 或飞书标签可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，早于 `2026-05-15 04:05 CST` 的当前 HEAD 修复复核；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-16 19:03 CST` 复核：最近四小时真实运行窗口 `2026-05-16T15:30:08+08:00` 到 `2026-05-16T19:00:22+08:00` 又新增 `80` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗无普通 scheduler 终态，最近四小时 17 个 user turn 均有 assistant final 收口；assistant final 未命中绝对路径、工具轨迹、原始 ACP `session/update`、compact marker 或飞书标签可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，`hone-feishu` 仍启动于 `2026-05-13 21:01 CST`，早于 `2026-05-15 04:05 CST` 的当前 HEAD 修复复核；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-16 15:03 CST` 复核：最近四小时真实运行窗口 `2026-05-16T11:30:09+08:00` 到 `2026-05-16T15:00:21+08:00` 又新增 `81` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗普通 scheduler `每日公司资讯与分析总结` 有 `completed + sent + delivered=1` 终态，最近四小时 9 个 user turn 均有 assistant final 收口；assistant final 未命中绝对路径、工具轨迹、原始 ACP `session/update`、compact marker 或飞书标签可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，`hone-feishu` 仍启动于 `2026-05-13 21:01 CST`，早于 `2026-05-15 04:05 CST` 的当前 HEAD 修复复核；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
+  - `2026-05-16 11:03 CST` 复核：最近四小时真实运行窗口 `2026-05-16T07:30:07+08:00` 到 `2026-05-16T11:00:23+08:00` 又新增 `79` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
+  - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
+  - 同窗普通 scheduler 有 `10` 条 `completed + sent`，最近四小时 Feishu / Web / Discord direct 和普通 scheduler 均有 assistant 收口；assistant final 未命中绝对路径、工具轨迹、原始 ACP `session/update` 或飞书标签可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
+  - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，`hone-feishu` 仍启动于 `2026-05-13 21:01 CST`，早于 `2026-05-15 04:05 CST` 的当前 HEAD 修复复核；本轮证据继续按当前机器旧/非生产运行态处理，只追加运行态观察，不把状态从 `Fixed` 回退为 `New`。
   - `2026-05-16 07:02 CST` 复核：最近四小时真实运行窗口 `2026-05-16T03:30:09+08:00` 到 `2026-05-16T07:00:18+08:00` 又新增 `81` 条 heartbeat `reasoning_content must be passed back` / `Param Incorrect` 失败，覆盖 `11` 个 job；终态均为 `execution_failed + skipped_error + delivered=0`。
   - 失败 job 仍覆盖 `Cerebras IPO与业务进展心跳监控`、`DRAM 心跳监控`、`Monitor_Watchlist_11`、`RKLB异动监控`、`TEM大事件心跳监控`、`TEM破位预警`、`TSLA 正负触发条件心跳监控`、`伦敦金跌破4500提醒`、`持仓重大事件心跳检测`、`小米30港元破位预警` 与 `全天原油价格3小时播报`。
   - 同窗仅看到 1 条普通 scheduler `每日美股盘后收盘复盘` 成功 `completed + sent + delivered=1`；最近四小时 Feishu assistant final 未命中绝对路径、工具轨迹、原始 ACP `session/update` 或飞书标签可见污染。故障仍集中在 heartbeat `mimo-v2.5-pro` function-calling 路径。
@@ -97,6 +165,20 @@
 
 ## 当前实现效果
 
+- 2026-05-19 19:02 CST 的最新复核继续只作为当前机器旧/非生产运行态证据：15:30-19:00 CST 仍新增 `81` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；最近四小时 21 个 user turn 与 21 个 assistant final 均有收口，assistant final 污染扫描未见用户可见 `reasoning_content` / `Param Incorrect` 外泄；当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程，本轮不重新打开。
+
+- 2026-05-19 15:02 CST 的最新复核继续只作为当前机器旧/非生产运行态证据：11:30-15:00 CST 仍新增 `81` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；最近四小时普通 scheduler 仍有 `1` 条 `completed + sent + delivered=1`，assistant final 污染扫描未见用户可见 `reasoning_content` / `Param Incorrect` 外泄；当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程，本轮不重新打开。
+
+- 2026-05-19 11:03 CST 的复核继续只作为当前机器旧/非生产运行态证据：07:30-11:00 CST 仍新增 `80` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；最近四小时普通 scheduler 仍有 `18` 条 `completed + sent + delivered=1`，assistant final 污染扫描未见用户可见 `reasoning_content` / `Param Incorrect` 外泄；当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程，本轮不重新打开。
+
+- 2026-05-19 07:03 CST 的复核继续只作为当前机器旧/非生产运行态证据：03:30-07:00 CST 仍新增 `78` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；最近四小时普通 scheduler 仍有 `5` 条 `completed + sent + delivered=1`，assistant final 污染扫描未见用户可见 `reasoning_content` / `Param Incorrect` 外泄；当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程，本轮不重新打开。
+- 2026-05-18 23:03 CST 的最新复核继续只作为当前机器旧/非生产运行态证据：19:30-23:00 CST 仍新增 `81` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程，本轮不重新打开。
+- 2026-05-18 19:03 CST 的最新复核继续只作为当前机器旧/非生产运行态证据：15:30-19:00 CST 仍新增 `80` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程，本轮不重新打开。
+- 2026-05-18 15:02 CST 的复核继续只作为当前机器旧/非生产运行态证据：11:30-15:00 CST 仍新增 `81` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程，本轮不重新打开。
+- 2026-05-18 03:03 CST 的最新复核继续只作为当前机器旧/非生产运行态证据：23:30-03:00 CST 仍新增 `82` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；当前机器没有可确认已重启到 2026-05-15 04:05 CST 当前 HEAD 修复后的 live 进程，本轮不重新打开。
+- 2026-05-17 23:04 CST 的复核继续只作为当前机器旧/非生产运行态证据：19:30-23:00 CST 仍新增 `81` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；live 主进程与 Feishu 进程仍早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核，本轮不重新打开。
+- 2026-05-17 15:02 CST 的最新复核继续只作为当前机器旧/非生产运行态证据：11:30-15:01 CST 仍新增 `82` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；live Feishu 进程仍早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核，本轮不重新打开。
+- 2026-05-17 11:03 CST 的复核继续只作为当前机器旧/非生产运行态证据：07:30-11:00 CST 仍新增 `81` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；live 主进程仍早于 2026-05-15 04:05 CST 的当前 HEAD 修复复核，本轮不重新打开。
 - 2026-05-13 23:04 CST 的最新复核显示，本单在 10:22 CST 重启后一度恢复，但 21:02-23:00 CST 又连续复发；因此关闭结论不再成立。
 - 2026-05-14 03:03 CST 的最新复核显示，复发继续扩大到 23:30-03:00 CST，新增 82 条同类 heartbeat 失败；普通 scheduler 同窗仍可送达。
 - 2026-05-14 07:06 CST 的最新复核显示，03:00-07:00 CST 又新增 `90` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；普通 scheduler 与 Feishu direct 同窗仍可送达。
@@ -108,6 +190,7 @@
 - 2026-05-15 07:02 CST 的最新复核仅作为当前机器旧/非生产运行态证据：03:00-07:00 CST 仍新增 `90` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；但 04:05 CST 已按当前 HEAD 回归验证确认修复成立，本轮不重新打开。
 - 2026-05-16 03:04 CST 的最新复核继续只作为当前机器旧/非生产运行态证据：23:30-03:00 CST 仍新增 `81` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；live 主进程仍早于 04:05 CST 修复复核，不重新打开。
 - 2026-05-16 07:02 CST 的最新复核继续只作为当前机器旧/非生产运行态证据：03:30-07:00 CST 仍新增 `81` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；本轮不重新打开。
+- 2026-05-16 11:03 CST 的最新复核继续只作为当前机器旧/非生产运行态证据：07:30-11:00 CST 仍新增 `79` 条 heartbeat 因同一 `mimo-v2.5-pro` 上游 `HTTP 400 Param Incorrect` 失败，覆盖 11 个 job；live 主进程仍早于当前 HEAD 修复复核，本轮不重新打开。
 - 失败已被正确记为 `provider_http_error`，没有被伪装成 noop；但业务效果仍是本轮监控漏发。
 - 同窗普通 scheduler 仍可送达，故障集中在 heartbeat provider 参数 / 模型兼容路径。
 

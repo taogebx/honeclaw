@@ -4,8 +4,9 @@
 //!
 //! 设计:**保守 dedup,只合明显同一具体事件**(同 actor + 同行动 + 几天内)。
 //! 主题相同但事件独立(如 SpaceX $57M 合同 vs Pentagon $2.3B Maven AI 都是国防
-//! 太空)绝对不合。POC 验证:`x-ai/grok-4.1-fast` 二阶段 induce-then-assign 在
-//! 04-22 → 04-25 四天 + 04-21 高量 236 条上稳定保守(详见 docs 或 commit msg)。
+//! 太空)绝对不合。原 grok 4.1 fast POC 的二阶段 induce-then-assign 在 04-22 →
+//! 04-25 四天 + 04-21 高量 236 条上稳定保守;当前配置使用 OpenRouter 可用的
+//! grok 4.3 替代。模型质量需用真实新闻样本定期复核。
 //!
 //! 失败降级:LLM 调用失败 / JSON 解析失败 → 透传原候选,scheduler 不会因为
 //! dedup 挂掉断了整次推送。
@@ -87,7 +88,7 @@ impl EventDeduper for PassThroughDeduper {
     }
 }
 
-/// 走 OpenRouter / OpenAI 兼容 LLM 的实现。生产配 `x-ai/grok-4.1-fast`。
+/// 走 OpenRouter / OpenAI 兼容 LLM 的实现。生产默认配 `x-ai/grok-4.3`。
 pub struct LlmEventDeduper {
     provider: Arc<dyn LlmProvider>,
     model: String,
@@ -217,42 +218,42 @@ impl EventDeduper for LlmEventDeduper {
         }
 
         // 选每簇代表 + 出 audit
-        let mut reps: Vec<GlobalDigestCandidate> = Vec::with_capacity(clusters.len());
-        let mut audits: Vec<ClusterAudit> = Vec::with_capacity(clusters.len());
-        let mut multi_count = 0;
+        let mut representatives: Vec<GlobalDigestCandidate> = Vec::with_capacity(clusters.len());
+        let mut cluster_audits: Vec<ClusterAudit> = Vec::with_capacity(clusters.len());
+        let mut multi_cluster_count = 0;
         // 按原 idx 排序保证输出顺序稳定
         let mut sorted_clusters = clusters;
         sorted_clusters.sort_by_key(|(_, items)| *items.iter().min().unwrap_or(&0));
         for (id, items) in sorted_clusters {
-            let rep_local_idx = pick_representative_idx(&candidates, &items);
-            let representative = candidates[rep_local_idx].clone();
+            let representative_index = pick_representative_idx(&candidates, &items);
+            let representative = candidates[representative_index].clone();
             let kept_event_id = representative.event.id.clone();
-            let merged: Vec<String> = items
+            let merged_event_ids: Vec<String> = items
                 .iter()
-                .filter(|i| **i != rep_local_idx)
+                .filter(|candidate_index| **candidate_index != representative_index)
                 .map(|i| candidates[*i].event.id.clone())
                 .collect();
             if items.len() > 1 {
-                multi_count += 1;
+                multi_cluster_count += 1;
             }
-            audits.push(ClusterAudit {
+            cluster_audits.push(ClusterAudit {
                 id,
                 kept_event_id,
-                merged_event_ids: merged,
+                merged_event_ids,
             });
-            reps.push(representative);
+            representatives.push(representative);
         }
 
         (
-            reps,
+            representatives,
             DedupeStats {
                 input: input_n,
-                clusters: audits.len(),
-                multi_clusters: multi_count,
+                clusters: cluster_audits.len(),
+                multi_clusters: multi_cluster_count,
                 silent_drops_recovered: silent_drops,
                 fell_back_to_pass_through: false,
             },
-            audits,
+            cluster_audits,
         )
     }
 }
@@ -323,8 +324,8 @@ fn strip_fence(raw_content: &str) -> String {
     trimmed_content.to_string()
 }
 
-fn truncate(s: &str, max_chars: usize) -> String {
-    s.chars().take(max_chars).collect()
+fn truncate(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
 }
 
 #[cfg(test)]
@@ -338,7 +339,12 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn ev(id: &str, title: &str, summary: &str, occurred_offset_secs: i64) -> MarketEvent {
+    fn market_event_fixture(
+        id: &str,
+        title: &str,
+        summary: &str,
+        occurred_offset_secs: i64,
+    ) -> MarketEvent {
         MarketEvent {
             id: id.into(),
             kind: EventKind::NewsCritical,
@@ -355,7 +361,7 @@ mod tests {
         }
     }
 
-    fn cand(
+    fn digest_candidate_fixture(
         id: &str,
         title: &str,
         summary: &str,
@@ -363,7 +369,7 @@ mod tests {
         occurred_offset_secs: i64,
     ) -> GlobalDigestCandidate {
         GlobalDigestCandidate {
-            event: ev(id, title, summary, occurred_offset_secs),
+            event: market_event_fixture(id, title, summary, occurred_offset_secs),
             source_class,
             fmp_text: summary.into(),
             site: "x".into(),
@@ -442,53 +448,53 @@ mod tests {
             last_prompt: Mutex::new(None),
         });
         let dedup = LlmEventDeduper::new(provider.clone(), "test-model");
-        let (out, stats, audits) = dedup.dedupe(vec![]).await;
-        assert!(out.is_empty());
+        let (deduped_candidates, stats, cluster_audits) = dedup.dedupe(vec![]).await;
+        assert!(deduped_candidates.is_empty());
         assert_eq!(stats.input, 0);
-        assert!(audits.is_empty());
+        assert!(cluster_audits.is_empty());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0, "空输入不应调 LLM");
     }
 
     #[tokio::test]
     async fn typical_three_clusters_with_kept_singleton() {
         // 输入: 3 条 hormuz + 2 条 microsoft buyout + 1 条 NASA 单独
-        let input = vec![
-            cand(
+        let candidates = vec![
+            digest_candidate_fixture(
                 "a1",
                 "Trump Hormuz Blockade Crisis",
                 "long summary about blockade",
                 NewsSourceClass::Trusted,
                 0,
             ),
-            cand(
+            digest_candidate_fixture(
                 "a2",
                 "Strait of Hormuz Empty",
                 "shorter",
                 NewsSourceClass::Trusted,
                 100,
             ),
-            cand(
+            digest_candidate_fixture(
                 "a3",
                 "Hormuz Oil Shock",
                 "the longest summary about oil shock and demand collapse details",
                 NewsSourceClass::Trusted,
                 50,
             ),
-            cand(
+            digest_candidate_fixture(
                 "b1",
                 "Microsoft Buyouts 7%",
                 "buyout details",
                 NewsSourceClass::Trusted,
                 200,
             ),
-            cand(
+            digest_candidate_fixture(
                 "b2",
                 "Microsoft voluntary employee buyout",
                 "more details about MS layoffs and offers",
                 NewsSourceClass::Trusted,
                 250,
             ),
-            cand(
+            digest_candidate_fixture(
                 "c1",
                 "NASA reserves Mars payload",
                 "single nasa story",
@@ -496,18 +502,18 @@ mod tests {
                 300,
             ),
         ];
-        let response = r#"{"clusters":[
+        let cluster_response_json = r#"{"clusters":[
             {"id":"hormuz-crisis","items":[0,1,2]},
             {"id":"microsoft-buyout","items":[3,4]},
             {"id":"nasa-mars","items":[5]}
         ]}"#;
         let provider = Arc::new(FixedResponseProvider {
-            response: response.into(),
+            response: cluster_response_json.into(),
             calls: AtomicUsize::new(0),
             last_prompt: Mutex::new(None),
         });
         let dedup = LlmEventDeduper::new(provider.clone(), "test-model");
-        let (out, stats, audits) = dedup.dedupe(input).await;
+        let (deduped_candidates, stats, cluster_audits) = dedup.dedupe(candidates).await;
 
         assert_eq!(stats.input, 6);
         assert_eq!(stats.clusters, 3);
@@ -516,16 +522,22 @@ mod tests {
         assert!(!stats.fell_back_to_pass_through);
 
         // 每簇代表:hormuz 应选 a3(summary 最长),microsoft 应选 b2,nasa 选 c1
-        let kept_ids: Vec<&str> = out.iter().map(|c| c.event.id.as_str()).collect();
+        let kept_ids: Vec<&str> = deduped_candidates
+            .iter()
+            .map(|candidate| candidate.event.id.as_str())
+            .collect();
         assert!(
             kept_ids.contains(&"a3"),
             "hormuz 簇代表应是 a3(最长 summary),实际 {kept_ids:?}"
         );
         assert!(kept_ids.contains(&"b2"), "microsoft 簇代表应是 b2");
         assert!(kept_ids.contains(&"c1"));
-        assert_eq!(out.len(), 3);
+        assert_eq!(deduped_candidates.len(), 3);
 
-        let hormuz_audit = audits.iter().find(|a| a.id == "hormuz-crisis").unwrap();
+        let hormuz_audit = cluster_audits
+            .iter()
+            .find(|audit| audit.id == "hormuz-crisis")
+            .unwrap();
         assert_eq!(hormuz_audit.kept_event_id, "a3");
         assert_eq!(hormuz_audit.merged_event_ids.len(), 2);
     }
@@ -533,10 +545,10 @@ mod tests {
     #[tokio::test]
     async fn silent_dropped_idx_recovered_as_singleton() {
         // grok 输出只覆盖 0 和 1,故意漏掉 2
-        let input = vec![
-            cand("a", "first", "x", NewsSourceClass::Trusted, 0),
-            cand("b", "second", "y", NewsSourceClass::Trusted, 100),
-            cand(
+        let candidates = vec![
+            digest_candidate_fixture("a", "first", "x", NewsSourceClass::Trusted, 0),
+            digest_candidate_fixture("b", "second", "y", NewsSourceClass::Trusted, 100),
+            digest_candidate_fixture(
                 "c",
                 "third dropped silently",
                 "z",
@@ -544,28 +556,35 @@ mod tests {
                 200,
             ),
         ];
-        let response = r#"{"clusters":[{"id":"only-cluster","items":[0,1]}]}"#;
+        let cluster_response_json = r#"{"clusters":[{"id":"only-cluster","items":[0,1]}]}"#;
         let provider = Arc::new(FixedResponseProvider {
-            response: response.into(),
+            response: cluster_response_json.into(),
             calls: AtomicUsize::new(0),
             last_prompt: Mutex::new(None),
         });
         let dedup = LlmEventDeduper::new(provider, "test-model");
-        let (out, stats, audits) = dedup.dedupe(input).await;
+        let (deduped_candidates, stats, cluster_audits) = dedup.dedupe(candidates).await;
 
         assert_eq!(stats.input, 3);
         assert_eq!(stats.silent_drops_recovered, 1);
-        assert_eq!(out.len(), 2, "只有 2 簇:[a,b] 一簇 + c 救回的 singleton");
+        assert_eq!(
+            deduped_candidates.len(),
+            2,
+            "只有 2 簇:[a,b] 一簇 + c 救回的 singleton"
+        );
         // c 必须出现在输出里(救回)
-        let kept_ids: Vec<&str> = out.iter().map(|c| c.event.id.as_str()).collect();
+        let kept_ids: Vec<&str> = deduped_candidates
+            .iter()
+            .map(|candidate| candidate.event.id.as_str())
+            .collect();
         assert!(
             kept_ids.contains(&"c"),
             "c 应被救回 singleton,实际 {kept_ids:?}"
         );
 
-        let recovered = audits
+        let recovered = cluster_audits
             .iter()
-            .find(|a| a.id.starts_with("recovered-singleton-"))
+            .find(|audit| audit.id.starts_with("recovered-singleton-"))
             .expect("应有 recovered-singleton 审计");
         assert_eq!(recovered.kept_event_id, "c");
     }
@@ -573,96 +592,109 @@ mod tests {
     #[tokio::test]
     async fn duplicate_idx_in_multiple_clusters_only_first_wins() {
         // grok 把 idx 0 同时塞进两个簇 —— 第一个簇赢,第二个去掉 0
-        let input = vec![
-            cand("a", "first", "x", NewsSourceClass::Trusted, 0),
-            cand("b", "second", "y", NewsSourceClass::Trusted, 100),
+        let candidates = vec![
+            digest_candidate_fixture("a", "first", "x", NewsSourceClass::Trusted, 0),
+            digest_candidate_fixture("b", "second", "y", NewsSourceClass::Trusted, 100),
         ];
-        let response = r#"{"clusters":[{"id":"first","items":[0,1]},{"id":"second","items":[0]}]}"#;
+        let cluster_response_json =
+            r#"{"clusters":[{"id":"first","items":[0,1]},{"id":"second","items":[0]}]}"#;
         let provider = Arc::new(FixedResponseProvider {
-            response: response.into(),
+            response: cluster_response_json.into(),
             calls: AtomicUsize::new(0),
             last_prompt: Mutex::new(None),
         });
         let dedup = LlmEventDeduper::new(provider, "test-model");
-        let (out, stats, _audits) = dedup.dedupe(input).await;
+        let (deduped_candidates, stats, _cluster_audits) = dedup.dedupe(candidates).await;
         // 第二个簇应空被丢弃,不留 ghost cluster
         assert_eq!(stats.clusters, 1);
-        assert_eq!(out.len(), 1);
+        assert_eq!(deduped_candidates.len(), 1);
     }
 
     #[tokio::test]
     async fn invalid_idx_skipped_not_panic() {
-        let input = vec![cand("a", "only", "x", NewsSourceClass::Trusted, 0)];
-        let response = r#"{"clusters":[{"id":"bad","items":[0,99,42]}]}"#;
+        let candidates = vec![digest_candidate_fixture(
+            "a",
+            "only",
+            "x",
+            NewsSourceClass::Trusted,
+            0,
+        )];
+        let cluster_response_json = r#"{"clusters":[{"id":"bad","items":[0,99,42]}]}"#;
         let provider = Arc::new(FixedResponseProvider {
-            response: response.into(),
+            response: cluster_response_json.into(),
             calls: AtomicUsize::new(0),
             last_prompt: Mutex::new(None),
         });
         let dedup = LlmEventDeduper::new(provider, "test-model");
-        let (out, stats, _) = dedup.dedupe(input).await;
+        let (deduped_candidates, stats, _) = dedup.dedupe(candidates).await;
         assert_eq!(stats.clusters, 1);
-        assert_eq!(out.len(), 1);
+        assert_eq!(deduped_candidates.len(), 1);
     }
 
     #[tokio::test]
     async fn llm_failure_falls_back_to_pass_through() {
-        let input = vec![
-            cand("a", "x", "y", NewsSourceClass::Trusted, 0),
-            cand("b", "z", "w", NewsSourceClass::Trusted, 100),
+        let candidates = vec![
+            digest_candidate_fixture("a", "x", "y", NewsSourceClass::Trusted, 0),
+            digest_candidate_fixture("b", "z", "w", NewsSourceClass::Trusted, 100),
         ];
         let provider = Arc::new(FailingProvider);
         let dedup = LlmEventDeduper::new(provider, "test-model");
-        let (out, stats, audits) = dedup.dedupe(input).await;
-        assert_eq!(out.len(), 2, "降级应原样输出全部候选");
+        let (deduped_candidates, stats, cluster_audits) = dedup.dedupe(candidates).await;
+        assert_eq!(deduped_candidates.len(), 2, "降级应原样输出全部候选");
         assert!(stats.fell_back_to_pass_through);
-        assert!(audits.is_empty());
+        assert!(cluster_audits.is_empty());
     }
 
     #[tokio::test]
     async fn malformed_json_falls_back_to_pass_through() {
-        let input = vec![cand("a", "x", "y", NewsSourceClass::Trusted, 0)];
+        let candidates = vec![digest_candidate_fixture(
+            "a",
+            "x",
+            "y",
+            NewsSourceClass::Trusted,
+            0,
+        )];
         let provider = Arc::new(FixedResponseProvider {
             response: "this is not json at all".into(),
             calls: AtomicUsize::new(0),
             last_prompt: Mutex::new(None),
         });
         let dedup = LlmEventDeduper::new(provider, "test-model");
-        let (out, stats, _) = dedup.dedupe(input).await;
-        assert_eq!(out.len(), 1);
+        let (deduped_candidates, stats, _) = dedup.dedupe(candidates).await;
+        assert_eq!(deduped_candidates.len(), 1);
         assert!(stats.fell_back_to_pass_through);
     }
 
     #[tokio::test]
     async fn markdown_fence_response_parsed() {
-        let input = vec![
-            cand("a", "x", "y", NewsSourceClass::Trusted, 0),
-            cand("b", "z", "w", NewsSourceClass::Trusted, 100),
+        let candidates = vec![
+            digest_candidate_fixture("a", "x", "y", NewsSourceClass::Trusted, 0),
+            digest_candidate_fixture("b", "z", "w", NewsSourceClass::Trusted, 100),
         ];
-        let response = "```json\n{\"clusters\":[{\"id\":\"c\",\"items\":[0,1]}]}\n```";
+        let cluster_response_json = "```json\n{\"clusters\":[{\"id\":\"c\",\"items\":[0,1]}]}\n```";
         let provider = Arc::new(FixedResponseProvider {
-            response: response.into(),
+            response: cluster_response_json.into(),
             calls: AtomicUsize::new(0),
             last_prompt: Mutex::new(None),
         });
         let dedup = LlmEventDeduper::new(provider, "test-model");
-        let (out, stats, _) = dedup.dedupe(input).await;
-        assert_eq!(out.len(), 1);
+        let (deduped_candidates, stats, _) = dedup.dedupe(candidates).await;
+        assert_eq!(deduped_candidates.len(), 1);
         assert!(!stats.fell_back_to_pass_through);
     }
 
     #[tokio::test]
     async fn trusted_source_preferred_over_uncertain_in_representative() {
         // 同簇里一条 trusted、一条 uncertain → trusted 当代表
-        let input = vec![
-            cand(
+        let candidates = vec![
+            digest_candidate_fixture(
                 "u1",
                 "uncertain blog post about hormuz",
                 "longer summary uncertain blog version",
                 NewsSourceClass::Uncertain,
                 0,
             ),
-            cand(
+            digest_candidate_fixture(
                 "t1",
                 "trusted reuters about hormuz",
                 "shorter trusted",
@@ -670,34 +702,34 @@ mod tests {
                 100,
             ),
         ];
-        let response = r#"{"clusters":[{"id":"hormuz","items":[0,1]}]}"#;
+        let cluster_response_json = r#"{"clusters":[{"id":"hormuz","items":[0,1]}]}"#;
         let provider = Arc::new(FixedResponseProvider {
-            response: response.into(),
+            response: cluster_response_json.into(),
             calls: AtomicUsize::new(0),
             last_prompt: Mutex::new(None),
         });
         let dedup = LlmEventDeduper::new(provider, "test-model");
-        let (out, _, _) = dedup.dedupe(input).await;
-        assert_eq!(out.len(), 1);
+        let (deduped_candidates, _, _) = dedup.dedupe(candidates).await;
+        assert_eq!(deduped_candidates.len(), 1);
         assert_eq!(
-            out[0].event.id, "t1",
+            deduped_candidates[0].event.id, "t1",
             "trusted 应优先于 uncertain 即使 summary 更短"
         );
     }
 
     #[tokio::test]
     async fn pass_through_deduper_keeps_everything() {
-        let input = vec![
-            cand("a", "x", "y", NewsSourceClass::Trusted, 0),
-            cand("b", "z", "w", NewsSourceClass::Trusted, 100),
+        let candidates = vec![
+            digest_candidate_fixture("a", "x", "y", NewsSourceClass::Trusted, 0),
+            digest_candidate_fixture("b", "z", "w", NewsSourceClass::Trusted, 100),
         ];
         let dedup = PassThroughDeduper;
-        let (out, stats, audits) = dedup.dedupe(input).await;
-        assert_eq!(out.len(), 2);
+        let (deduped_candidates, stats, cluster_audits) = dedup.dedupe(candidates).await;
+        assert_eq!(deduped_candidates.len(), 2);
         assert_eq!(stats.input, 2);
         assert_eq!(stats.clusters, 2);
         assert_eq!(stats.multi_clusters, 0);
-        assert!(audits.is_empty());
+        assert!(cluster_audits.is_empty());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 // locale switcher, common buttons, status pills, toast verbs, and other
 // chrome-level strings. Per-page strings live in sibling files
 // (admin-content/<page>.ts). Both ZH and EN trees MUST share the exact same
-// shape — `structure.test.ts` enforces parity at build time.
+// shape — `structure.test.ts` enforces parity in the web test suite.
 
 import { makeContentProxy } from "../i18n"
 
@@ -117,6 +117,16 @@ const ZH = {
     all: "全部",
   },
 
+  entity_ref: {
+    actor: "用户",
+    session: "会话",
+    task: "任务",
+    symbol: "标的",
+    research: "研究",
+    skill: "技能",
+    goto_title: "跳转到{kind}：{label}",
+  },
+
   toast: {
     save_failed: "保存失败",
     delete_failed: "删除失败",
@@ -129,7 +139,8 @@ const ZH = {
 
   layout: {
     not_connected_title: "尚未连接到 Hone 后端",
-    not_connected_hint: "请在「设置 → 后端连接」中检查 baseUrl / token 后重试。",
+    not_connected_prefix: "后端未连接：",
+    not_connected_hint: "请在设置页检查后端连接后重试。",
   },
 
   units: {
@@ -264,6 +275,16 @@ const EN: typeof ZH = {
     all: "All",
   },
 
+  entity_ref: {
+    actor: "User",
+    session: "Session",
+    task: "Task",
+    symbol: "Symbol",
+    research: "Research",
+    skill: "Skill",
+    goto_title: "Go to {kind}: {label}",
+  },
+
   toast: {
     save_failed: "Save failed",
     delete_failed: "Delete failed",
@@ -276,8 +297,9 @@ const EN: typeof ZH = {
 
   layout: {
     not_connected_title: "Not connected to the Hone backend",
+    not_connected_prefix: "Backend disconnected: ",
     not_connected_hint:
-      "Check baseUrl / token under Settings → Backend Connection and retry.",
+      "Check the backend connection on the Settings page and retry.",
   },
 
   units: {

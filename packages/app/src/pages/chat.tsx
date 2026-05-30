@@ -16,10 +16,7 @@ import {
 import { createStore, reconcile } from "solid-js/store";
 import { useNavigate } from "@solidjs/router";
 import { PublicLoginForm } from "@/components/public-login-form";
-import {
-  PublicContactCards,
-  PublicContactMenu,
-} from "@/components/public-contact-menu";
+import { PublicNav } from "@/components/public-nav";
 import { ChatShareModal } from "@/components/chat-share-modal";
 import { displayGithubStars, fetchGithubStars } from "@/lib/github-stars";
 import { CONTENT } from "@/lib/public-content";
@@ -104,7 +101,9 @@ const ICONS = {
 };
 
 const PUBLIC_IMAGE_ENDPOINT = "/api/public/image";
+const PUBLIC_FILE_ENDPOINT = "/api/public/file";
 const HISTORY_PAGE_SIZE = 24;
+const SIDEBAR_HISTORY_LIMIT = 6;
 
 function AnimatedBackground() {
   return (
@@ -315,80 +314,26 @@ function AccountButton(props: {
   );
 }
 
-function Header(props: {
-  user?: PublicAuthUserInfo | null;
-  onLogout?: () => void;
-}) {
-  const navigate = useNavigate();
-  const [stars] = createResource(fetchGithubStars);
-
-  return (
-    <header class="page-header">
-      <div class="public-chat-header-brand">
-        <div onClick={() => navigate("/")} class="header-logo">
-          <img src="/logo.svg" alt="Hone" />
-          <span>Hone</span>
-        </div>
-        <AccountButton user={props.user} onLogout={props.onLogout} />
-      </div>
-
-      <div class="header-actions">
-        <div class="header-socials header-github-stars">
-          <a
-            href="https://github.com/B-M-Capital-Research/honeclaw"
-            target="_blank"
-            class="star-badge"
-          >
-            <ICONS.Github />
-            <span>{displayGithubStars(stars())}</span>
-          </a>
-        </div>
-
-        <div class="divider-v mobile-hide" />
-
-        <PublicContactMenu />
-
-        <div class="lang-switch">
-          <button
-            onClick={() => setLocale("zh")}
-            class={useLocale() === "zh" ? "active" : ""}
-          >
-            中
-          </button>
-          <button
-            onClick={() => setLocale("en")}
-            class={useLocale() === "en" ? "active" : ""}
-          >
-            EN
-          </button>
-        </div>
-
-        <PrefsButton />
-
-        <div style={{ display: "flex", gap: "10px" }}>
-          <button
-            onClick={() => navigate("/roadmap")}
-            class="btn-roadmap-nav mobile-hide"
-          >
-            {CONTENT.home_page.roadmap_button}
-          </button>
-          {/* The 对话 pill is the page we're already on, so hide it here
-              to free header room for the prefs trigger and stop the dead
-              click. The roadmap link (mobile-hidden too) covers desktop. */}
-        </div>
-      </div>
-    </header>
-  );
-}
-
 function ChatSidebar(props: {
   user: PublicAuthUserInfo;
   collapsed: boolean;
+  recentMessages: ChatMessage[];
   onToggle: () => void;
+  onSelectMessage: (id: string) => void;
   onLogout: () => void;
 }) {
   const navigate = useNavigate();
   const [stars] = createResource(fetchGithubStars);
+  const messagePreview = (message: ChatMessage) => {
+    const text = stripAttachmentMarkers(message.content)
+      .replace(/\s+/g, " ")
+      .trim();
+    if (text) return text.length > 44 ? `${text.slice(0, 44)}...` : text;
+    if ((message.attachments?.length ?? 0) > 0) {
+      return CONTENT.chat_page.sidebar.history_attachment;
+    }
+    return CONTENT.chat_page.sidebar.history_empty_item;
+  };
 
   return (
     <aside
@@ -450,14 +395,6 @@ function ChatSidebar(props: {
           <span class="public-chat-sidebar-icon">R</span>
           <span>{CONTENT.nav.roadmap}</span>
         </button>
-        <button
-          type="button"
-          onClick={() => navigate("/me")}
-          title={CONTENT.nav.me}
-        >
-          <span class="public-chat-sidebar-icon">A</span>
-          <span>{CONTENT.nav.me}</span>
-        </button>
       </nav>
 
       <div class="public-chat-sidebar-socials">
@@ -473,21 +410,53 @@ function ChatSidebar(props: {
         </a>
       </div>
 
-      <div class="public-chat-sidebar-contact">
+      <section class="public-chat-sidebar-history">
         <div class="public-chat-sidebar-section-title">
-          {CONTENT.nav.contact_title}
+          {CONTENT.chat_page.sidebar.history_title}
         </div>
-        <PublicContactCards />
-      </div>
+        <Show
+          when={props.recentMessages.length > 0}
+          fallback={
+            <div class="public-chat-sidebar-history-empty">
+              {CONTENT.chat_page.sidebar.history_empty}
+            </div>
+          }
+        >
+          <div class="public-chat-sidebar-history-list">
+            <For each={props.recentMessages}>
+              {(message, index) => (
+                <button
+                  type="button"
+                  class="public-chat-sidebar-history-item"
+                  onClick={() => props.onSelectMessage(message.id)}
+                  title={messagePreview(message)}
+                >
+                  <span class="public-chat-sidebar-history-index">
+                    {index() + 1}
+                  </span>
+                  <span class="public-chat-sidebar-history-text">
+                    {messagePreview(message)}
+                  </span>
+                </button>
+              )}
+            </For>
+          </div>
+        </Show>
+      </section>
 
       <div class="public-chat-sidebar-footer">
-        <div class="public-chat-sidebar-user" title={props.user.user_id}>
+        <button
+          type="button"
+          class="public-chat-sidebar-user"
+          title={props.user.user_id}
+          onClick={() => navigate("/me")}
+        >
           <span class="public-chat-sidebar-avatar">H</span>
           <span>
             <strong>{CONTENT.chat_page.sidebar.signed_in}</strong>
             <small>{CONTENT.chat_page.sidebar.account_center}</small>
           </span>
-        </div>
+        </button>
         <div class="public-chat-sidebar-footer-actions">
           <button
             type="button"
@@ -499,7 +468,6 @@ function ChatSidebar(props: {
           >
             {useLocale() === "zh" ? "中" : "EN"}
           </button>
-          <PrefsButton />
           <button
             type="button"
             class="public-chat-sidebar-logout"
@@ -518,6 +486,12 @@ function publicAttachmentUrl(att: PublicChatAttachment): string {
   if (att.previewUrl) return att.previewUrl;
   return buildApiUrl(
     `${PUBLIC_IMAGE_ENDPOINT}?path=${encodeURIComponent(att.path)}`,
+  );
+}
+
+function publicAttachmentDownloadUrl(att: PublicChatAttachment): string {
+  return buildApiUrl(
+    `${PUBLIC_FILE_ENDPOINT}?path=${encodeURIComponent(att.path)}`,
   );
 }
 
@@ -817,7 +791,7 @@ function FileCard(props: {
     props.inUserBubble ? "rgba(255,255,255,0.95)" : "#0f172a";
   const subColor = () =>
     props.inUserBubble ? "rgba(255,255,255,0.7)" : "#64748b";
-  return (
+  const card = (
     <div
       style={{
         display: "flex",
@@ -878,6 +852,22 @@ function FileCard(props: {
         </Show>
       </div>
     </div>
+  );
+  if (props.file.kind === "image") return card;
+  return (
+    <a
+      href={publicAttachmentDownloadUrl(props.file)}
+      download={props.file.name}
+      target="_blank"
+      rel="noreferrer"
+      style={{
+        display: "block",
+        color: "inherit",
+        "text-decoration": "none",
+      }}
+    >
+      {card}
+    </a>
   );
 }
 
@@ -1185,7 +1175,7 @@ function PendingBubble(props: {
       >
         {/* The header status row only shows in error state — for the
             normal thinking/streaming flow the composer-side status strip
-            is the single source of truth (avoids duplicate "HONE 思考中"). */}
+            is the single source of truth (avoids duplicate "Hone 思考中"). */}
         <Show when={terminal()}>
           <div
             style={{
@@ -1598,6 +1588,31 @@ function ComposerStatus(props: {
 
 function ProactiveModeTips() {
   const [open, setOpen] = createSignal(false);
+  const [copiedExample, setCopiedExample] = createSignal<number | null>(null);
+  let copiedTimer: number | undefined;
+
+  const copyText = async (text: string) => {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.left = "-9999px";
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand("copy");
+    textarea.remove();
+  };
+
+  const copyExample = async (text: string, index: number) => {
+    await copyText(text);
+    setCopiedExample(index);
+    if (copiedTimer) window.clearTimeout(copiedTimer);
+    copiedTimer = window.setTimeout(() => setCopiedExample(null), 1200);
+  };
 
   createEffect(() => {
     if (!open()) return;
@@ -1606,6 +1621,10 @@ function ProactiveModeTips() {
     };
     document.addEventListener("keydown", onKey);
     onCleanup(() => document.removeEventListener("keydown", onKey));
+  });
+
+  onCleanup(() => {
+    if (copiedTimer) window.clearTimeout(copiedTimer);
   });
 
   return (
@@ -1693,7 +1712,63 @@ function ProactiveModeTips() {
             <div class="public-chat-proactive-examples">
               <div>{CONTENT.chat_page.composer.proactive_examples_title}</div>
               <For each={CONTENT.chat_page.composer.proactive_examples}>
-                {(example) => <span>{example}</span>}
+                {(example, index) => (
+                  <span class="public-chat-proactive-example-row">
+                    <button
+                      type="button"
+                      class="public-chat-proactive-copy"
+                      aria-label={CONTENT.chat_page.actions.copy_aria}
+                      title={
+                        copiedExample() === index()
+                          ? CONTENT.chat_page.actions.copied
+                          : CONTENT.chat_page.actions.copy_aria
+                      }
+                      onClick={() => void copyExample(example, index())}
+                    >
+                      <Show
+                        when={copiedExample() === index()}
+                        fallback={
+                          <svg
+                            width="13"
+                            height="13"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            aria-hidden="true"
+                          >
+                            <rect
+                              x="9"
+                              y="9"
+                              width="13"
+                              height="13"
+                              rx="2"
+                              ry="2"
+                            />
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                          </svg>
+                        }
+                      >
+                        <svg
+                          width="13"
+                          height="13"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2.2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          aria-hidden="true"
+                        >
+                          <path d="M20 6 9 17l-5-5" />
+                        </svg>
+                      </Show>
+                    </button>
+                    <span>{example}</span>
+                  </span>
+                )}
               </For>
             </div>
             <button
@@ -2028,6 +2103,19 @@ export default function PublicChatPage() {
       lastScrollTop = scrollRef.scrollTop;
     });
   };
+  const scrollToMessage = (id: string) => {
+    const index = messages.findIndex((message) => message.id === id);
+    if (index < 0) return;
+    const neededVisibleCount = messages.length - index;
+    setVisibleMessageCount((current) =>
+      Math.max(current, neededVisibleCount, HISTORY_PAGE_SIZE),
+    );
+    requestAnimationFrame(() => {
+      document
+        .getElementById(`public-chat-message-${id}`)
+        ?.scrollIntoView({ block: "center", behavior: "smooth" });
+    });
+  };
   const pinToBottom = (durationMs = 900) => {
     stickToBottom = true;
     const until = Date.now() + durationMs;
@@ -2049,6 +2137,12 @@ export default function PublicChatPage() {
       : 0;
   const visibleMessages = createMemo(() =>
     selectVisibleRecentMessages(messages, visibleMessageCount()),
+  );
+  const sidebarHistoryMessages = createMemo(() =>
+    messages
+      .filter((message) => message.role === "user")
+      .slice(-SIDEBAR_HISTORY_LIMIT)
+      .reverse(),
   );
   const hasOlderMessages = () => visibleMessageCount() < messages.length;
   const isSendingOrStreaming = () =>
@@ -2324,11 +2418,13 @@ export default function PublicChatPage() {
   });
 
   // Flash "本轮已完成" when a background-pending run resolves.
-  let bgPrev = false;
+  let hadBackgroundPending = false;
   createEffect(() => {
-    const cur = !!backgroundPending();
-    if (bgPrev && !cur && !isSending()) flashJustFinished();
-    bgPrev = cur;
+    const hasBackgroundPending = !!backgroundPending();
+    if (hadBackgroundPending && !hasBackgroundPending && !isSending()) {
+      flashJustFinished();
+    }
+    hadBackgroundPending = hasBackgroundPending;
   });
 
   onMount(() => {
@@ -2466,7 +2562,14 @@ export default function PublicChatPage() {
       style={{ height: "100dvh", display: "flex", "flex-direction": "column" }}
     >
       <AnimatedBackground />
-      <Header user={currentUser()} onLogout={logoutPublicChat} />
+      <PublicNav
+        extraActions={
+          <>
+            <PrefsButton />
+            <AccountButton user={currentUser()} onLogout={logoutPublicChat} />
+          </>
+        }
+      />
 
       <Switch>
         <Match when={authState() === "loading"}>
@@ -2507,7 +2610,9 @@ export default function PublicChatPage() {
                 <ChatSidebar
                   user={user()}
                   collapsed={sidebarCollapsed()}
+                  recentMessages={sidebarHistoryMessages()}
                   onToggle={() => setSidebarCollapsed((value) => !value)}
+                  onSelectMessage={scrollToMessage}
                   onLogout={logoutPublicChat}
                 />
                 <div
@@ -2603,45 +2708,48 @@ export default function PublicChatPage() {
                     </Show>
                     <For each={visibleMessages()}>
                       {(msg, i) => (
-                        <Switch>
-                          <Match when={msg.role === "user"}>
-                            <UserBubble
-                              content={msg.content}
-                              attachments={msg.attachments}
-                              onOpenImage={(imgs, i) =>
-                                setLightbox({ images: imgs, index: i })
+                        <div id={`public-chat-message-${msg.id}`}>
+                          <Switch>
+                            <Match when={msg.role === "user"}>
+                              <UserBubble
+                                content={msg.content}
+                                attachments={msg.attachments}
+                                onOpenImage={(imgs, i) =>
+                                  setLightbox({ images: imgs, index: i })
+                                }
+                              />
+                            </Match>
+                            <Match
+                              when={
+                                msg.role === "assistant" && msg.phase === "done"
                               }
-                            />
-                          </Match>
-                          <Match
-                            when={
-                              msg.role === "assistant" && msg.phase === "done"
-                            }
-                          >
-                            <AssistantBubble
-                              content={msg.content}
-                              attachments={msg.attachments}
-                              isContinuation={
-                                i() > 0 &&
-                                visibleMessages()[i() - 1]?.role === "assistant"
+                            >
+                              <AssistantBubble
+                                content={msg.content}
+                                attachments={msg.attachments}
+                                isContinuation={
+                                  i() > 0 &&
+                                  visibleMessages()[i() - 1]?.role ===
+                                    "assistant"
+                                }
+                                onShare={() => openShareModal(i())}
+                              />
+                            </Match>
+                            <Match
+                              when={
+                                msg.role === "assistant" &&
+                                msg.phase !== "done" &&
+                                (msg.content || msg.phase === "error")
                               }
-                              onShare={() => openShareModal(i())}
-                            />
-                          </Match>
-                          <Match
-                            when={
-                              msg.role === "assistant" &&
-                              msg.phase !== "done" &&
-                              (msg.content || msg.phase === "error")
-                            }
-                          >
-                            <PendingBubble
-                              message={msg}
-                              onStop={() => activeController?.abort()}
-                              onDismiss={() => {}}
-                            />
-                          </Match>
-                        </Switch>
+                            >
+                              <PendingBubble
+                                message={msg}
+                                onStop={() => activeController?.abort()}
+                                onDismiss={() => {}}
+                              />
+                            </Match>
+                          </Switch>
+                        </div>
                       )}
                     </For>
                   </div>
@@ -2755,12 +2863,21 @@ export default function PublicChatPage() {
           position: relative;
         }
         .public-chat-page {
+          --font-sans: "Plus Jakarta Sans", "Inter", -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
           width: 100vw;
           height: 100dvh !important;
           max-height: 100dvh;
           overflow: hidden;
           overflow-anchor: none;
           overscroll-behavior: none;
+          font-family: var(--font-sans);
+          -webkit-font-smoothing: antialiased;
+          text-rendering: optimizeLegibility;
+        }
+        .public-chat-page button,
+        .public-chat-page textarea,
+        .public-chat-page input {
+          font-family: inherit;
         }
         .public-chat-page--logged_out,
         .public-chat-page--loading {
@@ -2785,7 +2902,7 @@ export default function PublicChatPage() {
         }
         .public-chat-account {
           position: relative;
-          display: none;
+          display: inline-flex;
         }
         .public-chat-account-trigger {
           width: 32px;
@@ -2817,6 +2934,12 @@ export default function PublicChatPage() {
           box-shadow: 0 20px 52px rgba(15,23,42,0.18);
           backdrop-filter: blur(18px);
           -webkit-backdrop-filter: blur(18px);
+        }
+        .pub-nav-extra-actions .public-chat-account-panel {
+          position: absolute;
+          top: calc(100% + 10px);
+          right: 0;
+          left: auto;
         }
         .public-chat-account-card {
           display: flex;
@@ -2904,7 +3027,7 @@ export default function PublicChatPage() {
           }
           .public-chat-page--ready .public-chat-shell {
             height: 100dvh !important;
-            padding-top: 0 !important;
+            padding-top: 56px !important;
             background: rgba(248,250,252,0.72);
           }
           .public-chat-page--ready .public-chat-session-strip {
@@ -2916,6 +3039,7 @@ export default function PublicChatPage() {
           .public-chat-sidebar {
             position: relative;
             z-index: 20;
+            padding-top: 56px;
             width: 292px;
             height: 100dvh;
             flex: 0 0 292px;
@@ -2942,31 +3066,41 @@ export default function PublicChatPage() {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            min-height: 42px;
+            min-height: 62px;
             gap: 8px;
           }
           .public-chat-sidebar-logo {
             min-width: 0;
-            border: none;
-            background: transparent;
+            min-height: 58px;
+            border: 1px solid rgba(15,23,42,0.08);
+            border-radius: 14px;
+            background: #fff;
             display: inline-flex;
             align-items: center;
-            gap: 10px;
+            gap: 12px;
             cursor: pointer;
-            padding: 4px 6px;
+            padding: 6px 10px;
             color: #0f172a;
-            font-size: 18px;
-            font-weight: 850;
+            font-size: 21px;
+            font-weight: 900;
             letter-spacing: 0;
+            box-shadow: 0 8px 22px rgba(15,23,42,0.06);
+            transition: border-color 0.18s ease, transform 0.06s ease, box-shadow 0.18s ease;
+          }
+          .public-chat-sidebar-logo:hover {
+            border-color: rgba(15,23,42,0.16);
+            box-shadow: 0 10px 26px rgba(15,23,42,0.08);
+          }
+          .public-chat-sidebar-logo:active {
+            transform: scale(0.99);
           }
           .public-chat-sidebar-logo img {
-            width: 30px;
-            height: 30px;
-            border-radius: 8px;
-            flex: 0 0 30px;
+            width: 44px;
+            height: 44px;
+            border-radius: 10px;
+            flex: 0 0 44px;
           }
           .public-chat-sidebar-toggle,
-          .public-chat-sidebar-footer-actions .hone-prefs-trigger,
           .public-chat-sidebar-lang {
             width: 36px;
             height: 36px;
@@ -2983,7 +3117,6 @@ export default function PublicChatPage() {
             transition: background 0.18s ease, border-color 0.18s ease, color 0.18s ease, transform 0.06s ease;
           }
           .public-chat-sidebar-toggle:hover,
-          .public-chat-sidebar-footer-actions .hone-prefs-trigger:hover,
           .public-chat-sidebar-lang:hover {
             color: #0f172a;
             background: #f8fafc;
@@ -3039,10 +3172,11 @@ export default function PublicChatPage() {
             font-size: 12px;
             font-weight: 850;
           }
-          .public-chat-sidebar-contact {
+          .public-chat-sidebar-history {
             min-height: 0;
             overflow: auto;
             padding: 6px 2px 0;
+            flex: 1 1 auto;
           }
           .public-chat-sidebar-section-title {
             margin: 0 6px 8px;
@@ -3052,21 +3186,65 @@ export default function PublicChatPage() {
             letter-spacing: 0.08em;
             text-transform: uppercase;
           }
-          .public-chat-sidebar-contact .pub-contact-card-grid {
-            grid-template-columns: 1fr;
+          .public-chat-sidebar-history-empty {
+            margin: 0 6px;
+            padding: 12px 10px;
+            border: 1px dashed rgba(15,23,42,0.12);
+            border-radius: 12px;
+            color: #94a3b8;
+            font-size: 12px;
+            font-weight: 650;
+            line-height: 1.5;
+          }
+          .public-chat-sidebar-history-list {
+            display: grid;
             gap: 7px;
           }
-          .public-chat-sidebar-contact .pub-contact-card {
+          .public-chat-sidebar-history-item {
+            width: 100%;
             min-height: 42px;
-            padding: 9px 10px;
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            padding: 8px 10px;
+            border: 1px solid rgba(15,23,42,0.06);
             border-radius: 10px;
             background: #f8fafc;
+            color: #334155;
+            cursor: pointer;
+            text-align: left;
+            transition: background 0.18s ease, border-color 0.18s ease, color 0.18s ease, transform 0.06s ease;
           }
-          .public-chat-sidebar-contact .pub-contact-card small {
-            max-width: 190px;
+          .public-chat-sidebar-history-item:hover {
+            background: #fff;
+            border-color: rgba(245,158,11,0.28);
+            color: #0f172a;
+          }
+          .public-chat-sidebar-history-item:active {
+            transform: scale(0.99);
+          }
+          .public-chat-sidebar-history-index {
+            width: 22px;
+            height: 22px;
+            flex: 0 0 22px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 7px;
+            background: rgba(245,158,11,0.12);
+            color: #b45309;
+            font-size: 11px;
+            font-weight: 850;
+            font-variant-numeric: tabular-nums;
+          }
+          .public-chat-sidebar-history-text {
+            min-width: 0;
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
+            font-size: 12.5px;
+            font-weight: 700;
+            line-height: 1.3;
           }
           .public-chat-sidebar-footer {
             margin-top: auto;
@@ -3080,6 +3258,12 @@ export default function PublicChatPage() {
             display: flex;
             align-items: center;
             gap: 10px;
+            width: 100%;
+            padding: 0;
+            border: 0;
+            background: transparent;
+            cursor: pointer;
+            text-align: left;
           }
           .public-chat-sidebar-avatar {
             width: 36px;
@@ -3136,7 +3320,7 @@ export default function PublicChatPage() {
           .public-chat-sidebar.is-collapsed .public-chat-sidebar-logo span,
           .public-chat-sidebar.is-collapsed .public-chat-sidebar-nav span:not(.public-chat-sidebar-icon),
           .public-chat-sidebar.is-collapsed .public-chat-sidebar-star span,
-          .public-chat-sidebar.is-collapsed .public-chat-sidebar-contact,
+          .public-chat-sidebar.is-collapsed .public-chat-sidebar-history,
           .public-chat-sidebar.is-collapsed .public-chat-sidebar-section-title,
           .public-chat-sidebar.is-collapsed .public-chat-sidebar-user span:not(.public-chat-sidebar-avatar),
           .public-chat-sidebar.is-collapsed .public-chat-sidebar-logout span {
@@ -3151,6 +3335,18 @@ export default function PublicChatPage() {
             width: 42px;
             justify-content: center;
             padding: 0;
+          }
+          .public-chat-sidebar.is-collapsed .public-chat-sidebar-logo {
+            width: 42px;
+            min-height: 42px;
+            justify-content: center;
+            padding: 0;
+            border-radius: 12px;
+          }
+          .public-chat-sidebar.is-collapsed .public-chat-sidebar-logo img {
+            width: 32px;
+            height: 32px;
+            flex-basis: 32px;
           }
           .public-chat-sidebar.is-collapsed .public-chat-sidebar-footer {
             width: 42px;
@@ -3418,10 +3614,40 @@ export default function PublicChatPage() {
           font-weight: 800;
           line-height: 1.3;
         }
-        .public-chat-proactive-examples span {
+        .public-chat-proactive-example-row {
+          display: grid;
+          grid-template-columns: 24px 1fr;
+          align-items: start;
+          gap: 7px;
           color: #334155;
           font-size: 12.5px;
           line-height: 1.45;
+        }
+        .public-chat-proactive-example-row span {
+          color: #334155;
+          font-size: 12.5px;
+          line-height: 1.45;
+        }
+        .public-chat-proactive-copy {
+          width: 22px;
+          height: 22px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          border: 1px solid rgba(15,23,42,0.08);
+          border-radius: 7px;
+          background: #fff;
+          color: #64748b;
+          cursor: pointer;
+          transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease, transform 0.06s ease;
+        }
+        .public-chat-proactive-copy:hover {
+          background: rgba(245,158,11,0.10);
+          border-color: rgba(245,158,11,0.24);
+          color: #b45309;
+        }
+        .public-chat-proactive-copy:active {
+          transform: scale(0.96);
         }
         .public-chat-proactive-primary {
           width: 100%;
@@ -3901,7 +4127,8 @@ export default function PublicChatPage() {
         [data-theme="dark"] .public-chat-proactive-intro,
         [data-theme="dark"] .public-chat-proactive-item small,
         [data-theme="dark"] .public-chat-proactive-examples div,
-        [data-theme="dark"] .public-chat-proactive-examples span { color: #cbd5e1 !important; }
+        [data-theme="dark"] .public-chat-proactive-example-row,
+        [data-theme="dark"] .public-chat-proactive-example-row span { color: #cbd5e1 !important; }
         [data-theme="dark"] .public-chat-proactive-close {
           background: rgba(255,255,255,0.06) !important;
           color: #cbd5e1 !important;
@@ -3913,9 +4140,62 @@ export default function PublicChatPage() {
         [data-theme="dark"] .public-chat-proactive-examples {
           background: rgba(255,255,255,0.05) !important;
         }
+        [data-theme="dark"] .public-chat-proactive-copy {
+          background: rgba(255,255,255,0.06) !important;
+          border-color: rgba(255,255,255,0.08) !important;
+          color: #cbd5e1 !important;
+        }
+        [data-theme="dark"] .public-chat-proactive-copy:hover {
+          background: rgba(245,158,11,0.16) !important;
+          border-color: rgba(245,158,11,0.32) !important;
+          color: #fbbf24 !important;
+        }
         [data-theme="dark"] .public-chat-proactive-primary {
           background: #f8fafc !important;
           color: #0a0e16 !important;
+        }
+        [data-theme="dark"] .public-chat-sidebar {
+          background: rgba(10,14,22,0.9) !important;
+          border-right-color: rgba(255,255,255,0.08) !important;
+        }
+        [data-theme="dark"] .public-chat-sidebar-logo {
+          background: rgba(19,27,44,0.9) !important;
+          border-color: rgba(255,255,255,0.08) !important;
+          color: #f8fafc !important;
+          box-shadow: 0 8px 22px rgba(0,0,0,0.24) !important;
+        }
+        [data-theme="dark"] .public-chat-sidebar-nav button,
+        [data-theme="dark"] .public-chat-sidebar-star,
+        [data-theme="dark"] .public-chat-sidebar-lang {
+          color: #cbd5e1 !important;
+        }
+        [data-theme="dark"] .public-chat-sidebar-nav button:hover,
+        [data-theme="dark"] .public-chat-sidebar-star:hover,
+        [data-theme="dark"] .public-chat-sidebar-lang:hover,
+        [data-theme="dark"] .public-chat-sidebar-history-item:hover {
+          background: rgba(255,255,255,0.06) !important;
+          border-color: rgba(255,255,255,0.12) !important;
+          color: #f8fafc !important;
+        }
+        [data-theme="dark"] .public-chat-sidebar-nav button.is-active {
+          background: #f8fafc !important;
+          border-color: #f8fafc !important;
+          color: #0a0e16 !important;
+        }
+        [data-theme="dark"] .public-chat-sidebar-history-empty,
+        [data-theme="dark"] .public-chat-sidebar-history-item {
+          background: rgba(19,27,44,0.72) !important;
+          border-color: rgba(255,255,255,0.08) !important;
+          color: #cbd5e1 !important;
+        }
+        [data-theme="dark"] .public-chat-sidebar-footer {
+          border-top-color: rgba(255,255,255,0.08) !important;
+        }
+        [data-theme="dark"] .public-chat-sidebar-user strong {
+          color: #f8fafc !important;
+        }
+        [data-theme="dark"] .public-chat-sidebar-user small {
+          color: #94a3b8 !important;
         }
 
         @media (max-width: 768px) {
@@ -3964,14 +4244,14 @@ export default function PublicChatPage() {
              on mobile (the bubble shape already tells you it's HONE) and
              eats 30+ px of vertical space per turn. */
           .public-chat-messages .pub-msg-bubble__brand { display: none !important; }
-          .public-chat-page .page-header { height: 46px !important; padding: 0 12px !important; }
+          .public-chat-page .page-header { height: 50px !important; padding: 0 12px !important; }
           .public-chat-page .public-chat-header-brand {
             gap: 7px !important;
             flex: 1 1 auto !important;
             min-width: 0 !important;
           }
-          .public-chat-page .header-logo img { height: 22px !important; }
-          .public-chat-page .header-logo span { font-size: 16px !important; }
+          .public-chat-page .header-logo img { height: 28px !important; }
+          .public-chat-page .header-logo span { font-size: 18px !important; }
           .public-chat-page--ready .public-chat-account {
             display: inline-flex !important;
             flex: 0 0 auto !important;
@@ -4006,7 +4286,7 @@ export default function PublicChatPage() {
           .hone-prefs-seg { padding: 4px 0 !important; }
           .hone-prefs-seg--text { padding: 5px 0 !important; }
           .public-chat-shell {
-            padding-top: 46px !important;
+            padding-top: 50px !important;
           }
           .public-chat-messages {
             padding-top: 6px !important;

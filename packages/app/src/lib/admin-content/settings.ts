@@ -24,12 +24,12 @@ const ZH = {
     data: "数据源",
     notify: "通知",
     channel: "渠道",
-    invite: "白名单",
+    invite: "邀请名单",
   },
   agent: {
     title: "基础设置",
     subtitle:
-      "选择 Agent 引擎并配置相关参数，保存后写入 config.yaml 并刷新运行时配置快照。",
+      "选择 Agent 引擎并配置相关参数，保存后写入 config.yaml 并刷新当前运行设置。",
     current_badge: "当前",
     hone_cloud: {
       name: "Hone Cloud",
@@ -38,7 +38,7 @@ const ZH = {
       base_url_label: "服务地址",
       model_label: "模型",
       api_key_label: "API Key",
-      contact_note: "如需加入白名单或获取 API Key，请联系 bm@hone-claw.com。",
+      contact_note: "如需加入邀请名单或获取 API Key，请联系 bm@hone-claw.com。",
       hide: "隐藏",
       show: "显示",
       test_connection: "测试连通",
@@ -50,9 +50,9 @@ const ZH = {
     multi_agent: {
       name: "Multi-Agent",
       description:
-        "Search Agent 使用 MiniMax 工具调用，Answer Agent 通过 OpenAI 兼容接口收束回复。",
+        "Search Agent 使用 MiniMax 工具调用，Answer Agent 通过本机 OpenCode ACP 收束回复。",
       search_title: "Search Agent (MiniMax / OpenAI-compatible)",
-      answer_title: "Answer Agent (OpenAI-compatible)",
+      answer_title: "Answer Agent (OpenCode ACP)",
       test_search: "测试 Search Agent",
       test_answer: "测试 Answer Agent",
       check_opencode: "检查 opencode",
@@ -64,7 +64,7 @@ const ZH = {
     openai: {
       name: "OpenCode ACP",
       description:
-        "通过本机 opencode acp 启动 OpenCode；可留空继承本机 opencode 配置，或在 Hone 侧覆盖 OpenAI-compatible 端点。",
+        "通过本机 opencode ACP 启动 OpenCode；可留空继承本机 opencode 配置，或在 Hone 侧覆盖 OpenAI-compatible 端点。",
       base_url_label: "Base URL",
       model_label: "主模型",
       api_key_label: "API Key",
@@ -112,7 +112,7 @@ const ZH = {
       description_suffix:
         " 驱动当前 Agent，会话实际走 ACP 链路而不是 multi-agent。",
       runtime_note:
-        "设置会写入 config.yaml 并刷新运行时配置快照；如果监听进程仍显示旧 Agent 引擎，请确认内置后端已按新配置重启。",
+        "设置会写入 config.yaml 并刷新当前运行设置；如果监听进程仍显示旧 Agent 引擎，请确认内置后端已按新配置重启。",
       checking_status: "检测中，请稍候…",
       test_connection: "测试连通",
       checking: "检测中…",
@@ -211,27 +211,27 @@ const ZH = {
     saving: "同步中…",
   },
   invite: {
-    title: "Web 用户白名单",
+    title: "Web 用户邀请名单",
     subtitle:
-      "新增手机号会同步创建一个 `web` 用户。用户通过 `/chat` 使用手机号和短信验证码登录后，复用现有 12 次对话额度限制；历史邀请码保留用于兼容和管理。",
+      "新增手机号会同步创建一个 `web` 用户。用户通过 `/chat` 使用手机号和短信验证码登录后，复用当前每日对话额度；邀请码仍可用于管理和迁移。",
     refresh: "刷新",
     phone_label: "手机号",
-    phone_placeholder: "输入要加入白名单的手机号",
-    create: "加入白名单",
+    phone_placeholder: "输入要加入邀请名单的手机号",
+    create: "加入邀请名单",
     creating: "加入中…",
     phone_required: "请输入手机号",
-    created: "已将 {phone} 加入白名单（兼容邀请码 {code}）",
-    created_copied: "已将 {phone} 加入白名单，并复制兼容邀请码 {code}",
+    created: "已将 {phone} 加入邀请名单（邀请码 {code}）",
+    created_copied: "已将 {phone} 加入邀请名单，并复制邀请码 {code}",
     created_with_api_key:
-      "已将 {phone} 加入白名单，并生成兼容邀请码 {code} 和 API Key {apiKey}",
+      "已将 {phone} 加入邀请名单，并生成邀请码 {code} 和 API Key {apiKey}",
     created_with_api_key_copied:
-      "已将 {phone} 加入白名单，并生成兼容邀请码 {code} 和 API Key；均已复制",
+      "已将 {phone} 加入邀请名单，并生成邀请码 {code} 和 API Key；均已复制",
     copied: "已复制邀请码 {code}",
     copy_unsupported: "当前环境不支持复制",
     disable_confirm:
-      "停用 {userId} 的白名单后，现有 Web 登录态会立即失效。继续吗？",
+      "停用 {userId} 的邀请资格后，现有 Web 登录态会立即失效。继续吗？",
     reset_confirm:
-      "将为 {userId} 生成新兼容邀请码，并让旧邀请码和现有 Web 登录态立即失效。继续吗？",
+      "将为 {userId} 生成新邀请码，并让旧邀请码和现有 Web 登录态立即失效。继续吗？",
     api_key_reset_confirm:
       "将为 {userId} 生成新的 API Key，旧 API Key 会立即失效，但不会清理登录态。继续吗？",
     reset_copied_suffix: "{message}，新邀请码已复制",
@@ -246,7 +246,7 @@ const ZH = {
       remaining: "剩余次数",
       last_login: "最近登录",
       actions: "操作",
-      empty: "还没有加入任何白名单用户。",
+      empty: "还没有加入任何邀请用户。",
       phone_unbound: "未绑定",
       enabled: "已启用",
       disabled: "已停用",
@@ -287,12 +287,12 @@ const EN: typeof ZH = {
     data: "Data sources",
     notify: "Notifications",
     channel: "Channels",
-    invite: "Whitelist",
+    invite: "Invite list",
   },
   agent: {
     title: "Core settings",
     subtitle:
-      "Pick the agent engine and configure its parameters. Saving writes config.yaml and refreshes the runtime config snapshot.",
+      "Pick the agent engine and configure its parameters. Saving writes config.yaml and refreshes the running settings.",
     current_badge: "Active",
     hone_cloud: {
       name: "Hone Cloud",
@@ -302,7 +302,7 @@ const EN: typeof ZH = {
       model_label: "Model",
       api_key_label: "API Key",
       contact_note:
-        "Contact bm@hone-claw.com to join the whitelist or get an API key.",
+        "Contact bm@hone-claw.com to join the invite list or get an API key.",
       hide: "Hide",
       show: "Show",
       test_connection: "Test connection",
@@ -314,9 +314,9 @@ const EN: typeof ZH = {
     multi_agent: {
       name: "Multi-Agent",
       description:
-        "Search Agent uses MiniMax function calling; Answer Agent finalizes the reply through an OpenAI-compatible route.",
+        "Search Agent uses MiniMax function calling; Answer Agent finalizes the reply through local OpenCode ACP.",
       search_title: "Search Agent (MiniMax / OpenAI-compatible)",
-      answer_title: "Answer Agent (OpenAI-compatible)",
+      answer_title: "Answer Agent (OpenCode ACP)",
       test_search: "Test Search Agent",
       test_answer: "Test Answer Agent",
       check_opencode: "Check opencode",
@@ -328,7 +328,7 @@ const EN: typeof ZH = {
     openai: {
       name: "OpenCode ACP",
       description:
-        "Starts local OpenCode via opencode acp. Leave fields blank to inherit local opencode config, or override the OpenAI-compatible endpoint from Hone.",
+        "Starts local OpenCode via opencode ACP. Leave fields blank to inherit local opencode config, or override the OpenAI-compatible endpoint from Hone.",
       base_url_label: "Base URL",
       model_label: "Primary model",
       api_key_label: "API Key",
@@ -376,7 +376,7 @@ const EN: typeof ZH = {
       description_suffix:
         ". Sessions run over the ACP link instead of multi-agent.",
       runtime_note:
-        "Settings write to config.yaml and refresh the runtime config snapshot. If the listener still shows the old agent engine, confirm that the embedded backend restarted with the new config.",
+        "Settings write to config.yaml and refresh the running settings. If the listener still shows the old agent engine, confirm that the embedded backend restarted with the new config.",
       checking_status: "Checking, please wait…",
       test_connection: "Test connection",
       checking: "Checking…",
@@ -403,7 +403,7 @@ const EN: typeof ZH = {
   data: {
     title: "API configuration",
     subtitle:
-      "Configure keys for data sources and search services. Multi-key rotation and auto retry are supported.",
+      "Configure keys for data sources and search services. Multi-key rotation and automatic retries are supported.",
     fmp: {
       name: "Financial data API (Financial Modeling Prep)",
       description:
@@ -479,28 +479,28 @@ const EN: typeof ZH = {
     saving: "Syncing…",
   },
   invite: {
-    title: "Web user whitelist",
+    title: "Web user invite list",
     subtitle:
-      "Adding a phone number creates a `web` user. Users sign in from `/chat` with phone + SMS code and share the existing 12-message daily quota. Historical invite codes are kept for compatibility and management.",
+      "Adding a phone number creates a `web` user. Users sign in from `/chat` with phone + SMS code and share the current daily chat quota. Invite codes remain available for management and migration.",
     refresh: "Refresh",
     phone_label: "Phone number",
-    phone_placeholder: "Phone number to whitelist",
-    create: "Add to whitelist",
+    phone_placeholder: "Phone number to add",
+    create: "Add to invite list",
     creating: "Adding…",
     phone_required: "Enter a phone number",
-    created: "Added {phone} to the whitelist (compatibility invite code {code})",
+    created: "Added {phone} to the invite list (invite code {code})",
     created_copied:
-      "Added {phone} to the whitelist and copied compatibility invite code {code}",
+      "Added {phone} to the invite list and copied invite code {code}",
     created_with_api_key:
-      "Added {phone} to the whitelist with compatibility invite code {code} and API key {apiKey}",
+      "Added {phone} to the invite list with invite code {code} and API key {apiKey}",
     created_with_api_key_copied:
-      "Added {phone} to the whitelist with compatibility invite code {code} and API key; both copied",
+      "Added {phone} to the invite list with invite code {code} and API key; both copied",
     copied: "Copied invite code {code}",
     copy_unsupported: "Clipboard not available in this environment",
     disable_confirm:
-      "Disabling the whitelist entry for {userId} will immediately log out the existing web session. Continue?",
+      "Disabling invite access for {userId} will immediately log out the existing web session. Continue?",
     reset_confirm:
-      "This will issue a new compatibility invite code for {userId} and immediately invalidate the old code and any active web session. Continue?",
+      "This will issue a new invite code for {userId} and immediately invalidate the old code and any active web session. Continue?",
     api_key_reset_confirm:
       "This will issue a new API key for {userId}. The old API key stops working, but web sessions stay signed in. Continue?",
     reset_copied_suffix: "{message}; new invite code copied",
@@ -516,7 +516,7 @@ const EN: typeof ZH = {
       remaining: "Remaining",
       last_login: "Last login",
       actions: "Actions",
-      empty: "No whitelisted web users yet.",
+      empty: "No invited web users yet.",
       phone_unbound: "Not bound",
       enabled: "Enabled",
       disabled: "Disabled",

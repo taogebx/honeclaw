@@ -1,13 +1,13 @@
-//! `UnifiedCollector` —— 把三个 source 编排成两层产物:
+//! `UnifiedCollector` —— 把三个 source 编排成两层产物的轻量组合器:
 //!
 //! - **per-actor pool**:`BufferSource.drain(actor)` ∪ `SynthSource.synthesize_for_actor(actor)`,
 //!   每个 actor 独立产出,合并到一个 `Vec<UnifiedCandidate>`。
 //! - **shared pool**:`GlobalNewsSource.collect(until, lookback, dedup_lookback)`,
 //!   一次 slot 只取一次,所有 actor 共享,后续在 scheduler 里再做 per-actor `prefs` 过滤。
 //!
-//! Scheduler 已接入该组合 API;Synth / Global 两个 source 都是可选的——`SynthSource`
-//! 需要 store + registry 才有意义,`GlobalNewsSource` 在 `prefs.blocked_origins`
-//! 或 dryrun 关闭全球新闻时不创建。
+//! 当前 runtime scheduler 内联编排等价流程;这里保留组合器和测试来锁定
+//! source 层 contract。Synth / Global 两个 source 都是可选的——`SynthSource`
+//! 需要 store + registry 才有意义,`GlobalNewsSource` 可由调用方显式关闭。
 
 use chrono::{DateTime, Utc};
 use hone_core::ActorIdentity;
@@ -49,7 +49,7 @@ impl<'a> UnifiedCollector<'a> {
         }
     }
 
-    /// 关掉 global source —— 用户在 prefs 里 block 全球 origin、或 dryrun 不想跑 LLM 时用。
+    /// 关掉 global source —— 测试或调用方只想验证 per-actor pool 时使用。
     pub fn without_global(mut self) -> Self {
         self.global = None;
         self
@@ -62,8 +62,8 @@ impl<'a> UnifiedCollector<'a> {
         actor: &ActorIdentity,
         now: DateTime<Utc>,
     ) -> Vec<UnifiedCandidate> {
-        let mut out = match self.buffer.drain(actor) {
-            Ok(v) => v,
+        let mut candidates = match self.buffer.drain(actor) {
+            Ok(buffered) => buffered,
             Err(e) => {
                 tracing::warn!(actor = ?actor, "buffer drain failed: {e:#}");
                 Vec::new()
@@ -71,11 +71,11 @@ impl<'a> UnifiedCollector<'a> {
         };
         if let Some(synth) = &self.synth {
             match synth.synthesize_for_actor(actor, now) {
-                Ok(mut v) => out.append(&mut v),
+                Ok(mut synthesized) => candidates.append(&mut synthesized),
                 Err(e) => tracing::warn!(actor = ?actor, "synth failed: {e:#}"),
             }
         }
-        out
+        candidates
     }
 
     /// shared global pool;`global` 未配置时返回空。
@@ -85,11 +85,11 @@ impl<'a> UnifiedCollector<'a> {
         lookback_hours: u32,
         dedup_lookback_hours: u32,
     ) -> Vec<UnifiedCandidate> {
-        let Some(g) = &self.global else {
+        let Some(global_source) = &self.global else {
             return Vec::new();
         };
-        match g.collect(until, lookback_hours, dedup_lookback_hours) {
-            Ok(v) => v,
+        match global_source.collect(until, lookback_hours, dedup_lookback_hours) {
+            Ok(global_candidates) => global_candidates,
             Err(e) => {
                 tracing::warn!(
                     until = %until,
@@ -194,11 +194,14 @@ mod tests {
             .unwrap();
         let collector = UnifiedCollector::buffer_only(&digest_buffer);
         let now = Utc.with_ymd_and_hms(2026, 4, 27, 13, 0, 0).unwrap();
-        let per_actor = collector.collect_per_actor(&test_actor, now);
-        assert_eq!(per_actor.len(), 1);
-        assert_eq!(per_actor[0].origin, ItemOrigin::Buffered);
-        let global = collector.collect_global(now, 24, 24);
-        assert!(global.is_empty(), "buffer_only 路径不应触达 global source");
+        let per_actor_candidates = collector.collect_per_actor(&test_actor, now);
+        assert_eq!(per_actor_candidates.len(), 1);
+        assert_eq!(per_actor_candidates[0].origin, ItemOrigin::Buffered);
+        let global_candidates = collector.collect_global(now, 24, 24);
+        assert!(
+            global_candidates.is_empty(),
+            "buffer_only 路径不应触达 global source"
+        );
     }
 
     #[test]
@@ -220,10 +223,13 @@ mod tests {
         let registry = registry_with_holding("GOOGL", &test_actor);
         let collector = UnifiedCollector::new(&digest_buffer, &store, &registry, 0);
         let now = Utc.with_ymd_and_hms(2026, 4, 27, 13, 0, 0).unwrap();
-        let per_actor = collector.collect_per_actor(&test_actor, now);
+        let per_actor_candidates = collector.collect_per_actor(&test_actor, now);
 
-        assert_eq!(per_actor.len(), 2);
-        let origins: Vec<ItemOrigin> = per_actor.iter().map(|c| c.origin).collect();
+        assert_eq!(per_actor_candidates.len(), 2);
+        let origins: Vec<ItemOrigin> = per_actor_candidates
+            .iter()
+            .map(|candidate| candidate.origin)
+            .collect();
         assert!(origins.contains(&ItemOrigin::Buffered));
         assert!(origins.contains(&ItemOrigin::Synth));
     }
@@ -241,11 +247,11 @@ mod tests {
         let registry = registry_with_holding("AAPL", &test_actor);
         let collector = UnifiedCollector::new(&digest_buffer, &store, &registry, 0);
 
-        let global = collector.collect_global(now, 24, 24);
-        assert_eq!(global.len(), 1);
-        assert_eq!(global[0].origin, ItemOrigin::Global);
+        let global_candidates = collector.collect_global(now, 24, 24);
+        assert_eq!(global_candidates.len(), 1);
+        assert_eq!(global_candidates[0].origin, ItemOrigin::Global);
         assert!(
-            global[0]
+            global_candidates[0]
                 .fmp_text
                 .as_deref()
                 .unwrap_or("")
@@ -253,9 +259,11 @@ mod tests {
         );
 
         // per-actor 不应混入 global news
-        let per_actor = collector.collect_per_actor(&test_actor, now);
+        let per_actor_candidates = collector.collect_per_actor(&test_actor, now);
         assert!(
-            per_actor.iter().all(|c| c.origin != ItemOrigin::Global),
+            per_actor_candidates
+                .iter()
+                .all(|candidate| candidate.origin != ItemOrigin::Global),
             "global news 必须只走 collect_global,per-actor 池里不能出现 Global origin"
         );
     }
@@ -274,8 +282,8 @@ mod tests {
         let collector =
             UnifiedCollector::new(&digest_buffer, &store, &registry, 0).without_global();
 
-        let global = collector.collect_global(now, 24, 24);
-        assert!(global.is_empty());
+        let global_candidates = collector.collect_global(now, 24, 24);
+        assert!(global_candidates.is_empty());
     }
 
     #[test]
@@ -303,8 +311,8 @@ mod tests {
             .unwrap();
         let collector = UnifiedCollector::buffer_only(&digest_buffer);
         let now = Utc.with_ymd_and_hms(2026, 4, 27, 13, 0, 0).unwrap();
-        let per_actor = collector.collect_per_actor(&test_actor, now);
-        assert_eq!(per_actor.len(), 1);
-        assert_eq!(per_actor[0].event.id, "p2");
+        let per_actor_candidates = collector.collect_per_actor(&test_actor, now);
+        assert_eq!(per_actor_candidates.len(), 1);
+        assert_eq!(per_actor_candidates[0].event.id, "p2");
     }
 }

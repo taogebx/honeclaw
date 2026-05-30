@@ -75,8 +75,7 @@ fn render_item(item: &PersonalizedItem, fmt: RenderFormat) -> String {
     let url_line = item
         .candidate
         .event
-        .url
-        .as_deref()
+        .user_visible_url()
         .map(|u| match fmt {
             RenderFormat::TelegramHtml => {
                 format!("<a href=\"{}\">{}</a>", escape_attr_html(u), short_host(u))
@@ -86,16 +85,16 @@ fn render_item(item: &PersonalizedItem, fmt: RenderFormat) -> String {
         })
         .unwrap_or_default();
 
-    let mut out = format!("{title_line}\n   {comment}\n   {source}{symbols}");
+    let mut rendered_item = format!("{title_line}\n   {comment}\n   {source}{symbols}");
     if !url_line.is_empty() {
-        out.push_str("\n   ");
-        out.push_str(&url_line);
+        rendered_item.push_str("\n   ");
+        rendered_item.push_str(&url_line);
     }
-    out
+    rendered_item
 }
 
-fn label_for(cat: PickCategory, rel: MainlineRelation) -> &'static str {
-    match (cat, rel) {
+fn label_for(category: PickCategory, relation: MainlineRelation) -> &'static str {
+    match (category, relation) {
         (PickCategory::MainlineAligned, MainlineRelation::Aligned) => "🎯 [印证]",
         (PickCategory::MainlineCounter, _) | (_, MainlineRelation::Counter) => "⚠️ [证伪]",
         (PickCategory::MacroFloor, _) => "🌍 [宏观]",
@@ -103,8 +102,9 @@ fn label_for(cat: PickCategory, rel: MainlineRelation) -> &'static str {
     }
 }
 
-fn escape_attr_html(s: &str) -> String {
-    s.replace('&', "&amp;")
+fn escape_attr_html(raw_text: &str) -> String {
+    raw_text
+        .replace('&', "&amp;")
         .replace('"', "&quot;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -131,11 +131,11 @@ mod tests {
     use crate::pollers::news::NewsSourceClass;
     use chrono::Utc;
 
-    fn item(
+    fn personalized_digest_item_fixture(
         title: &str,
         comment: &str,
         category: PickCategory,
-        rel: MainlineRelation,
+        mainline_relation: MainlineRelation,
         rank: u32,
         symbols: Vec<&str>,
     ) -> PersonalizedItem {
@@ -165,7 +165,7 @@ mod tests {
             rank,
             comment: comment.into(),
             category,
-            mainline_relation: rel,
+            mainline_relation,
         }
     }
 
@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn renders_three_categories_with_distinct_labels() {
         let items = vec![
-            item(
+            personalized_digest_item_fixture(
                 "GOOGL Anthropic",
                 "印证 Gemini 飞轮",
                 PickCategory::MainlineAligned,
@@ -187,7 +187,7 @@ mod tests {
                 1,
                 vec!["GOOGL"],
             ),
-            item(
+            personalized_digest_item_fixture(
                 "Intel turnaround",
                 "对 AMD 不构成实质证伪",
                 PickCategory::MainlineCounter,
@@ -195,7 +195,7 @@ mod tests {
                 2,
                 vec!["INTC", "AMD"],
             ),
-            item(
+            personalized_digest_item_fixture(
                 "Macron Hormuz",
                 "波及电力叙事",
                 PickCategory::MacroFloor,
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn telegram_html_escapes_title_and_uses_anchor() {
-        let items = vec![item(
+        let items = vec![personalized_digest_item_fixture(
             "Apple's iPhone & iPad <update>",
             "回购增加",
             PickCategory::MainlineAligned,
@@ -240,7 +240,7 @@ mod tests {
         let long = "X".repeat(800);
         let items: Vec<_> = (0..10)
             .map(|i| {
-                item(
+                personalized_digest_item_fixture(
                     &format!("Title {i}"),
                     &long,
                     PickCategory::MainlineAligned,
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn label_falls_back_when_category_and_relation_dont_match() {
         // MainlineAligned + Neutral → 没有"印证" 关键词,应用通用 [要闻] label
-        let items = vec![item(
+        let items = vec![personalized_digest_item_fixture(
             "T",
             "c",
             PickCategory::MainlineAligned,

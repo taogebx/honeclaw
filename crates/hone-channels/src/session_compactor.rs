@@ -13,6 +13,13 @@ use crate::runtime::sanitize_user_visible_output;
 
 const POST_COMPACT_MAX_SKILL_SNAPSHOT_CHARS: usize = 12_000;
 const POST_COMPACT_MAX_SKILL_SNAPSHOTS: usize = 4;
+// [LOCAL PATCH fb0dd709] DM 默认阈值放宽 10x (原: 20 / 80_000 / 6)
+// 单用户场景下原阈值过激, 第 21 条消息就触发压缩, web UI 历史只剩压缩摘要.
+// 群聊仍按 group_context 配置, 避免群聊上下文爆炸.
+pub(crate) const DIRECT_COMPRESS_THRESHOLD_MESSAGES: usize = 200;
+pub(crate) const DIRECT_COMPRESS_THRESHOLD_BYTES: usize = 800_000;
+pub(crate) const DIRECT_RETAIN_RECENT_AFTER_COMPRESS: usize = 50;
+pub(crate) const MIN_GROUP_COMPRESS_THRESHOLD_BYTES: usize = 1024;
 
 pub(crate) struct SessionCompactor<'a> {
     core: &'a HoneBotCore,
@@ -50,8 +57,6 @@ impl<'a> SessionCompactor<'a> {
             .map(|identity| identity.is_group())
             .unwrap_or(false);
 
-        // [LOCAL PATCH] DM 会话默认阈值放宽 10 倍, 方便个人长会话保留完整历史 (单用户场景)
-        // 群聊仍然按 group_context 配置 (避免群聊上下文爆炸)
         let compress_threshold = if is_group_session {
             self.core
                 .config
@@ -59,16 +64,16 @@ impl<'a> SessionCompactor<'a> {
                 .compress_threshold_messages
                 .max(1)
         } else {
-            200
+            DIRECT_COMPRESS_THRESHOLD_MESSAGES
         };
         let compress_byte_threshold = if is_group_session {
             self.core
                 .config
                 .group_context
                 .compress_threshold_bytes
-                .max(1024)
+                .max(MIN_GROUP_COMPRESS_THRESHOLD_BYTES)
         } else {
-            800_000
+            DIRECT_COMPRESS_THRESHOLD_BYTES
         };
         let retain_recent = if is_group_session {
             self.core
@@ -77,7 +82,7 @@ impl<'a> SessionCompactor<'a> {
                 .retain_recent_after_compress
                 .max(1)
         } else {
-            50
+            DIRECT_RETAIN_RECENT_AFTER_COMPRESS
         };
 
         let total_content_bytes: usize = active_messages

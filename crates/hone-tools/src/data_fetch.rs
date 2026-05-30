@@ -264,7 +264,7 @@ fn format_fmp_transport_error(operation: &str, error: &reqwest::Error) -> String
 }
 
 fn sanitize_fmp_error_detail(text: &str) -> String {
-    let redacted = redact_fmp_query_secrets(text);
+    let redacted = redact_fmp_query_secrets(&redact_url_userinfo(text));
     if redacted.chars().count() <= MAX_FMP_TRANSPORT_ERROR_CHARS {
         return redacted;
     }
@@ -273,6 +273,32 @@ fn sanitize_fmp_error_detail(text: &str) -> String {
         .take(MAX_FMP_TRANSPORT_ERROR_CHARS)
         .collect::<String>()
         + "..."
+}
+
+fn redact_url_userinfo(text: &str) -> String {
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find("://") {
+        let authority_start = index + 3;
+        let authority = &remaining[authority_start..];
+        let authority_end = authority
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                (ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | ')')).then_some(idx)
+            })
+            .unwrap_or(authority.len());
+        let authority_slice = &authority[..authority_end];
+        if let Some(at_index) = authority_slice.rfind('@') {
+            output.push_str(&remaining[..authority_start]);
+            output.push_str("<redacted>@");
+            remaining = &remaining[authority_start + at_index + 1..];
+        } else {
+            output.push_str(&remaining[..authority_start]);
+            remaining = &remaining[authority_start..];
+        }
+    }
+    output.push_str(remaining);
+    output
 }
 
 fn redact_fmp_query_secrets(text: &str) -> String {
@@ -304,6 +330,7 @@ fn redact_delimited_fmp_secret_value(text: &str, needle: &str) -> String {
                 (ch == '&'
                     || ch == ')'
                     || ch == ','
+                    || ch == ';'
                     || ch == '"'
                     || ch == '\''
                     || ch == '}'
@@ -494,6 +521,7 @@ impl Tool for DataFetchTool {
 mod tests {
     use super::{DataFetchTool, sanitize_fmp_error_detail};
     use crate::base::Tool;
+    use crate::test_support::{assert_text_contains_all, assert_text_contains_none};
     use chrono::{Duration, NaiveDate};
     use serde_json::json;
 
@@ -545,18 +573,43 @@ mod tests {
     }
 
     #[test]
+    fn fmp_error_detail_redacts_api_key_aliases_before_semicolon_delimiter() {
+        let detail = sanitize_fmp_error_detail(
+            "https://example.com/api/v3/quote/AAPL?api_key=one;apiKey=two apikey: three;",
+        );
+        assert_eq!(
+            detail,
+            "https://example.com/api/v3/quote/AAPL?api_key=<redacted>;apiKey=<redacted> apikey: <redacted>;"
+        );
+    }
+
+    #[test]
     fn fmp_error_detail_redacts_json_api_key_aliases() {
         let detail = sanitize_fmp_error_detail(
             r#"backend failed {"api_key":"one","apiKey":"two","apikey":"three","safe":"kept"}"#,
         );
 
-        assert!(detail.contains("\"api_key\":\"<redacted>\""));
-        assert!(detail.contains("\"apiKey\":\"<redacted>\""));
-        assert!(detail.contains("\"apikey\":\"<redacted>\""));
-        assert!(detail.contains("\"safe\":\"kept\""));
-        assert!(!detail.contains("\"one\""));
-        assert!(!detail.contains("\"two\""));
-        assert!(!detail.contains("\"three\""));
+        assert_text_contains_all(
+            &detail,
+            &[
+                "\"api_key\":\"<redacted>\"",
+                "\"apiKey\":\"<redacted>\"",
+                "\"apikey\":\"<redacted>\"",
+                "\"safe\":\"kept\"",
+            ],
+        );
+        assert_text_contains_none(&detail, &["\"one\"", "\"two\"", "\"three\""]);
+    }
+
+    #[test]
+    fn fmp_error_detail_redacts_url_userinfo() {
+        let detail = sanitize_fmp_error_detail(
+            "error sending request for url (https://user:secret@example.com/api/v3/quote/AAPL)",
+        );
+        assert_eq!(
+            detail,
+            "error sending request for url (https://<redacted>@example.com/api/v3/quote/AAPL)"
+        );
     }
 
     #[test]

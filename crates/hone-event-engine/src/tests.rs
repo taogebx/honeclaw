@@ -10,9 +10,9 @@ async fn start_respects_disabled_flag() {
 
 #[tokio::test]
 async fn start_warns_when_enabled_but_no_key() {
-    let mut cfg = EventEngineConfig::default();
-    cfg.enabled = true;
-    let engine = EventEngine::new(cfg, FmpConfig::default());
+    let mut event_engine_config = EventEngineConfig::default();
+    event_engine_config.enabled = true;
+    let engine = EventEngine::new(event_engine_config, FmpConfig::default());
     engine.start().await.unwrap();
 }
 
@@ -173,18 +173,18 @@ async fn live_telegram_push_demo() {
             // 锚文本已提供，禁掉 preview 让版式更紧凑
             payload["disable_web_page_preview"] = serde_json::Value::Bool(true);
         }
-        let resp = client
+        let telegram_response = client
             .post(&url)
             .json(&payload)
             .send()
             .await
             .expect("telegram 发送请求失败");
-        let status = resp.status();
-        let body_resp = resp.text().await.unwrap_or_default();
-        println!("[tg demo] fmt={fmt:?} status={status} body={body_resp}");
+        let status = telegram_response.status();
+        let response_body = telegram_response.text().await.unwrap_or_default();
+        println!("[tg demo] fmt={fmt:?} status={status} body={response_body}");
         assert!(
             status.is_success(),
-            "telegram API 返回非 2xx: {status} / {body_resp}"
+            "telegram API 返回非 2xx: {status} / {response_body}"
         );
         // Telegram 发送速率限制：每秒 30 条个人；留 500ms 间隔
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
@@ -212,8 +212,8 @@ async fn live_telegram_push_llm_polished_demo() {
 
     let token = std::env::var("HONE_TG_BOT_TOKEN").expect("需要 HONE_TG_BOT_TOKEN");
     let chat_id = std::env::var("HONE_TG_CHAT_ID").expect("需要 HONE_TG_CHAT_ID");
-    let or_key = std::env::var("HONE_OPENROUTER_KEY").expect("需要 HONE_OPENROUTER_KEY");
-    let or_model = std::env::var("HONE_OPENROUTER_MODEL")
+    let openrouter_key = std::env::var("HONE_OPENROUTER_KEY").expect("需要 HONE_OPENROUTER_KEY");
+    let openrouter_model = std::env::var("HONE_OPENROUTER_MODEL")
         .unwrap_or_else(|_| "google/gemini-3.1-pro-preview".to_string());
 
     // High 事件 1：财报发布
@@ -249,7 +249,11 @@ async fn live_telegram_push_llm_polished_demo() {
     // 构建 LlmPolisher
     // 注：Gemini 3.x 是 reasoning 模型，会把大部分 token 预算花在思考链上，
     // 所以这里给到 4096 以避免"只输出标题就截断"。
-    let provider = Arc::new(OpenRouterProvider::new(&or_key, &or_model, 4096));
+    let provider = Arc::new(OpenRouterProvider::new(
+        &openrouter_key,
+        &openrouter_model,
+        4096,
+    ));
     let mut polish_levels = HashSet::new();
     polish_levels.insert(Severity::High);
     let polisher = LlmPolisher::new(provider, polish_levels);
@@ -296,18 +300,18 @@ async fn live_telegram_push_llm_polished_demo() {
             payload["parse_mode"] = serde_json::Value::String("HTML".into());
             payload["disable_web_page_preview"] = serde_json::Value::Bool(true);
         }
-        let resp = client
+        let telegram_response = client
             .post(&url)
             .json(&payload)
             .send()
             .await
             .expect("telegram 发送请求失败");
-        let status = resp.status();
-        let body_resp = resp.text().await.unwrap_or_default();
-        println!("[tg polish demo] html={use_html} status={status} body={body_resp}");
+        let status = telegram_response.status();
+        let response_body = telegram_response.text().await.unwrap_or_default();
+        println!("[tg polish demo] html={use_html} status={status} body={response_body}");
         assert!(
             status.is_success(),
-            "telegram API 返回非 2xx: {status} / {body_resp}"
+            "telegram API 返回非 2xx: {status} / {response_body}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     }
@@ -527,7 +531,7 @@ async fn live_portfolio_backtest_push() {
         println!("CorpAction calendar 失败（跳过）: {e:#}");
         vec![]
     });
-    let ca_filt: Vec<_> = ca_calendar
+    let corp_action_filtered: Vec<_> = ca_calendar
         .into_iter()
         .filter(|e| e.symbols.iter().any(|s| holdings_set.contains(s.as_str())))
         .collect();
@@ -548,7 +552,7 @@ async fn live_portfolio_backtest_push() {
     }
     println!(
         "CorpAction: calendar={} · 8-K={}",
-        ca_filt.len(),
+        corp_action_filtered.len(),
         sec_events.len()
     );
 
@@ -557,11 +561,11 @@ async fn live_portfolio_backtest_push() {
     let mut messages: Vec<(bool, String)> = Vec::new();
 
     // 7a) LLM 生成"今日要点"摘要（可选：无 OPENROUTER_KEY 时跳过）
-    if let Ok(or_key) = std::env::var("HONE_OPENROUTER_KEY") {
+    if let Ok(openrouter_key) = std::env::var("HONE_OPENROUTER_KEY") {
         use hone_llm::{LlmProvider, Message, OpenRouterProvider};
-        let or_model = std::env::var("HONE_OPENROUTER_MODEL")
+        let openrouter_model = std::env::var("HONE_OPENROUTER_MODEL")
             .unwrap_or_else(|_| "anthropic/claude-haiku-4-5".to_string());
-        let provider = OpenRouterProvider::new(&or_key, &or_model, 1024);
+        let provider = OpenRouterProvider::new(&openrouter_key, &openrouter_model, 1024);
 
         // 只把对 LLM 最有信息量的字段喂进去；压缩到 JSON，避免 prompt 太长
         let payload = serde_json::json!({
@@ -626,7 +630,7 @@ async fn live_portfolio_backtest_push() {
         let today_utc = chrono::Utc::now().date_naive();
         let mut sorted: Vec<&crate::event::MarketEvent> = earn_filt.iter().collect();
         sorted.sort_by_key(|e| e.occurred_at);
-        let mut s = format!("📅 持仓未来 14 天财报 · {} 条", sorted.len());
+        let mut digest_text = format!("📅 持仓未来 14 天财报 · {} 条", sorted.len());
         for ev in &sorted {
             let sym = ev.symbols.first().cloned().unwrap_or_default();
             let date = ev.occurred_at.date_naive();
@@ -665,11 +669,11 @@ async fn live_portfolio_backtest_push() {
                 (None, Some(r)) => format!("Rev {}", fmt_rev(r)),
                 _ => "".into(),
             };
-            s.push_str(&format!(
+            digest_text.push_str(&format!(
                 "\n• {urgency} ${sym} · {date} {time_slot} · {est_part}"
             ));
         }
-        messages.push((true, s));
+        messages.push((true, digest_text));
     } else {
         messages.push((false, "📅 持仓未来 14 天财报 · 无".into()));
     }
@@ -715,7 +719,7 @@ async fn live_portfolio_backtest_push() {
             .collect();
 
         // #13 财报窗口标记：对每条 news,看是否同 ticker 有 earnings 事件落在
-        // [news - 1d, news + 2d] 窗口内,若有则 🔔 标记——这些是 Router 里
+        // [news - 12h, news + 2d] 窗口内,若有则 🔔 标记——这些是 Router 里
         // `maybe_upgrade_news` 会把 Low 升到 Medium 的那一批,肉眼可验证。
         let earn_by_sym: std::collections::HashMap<&str, &crate::event::MarketEvent> = earn_filt
             .iter()
@@ -724,7 +728,7 @@ async fn live_portfolio_backtest_push() {
         let in_earnings_window = |ev: &crate::event::MarketEvent| -> Option<i64> {
             let sym = ev.symbols.first()?.as_str();
             let earn = earn_by_sym.get(sym)?;
-            let start = ev.occurred_at - chrono::Duration::days(1);
+            let start = ev.occurred_at - chrono::Duration::hours(12);
             let end = ev.occurred_at + chrono::Duration::days(2);
             if earn.occurred_at >= start && earn.occurred_at <= end {
                 Some((earn.occurred_at.date_naive() - ev.occurred_at.date_naive()).num_days())
@@ -756,7 +760,7 @@ async fn live_portfolio_backtest_push() {
             per_sym,
         );
 
-        let mut s = format!(
+        let mut digest_text = format!(
             "📰 持仓相关新闻 · {} 只有动静 · Top {}{}",
             touched_tickers.len(),
             picks.len(),
@@ -783,16 +787,16 @@ async fn live_portfolio_backtest_push() {
                         .nth(1)
                         .and_then(|s| s.split('/').next())
                         .unwrap_or(u);
-                    s.push_str(&format!(
+                    digest_text.push_str(&format!(
                         "\n• ${sym}{tag} · {ts} · {title_esc} <a href=\"{u}\">{host}</a>"
                     ));
                 }
                 None => {
-                    s.push_str(&format!("\n• ${sym}{tag} · {ts} · {title_esc}"));
+                    digest_text.push_str(&format!("\n• ${sym}{tag} · {ts} · {title_esc}"));
                 }
             }
         }
-        messages.push((true, s));
+        messages.push((true, digest_text));
     }
 
     // SEC 8-K：poller 侧已经按 72h 切过时效;这里直接按时间降序渲染。
@@ -802,7 +806,7 @@ async fn live_portfolio_backtest_push() {
         let mut recent: Vec<&crate::event::MarketEvent> = sec_events.iter().collect();
         recent.sort_by(|a, b| b.occurred_at.cmp(&a.occurred_at));
         if !recent.is_empty() {
-            let mut s = format!("📄 持仓最近 72h SEC 8-K · {} 条", recent.len());
+            let mut digest_text = format!("📄 持仓最近 72h SEC 8-K · {} 条", recent.len());
             for ev in &recent {
                 let sym = ev.symbols.first().cloned().unwrap_or_default();
                 // payload.acceptedDate 可能是 "YYYY-MM-DD HH:MM:SS"；
@@ -855,7 +859,7 @@ async fn live_portfolio_backtest_push() {
                     .unwrap_or_else(|| "document".into());
 
                 // 第一行：ticker · 时间 · 盘前/盘后
-                s.push_str(&format!(
+                digest_text.push_str(&format!(
                     "\n• ${sym} · {stamp}{}",
                     if slot_tag.is_empty() {
                         String::new()
@@ -873,17 +877,18 @@ async fn live_portfolio_backtest_push() {
                     links.push(format!("<a href=\"{doc_link}\">{name_esc}</a>"));
                 }
                 if !links.is_empty() {
-                    s.push_str(&format!("\n   ↳ {}", links.join(" · ")));
+                    digest_text.push_str(&format!("\n   ↳ {}", links.join(" · ")));
                 }
             }
-            messages.push((true, s));
+            messages.push((true, digest_text));
         } else {
             println!("SEC 8-K 过去 72h 无；全持仓都是历史老文件");
         }
     }
-    if !ca_filt.is_empty() {
-        let s = crate::digest::render_digest("持仓拆股/分红", &ca_filt, 0, fmt);
-        messages.push((true, s));
+    if !corp_action_filtered.is_empty() {
+        let digest_text =
+            crate::digest::render_digest("持仓拆股/分红", &corp_action_filtered, 0, fmt);
+        messages.push((true, digest_text));
     }
 
     // 8) 真推 Telegram
@@ -898,21 +903,21 @@ async fn live_portfolio_backtest_push() {
             payload["parse_mode"] = serde_json::Value::String("HTML".into());
             payload["disable_web_page_preview"] = serde_json::Value::Bool(true);
         }
-        let resp = client
+        let telegram_response = client
             .post(&url)
             .json(&payload)
             .send()
             .await
             .expect("telegram 发送请求失败");
-        let status = resp.status();
-        let body_resp = resp.text().await.unwrap_or_default();
+        let status = telegram_response.status();
+        let response_body = telegram_response.text().await.unwrap_or_default();
         println!(
             "[backtest push] html={use_html} status={status} body_len={}",
-            body_resp.len()
+            response_body.len()
         );
         assert!(
             status.is_success(),
-            "telegram API 返回非 2xx: {status} / {body_resp}"
+            "telegram API 返回非 2xx: {status} / {response_body}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
     }

@@ -54,59 +54,63 @@ pub(crate) struct PutGlobalDigestBody {
     pub config: GlobalDigestConfig,
 }
 
-fn validate_global_digest(cfg: &GlobalDigestConfig) -> Result<(), Response> {
-    if cfg.timezone.trim().is_empty() {
+fn validate_global_digest(global_digest_config: &GlobalDigestConfig) -> Result<(), Response> {
+    if global_digest_config.timezone.trim().is_empty() {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
             "global_digest.timezone 不能为空 (例 \"Asia/Shanghai\")",
         ));
     }
     use std::str::FromStr;
-    if chrono_tz::Tz::from_str(cfg.timezone.trim()).is_err() {
+    if chrono_tz::Tz::from_str(global_digest_config.timezone.trim()).is_err() {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
             format!(
                 "global_digest.timezone {:?} 不是合法 IANA 名;示例:Asia/Shanghai、America/New_York、Europe/London",
-                cfg.timezone
+                global_digest_config.timezone
             ),
         ));
     }
-    if cfg.final_pick_n == 0 {
+    if global_digest_config.final_pick_n == 0 {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
             "global_digest.final_pick_n 必须 > 0",
         ));
     }
-    if cfg.pass2_top_n < cfg.final_pick_n {
+    if global_digest_config.pass2_top_n < global_digest_config.final_pick_n {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
             format!(
                 "global_digest.pass2_top_n ({}) 必须 >= final_pick_n ({})",
-                cfg.pass2_top_n, cfg.final_pick_n
+                global_digest_config.pass2_top_n, global_digest_config.final_pick_n
             ),
         ));
     }
-    if cfg.lookback_hours == 0 {
+    if global_digest_config.lookback_hours == 0 {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
             "global_digest.lookback_hours 必须 > 0",
         ));
     }
-    if cfg.pass1_model.trim().is_empty() && cfg.pass1_llm.trim().is_empty() {
+    if global_digest_config.pass1_model.trim().is_empty()
+        && global_digest_config.pass1_llm.trim().is_empty()
+    {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
             "global_digest.pass1_model 或 pass1_llm 不能为空",
         ));
     }
-    if cfg.pass2_model.trim().is_empty() && cfg.pass2_llm.trim().is_empty() {
+    if global_digest_config.pass2_model.trim().is_empty()
+        && global_digest_config.pass2_llm.trim().is_empty()
+    {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
             "global_digest.pass2_model 或 pass2_llm 不能为空",
         ));
     }
-    if cfg.event_dedupe_enabled
-        && cfg.event_dedupe_model.trim().is_empty()
-        && cfg.event_dedupe_llm.trim().is_empty()
+    if global_digest_config.event_dedupe_enabled
+        && global_digest_config.event_dedupe_model.trim().is_empty()
+        && global_digest_config.event_dedupe_llm.trim().is_empty()
     {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
@@ -118,9 +122,9 @@ fn validate_global_digest(cfg: &GlobalDigestConfig) -> Result<(), Response> {
 
 /// GET /api/event-engine/global-digest
 pub(crate) async fn handle_get_global_digest(State(state): State<Arc<AppState>>) -> Response {
-    let cfg = &state.core.config.event_engine.global_digest;
+    let global_digest_config = &state.core.config.event_engine.global_digest;
     Json(json!({
-        "config": cfg,
+        "config": global_digest_config,
     }))
     .into_response()
 }
@@ -134,7 +138,7 @@ pub(crate) async fn handle_put_global_digest(
         return resp;
     }
     let yaml_value = match serde_yaml::to_value(&body.config) {
-        Ok(v) => v,
+        Ok(value) => value,
         Err(e) => {
             return json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -149,7 +153,7 @@ pub(crate) async fn handle_put_global_digest(
             value: yaml_value,
         }],
     ) {
-        Ok(r) => r,
+        Ok(result) => result,
         Err(e) => {
             return json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -230,7 +234,7 @@ fn build_rss_feed(body: UpsertRssFeedBody) -> Result<RssFeedConfig, Response> {
 
 fn write_rss_feeds(feeds: Vec<RssFeedConfig>) -> Result<Vec<RssFeedConfig>, Response> {
     let yaml_value = match serde_yaml::to_value(&feeds) {
-        Ok(v) => v,
+        Ok(value) => value,
         Err(e) => {
             return Err(json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -342,8 +346,8 @@ pub(crate) async fn handle_update_rss_feed(
 
 /// GET /api/event-engine/mainline-context?channel=&user_id=&channel_scope=
 ///
-/// 管理端查看任意 actor 的蒸馏投资主线与画像 inventory。和 public 端
-/// `/api/public/digest-context` 内容一致,但 actor 由 query 指定而非 session。
+/// 管理端查看任意 actor 的蒸馏投资主线与画像 inventory。主体字段对齐 public 端
+/// `/api/public/digest-context`,但 actor 由 query 指定而非 session。
 pub(crate) async fn handle_get_mainline_context(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<UserIdQuery>,
@@ -494,7 +498,7 @@ fn list_profile_summaries_admin(sandbox_root: &PathBuf) -> Vec<serde_json::Value
 /// POST /api/event-engine/mainline-distill?channel=&user_id=&channel_scope=
 ///
 /// 立即对指定 actor 跑一次投资主线蒸馏 —— admin 调试 / 用户主动刷新用。
-/// 平时由 web-api 启动的 cron 每 7 天自动跑,不需要走这条。
+/// 平时由 web-api 启动的 cron 每小时 tick,再按 staleness 策略决定是否自动跑。
 pub(crate) async fn handle_distill_mainline_now(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<UserIdQuery>,
@@ -635,15 +639,15 @@ mod tests {
             timezone: "Asia/Shanghai".into(),
             lookback_hours: 24,
             pass1_llm: String::new(),
-            pass1_model: "x-ai/grok-4.1-fast".into(),
+            pass1_model: "x-ai/grok-4.3".into(),
             pass2_llm: String::new(),
-            pass2_model: "x-ai/grok-4.1-fast".into(),
+            pass2_model: "x-ai/grok-4.3".into(),
             pass2_top_n: top_n,
             final_pick_n: pick_n,
             fetch_full_text: true,
             event_dedupe_enabled: true,
             event_dedupe_llm: String::new(),
-            event_dedupe_model: "x-ai/grok-4.1-fast".into(),
+            event_dedupe_model: "x-ai/grok-4.3".into(),
             mainline_distill_llm: String::new(),
             jina_api_key: None,
         }

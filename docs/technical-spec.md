@@ -247,7 +247,7 @@ This rule is already applied to:
 #### `multi-agent`
 
 - Runs a direct search stage from `agent.multi_agent.search`
-- Runs the answer stage through OpenCode ACP using `agent.multi_agent.answer` plus the OpenRouter key pool fallback when Hone manages that route
+- Runs the answer stage through OpenCode ACP using `agent.multi_agent.answer` plus the `llm.providers.openrouter.api_key/api_keys` pool fallback when Hone manages that route and no answer key is set
 
 ### 5.5 Tool Layer
 
@@ -347,18 +347,20 @@ Precedence is:
 
 ### 6.1 Storage Strategy
 
-The backend remains local-first and does not depend on an external database service. JSON files are still the default session runtime read path, while SQLite-backed session indexes/runtime reads are available through `storage.session_sqlite_db_path` and `storage.session_runtime_backend`; cron run history, Web auth sessions, and LLM audit records also use local SQLite tables.
+The backend still keeps core runtime state local-first today. JSON files are the default session runtime read path, while SQLite-backed session indexes/runtime reads are available through `storage.session_sqlite_db_path` and `storage.session_runtime_backend`; cron run history, Web auth sessions, and LLM audit records also use local SQLite tables. `cloud.postgres` now records the managed Postgres env contract for the migration target, but PG-backed repositories are not yet the default runtime storage path.
 
 Main directories come from `config.storage.*`:
 
-- `./data/sessions`
-- `./data/sessions.sqlite3`
-- `./data/portfolio`
-- `./data/cron_jobs`
-- `./data/gen_images`
-- `./data/notif_prefs`
-- `./data/conversation_quota`
-- `./data/llm_audit.sqlite3`
+- `sessions_dir`: `./data/sessions`
+- `session_sqlite_db_path`: `./data/sessions.sqlite3`
+- `portfolio_dir`: `./data/portfolio`
+- `cron_jobs_dir`: `./data/cron_jobs`
+- `gen_images_dir`: `./data/gen_images`
+- `notif_prefs_dir`: `./data/notif_prefs`
+- `conversation_quota_dir`: `./data/conversation_quota`
+- `llm_audit_db_path`: `./data/llm_audit.sqlite3`
+
+When `cloud.oss` is configured through runtime env, public Web uploads are stored in OSS under `cloud.oss.public_upload_prefix`, and `/api/public/image` / `/api/public/file` can proxy managed `oss://bucket/key` paths. Other generated files remain under `config.storage.*` until their cloud storage adapters land.
 
 ### 6.2 Session
 
@@ -370,9 +372,10 @@ Main directories come from `config.storage.*`:
 
 Session compression rules:
 
-- Trigger compression when the number of effective user / assistant messages exceeds 40
-- Ask the current LLM to generate a "watch list + conversation summary"
-- Keep one system summary plus the latest 4 messages after compression
+- Direct sessions trigger compression when the active message count exceeds 20 or active content exceeds about 80 KB
+- Group sessions use `group_context.compress_threshold_messages` and `group_context.compress_threshold_bytes` from `config.yaml`; defaults are 24 messages and 48 KB
+- Ask the configured auxiliary LLM route to generate a "watch list + conversation summary"
+- Keep one system summary plus the latest 6 messages for direct sessions; group sessions use `group_context.retain_recent_after_compress`, defaulting to 8
 
 ### 6.3 Portfolio
 
@@ -528,6 +531,7 @@ Key config sections:
 - `fmp`
 - `search`
 - `storage`
+- `cloud`
 - `logging`
 - `admins`
 - `web`
@@ -542,6 +546,12 @@ Implementation note:
 Important constraints:
 
 - LLM provider/profile credentials are config-owned. Prefer `llm.providers.<symbol>.api_key/api_keys`; legacy `llm.openrouter.*` remains readable only as a config fallback during migration.
+- Tavily web search currently consumes `search.api_keys` and `search.max_results`; `search.provider`, `search.search_depth`, and `search.topic` remain schema/compatibility fields and are not wired into requests until the search tool request builder is widened.
+- `cloud.enabled` is effectively enabled when set directly, when `HONE_CLOUD_ENABLED` is true, or when `cloud.postgres` / `cloud.oss` resolve enough env-backed credentials to be configured.
+- `cloud.postgres` and `cloud.oss` prefer env references such as `DATABASE_URL`, `HONE_POSTGRES_*`, and `HONE_OSS_*`; committed config should keep the actual credentials empty.
+- `cloud.strict_no_local_storage` / `HONE_CLOUD_STRICT_NO_LOCAL_STORAGE` fail startup while declared local storage dependencies remain, so they should stay false until managed replacements exist for all listed stores.
+- `logging.udp_port: null` uses the default local UDP log sink port `18118`; there is currently no config-level disable switch for UDP logging.
+- `logging.console` and `logging.file` are parsed compatibility fields; `setup_logging` currently installs the console formatter unconditionally and does not create a file appender from `logging.file`.
 - External-account capabilities must not enter the default CI gate
 - iMessage is treated as a local privileged capability by default
 - Admin tools are exposed by channel allowlist

@@ -118,8 +118,8 @@ nano_banana:
   base_url: "https://openrouter.ai/api/v1"
   model: "google/gemini-2.0-flash-exp"
   default_image_count: 3
-  # API key prefers llm.providers.openrouter.api_key/api_keys; legacy
-  # llm.openrouter.api_key/api_keys is still readable during migration.
+  # API key prefers the llm.providers.openrouter.api_key/api_keys pool; legacy single-key
+  # OpenRouter fields remain readable during migration.
   # Request timeout, max_tokens, temperature, HTTP referrer, and title currently use fixed client defaults.
   download_dir: "gen_images"
 
@@ -237,7 +237,7 @@ event_engine:
     quality_review:
       enabled: true
       llm: earnings_quality
-      model: x-ai/grok-4.1-fast
+      model: x-ai/grok-4.3
       max_review_tokens: 1800
       min_review_confidence: 0.65
       min_immediate_confidence: 0.9
@@ -254,8 +254,9 @@ event_engine:
   #   想关掉某 form 直接从这里删掉它,不需要改代码。空数组等于关闭整个 poller。
   # enrichment: 是否给 SEC filing 调 LLM 生成 ~200 字业务摘要(长期主线投资者
   #   视角:跳过 GAAP 数字,抓 backlog / 资本配置 / 风险因子新增)。
-  #   POC 实证 grok-4.1-fast 在 11 持仓 × 一年 ~70 条 filing 上 ≈ $0.82/年,质量、
-  #   成本、延迟均第一。失败 fallback 走原始 form/link body,不阻塞推送。
+  #   当前默认使用 x-ai/grok-4.3 替代已下线的 Grok 4.1 Fast；
+  #   实际质量、延迟和成本以 OpenRouter 当前模型为准。
+  #   失败 fallback 走原始 form/link body,不阻塞推送。
   sec_filings:
     forms:
       - 8-K
@@ -266,31 +267,32 @@ event_engine:
     enrichment:
       enabled: true
       llm: filing_summary
-      model: x-ai/grok-4.1-fast
+      model: x-ai/grok-4.3
       max_summary_tokens: 800
       # SEC EDGAR 强制要求 User-Agent 包含联系邮箱,否则会被限流或拒绝。
       # 部署方应改成自己的真实联系邮箱(SEC 不强制可达,但需有公司 / 产品名 + 邮箱)。
       user_agent: "honeclaw event-engine ops@honeclaw.local"
 
   # 全局 digest LLM 子配置 —— UnifiedDigestScheduler 在每个 slot 触发时把这一节
-  # 作为 GlobalNewsSource 的旋钮使用。触发完全由 per-actor `prefs.digest_slots` 驱动,
-  # 这里不再有调度时刻。
+  # 作为 global news path 的采集 / dedup / LLM 旋钮使用。
+  # 触发完全由 per-actor `prefs.digest_slots` 驱动,这里不再有调度时刻。
   # 候选池流水:
-  # - 候选池 = trusted-source High/Medium news + 临近 high macro_event(不挂 ticker 也算)
+  # - 候选池 = RSS news + FMP trusted news(允许 Low 进入预选);collector 再过滤
+  #   legal_ad / transcript / 已广播事件。Macro floor 不从这里采集,由 personalize 分类产生。
   # - Pass 1 (pass1_llm/pass1_model) 批量打分 + cluster + 一句话 takeaway
   # - Pass 2 (pass2_llm/pass2_model) 抓原文(若 fetch_full_text=true) + 精读 + 短评 + 排序
   # 输出经 unified scheduler per-actor fan-out,与 buffer/synth 候选合流后渲染。
-  # 默认 enabled=false。`enabled=false` 时 GlobalNewsSource 直接返回空池,
-  # unified pipeline 仍按 buffer/synth 候选推送 actor。
+  # 默认 enabled=false。`enabled=false` 时 unified scheduler 不装配 global curator,
+  # global news section 跳过;pipeline 仍按 buffer/synth 候选推送 actor。
   global_digest:
     enabled: false
     timezone: Asia/Shanghai
     lookback_hours: 24 # 候选池回看窗口
     # *_llm fields name llm.profiles entries; matching *_model fields are legacy OpenRouter fallbacks.
     pass1_llm: digest_fast
-    pass1_model: x-ai/grok-4.1-fast
+    pass1_model: x-ai/grok-4.3
     pass2_llm: digest_strong
-    pass2_model: x-ai/grok-4.1-fast # 价格 $0.20/$0.50 per M,2M context,带 reasoning
+    pass2_model: x-ai/grok-4.3 # 替代已下线的 Grok 4.1 Fast；实际价格 / context / reasoning 能力以 OpenRouter 当前模型为准
     pass2_top_n: 15 # Pass 1 排序后送 Pass 2 精读的候选数上限
     final_pick_n: 8 # 单次推送最终保留的条数上限
     fetch_full_text: true # Pass 2 是否 GET 原文 → html2text;失败 fallback FMP text
@@ -304,7 +306,7 @@ event_engine:
     event_dedupe_enabled: true
     event_dedupe_llm: digest_strong
     mainline_distill_llm: mainline_short
-    event_dedupe_model: x-ai/grok-4.1-fast
+    event_dedupe_model: x-ai/grok-4.3
 
   # Per-source 开关。每个字段对应 hone-event-engine 内一个 EventSource,
   # 设成 false 即不 spawn 该 source(最省 FMP 配额)。
@@ -315,7 +317,7 @@ event_engine:
     extended_hours: true # /v3/historical-chart/1min?extended=true → pre/post-market PriceAlert
     earnings_calendar: true # /v3/earning_calendar → EarningsUpcoming
     corp_action: true # 拆股 / 分红日历 → Split / Dividend
-    sec_filings: true # SEC filings per-ticker → SecFiling(form whitelist 见上方 sec_filings.forms)
+    sec_filings: true # SEC filings per-ticker → SecFiling(forms come from sec_filings.forms above)
     macro_calendar: true # /v3/economic_calendar → MacroEvent
     analyst_grade: true # 按 watch pool 拉 → AnalystGrade
     earnings_surprise: true # 按 watch pool 拉 → EarningsReleased
@@ -348,7 +350,7 @@ event_engine:
   # legacy OpenRouter fallback when that profile is empty. Keep CI/tests mocked;
   # use real API only for manual live-quality checks.
   news_classifier_llm: news_classifier
-  news_classifier_model: "x-ai/grok-4.1-fast"
+  news_classifier_model: "x-ai/grok-4.3"
   # Global default phrase for judging whether uncertain-source news is important.
   # Per-actor notif_prefs news_importance_prompt overrides this value.
   news_importance_prompt: "公司或潜在影响公司长期逻辑和宏观叙事的重大事件"
@@ -358,7 +360,7 @@ llm:
   default_profile: main
   auxiliary_profile: aux
   openrouter:
-    # Legacy config-only fallback. Prefer llm.providers.openrouter.api_key/api_keys.
+    # Legacy config-only fallback. Prefer the llm.providers.openrouter.api_key/api_keys pool.
     model: "moonshotai/kimi-k2.5"
     # Legacy auxiliary fallback model for heartbeats / session compression / other background checks.
     # This example uses llm.auxiliary_profile instead.
@@ -368,6 +370,8 @@ llm:
     max_tokens: 32768
   providers:
     openrouter:
+      # OpenRouter-specialized OpenAI-compatible provider kind.
+      # Use openai_compatible for other OpenAI-compatible endpoints.
       kind: openrouter
       base_url: "https://openrouter.ai/api/v1"
       api_key: ""
@@ -387,13 +391,13 @@ llm:
         max_tokens: 4096
     news_classifier:
       provider: openrouter
-      model: "x-ai/grok-4.1-fast"
+      model: "x-ai/grok-4.3"
       params:
         max_tokens: 64
         temperature: 0
     filing_summary:
       provider: openrouter
-      model: "x-ai/grok-4.1-fast"
+      model: "x-ai/grok-4.3"
       params:
         max_tokens: 800
         temperature: 0.2
@@ -401,7 +405,7 @@ llm:
           type: json_object
     earnings_quality:
       provider: openrouter
-      model: "x-ai/grok-4.1-fast"
+      model: "x-ai/grok-4.3"
       params:
         max_tokens: 1800
         temperature: 0.2
@@ -409,13 +413,13 @@ llm:
           type: json_object
     digest_fast:
       provider: openrouter
-      model: "x-ai/grok-4.1-fast"
+      model: "x-ai/grok-4.3"
       params:
         max_tokens: 1200
         temperature: 0.2
     digest_strong:
       provider: openrouter
-      model: "x-ai/grok-4.1-fast"
+      model: "x-ai/grok-4.3"
       params:
         max_tokens: 1600
         temperature: 0.2
@@ -423,7 +427,7 @@ llm:
           effort: low
     mainline_short:
       provider: openrouter
-      model: "x-ai/grok-4.1-fast"
+      model: "x-ai/grok-4.3"
       params:
         max_tokens: 1200
         temperature: 0.2
@@ -459,11 +463,64 @@ storage:
   gen_images_dir: "./data/gen_images"
   notif_prefs_dir: "./data/notif_prefs"
 
+cloud:
+  # Storage runtime mode:
+  # - local: default; keep JSON/SQLite/std::fs local even if PG/OSS env exists.
+  # - cloud: require PG + OSS and use them for cloud runtime surfaces.
+  # - auto: development compatibility; env presence can enable cloud_runtime capability.
+  # HONE_CLOUD_MODE overrides this field.
+  mode: "local"
+  # Legacy cloud.enabled compatibility flag used only in cloud.mode=auto.
+  # HONE_CLOUD_ENABLED=true also only has effect in auto mode.
+  # Keep real PG / OSS credentials in the process environment or local .env only.
+  enabled: false
+  # Set cloud.strict_no_local_storage true only after all storage backends have PG / OSS implementations.
+  # HONE_CLOUD_STRICT_NO_LOCAL_STORAGE=true has the same startup-fail effect.
+  strict_no_local_storage: false
+  postgres:
+    database_url: ""
+    database_url_env: "DATABASE_URL"
+    host: ""
+    host_env: "HONE_POSTGRES_HOST"
+    port: 0
+    port_env: "HONE_POSTGRES_PORT"
+    user: ""
+    user_env: "HONE_POSTGRES_USER"
+    password: ""
+    password_env: "HONE_POSTGRES_PASSWORD"
+    database: ""
+    database_env: "HONE_POSTGRES_DATABASE"
+    sslmode: "disable"
+    # Optional local proxy, for example socks5://127.0.0.1:1082.
+    proxy: ""
+    proxy_env: "HONE_POSTGRES_PROXY"
+  oss:
+    # aliyun_oss | r2 | s3
+    provider: "aliyun_oss"
+    provider_env: "HONE_OSS_PROVIDER"
+    access_key_id: ""
+    access_key_id_env: "HONE_OSS_ACCESS_KEY_ID"
+    access_key_secret: ""
+    access_key_secret_env: "HONE_OSS_ACCESS_KEY_SECRET"
+    bucket: ""
+    bucket_env: "HONE_OSS_BUCKET"
+    endpoint: ""
+    endpoint_env: "HONE_OSS_ENDPOINT"
+    region: ""
+    region_env: "HONE_OSS_REGION"
+    public_upload_prefix: "public-uploads"
+    # Optional reqwest proxy, for example socks5://127.0.0.1:1082.
+    proxy: ""
+    proxy_env: "HONE_OSS_PROXY"
+
 logging:
   level: "INFO"
+  # Parsed for compatibility, but setup_logging currently always installs the
+  # console formatter and does not create a file appender from logging.file.
   console: true
   file: "./data/logs/hone.log"
-  # Optional UDP log sink port; null disables it.
+  # Local UDP log sink port. null uses the runtime default port 18118; there is
+  # currently no config-level disable switch.
   udp_port: null
 
 admins:
@@ -512,8 +569,9 @@ web:
   # - HONE_ALIYUN_SMS_SIGN_NAME (default: 速通互联验证码)
   # - HONE_ALIYUN_SMS_TEMPLATE_CODE (default: 100001)
   # - HONE_ALIYUN_SMS_TEMPLATE_PARAM (default: {"code":"##code##","min":"5"})
-  # - HONE_PUBLIC_SECURE_COOKIE=true/false may force the public session cookie Secure flag.
-  # Existing admin-created Web invite users are treated as the public login whitelist.
+  # - HONE_PUBLIC_SECURE_COOKIE=true/1/yes or false/0/no may force the public
+  #   session cookie Secure flag; invalid values keep Secure=true.
+  # Existing admin-created Web invite users are treated as the public-login invite list.
   # Optional Aliyun Captcha 2.0 guard for public SMS sends is configured by env:
   # - ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET (same AccessKey env as SMS)
   # - HONE_ALIYUN_CAPTCHA_PREFIX / HONE_ALIYUN_CAPTCHA_SCENE_ID (required to enable)
@@ -605,7 +663,8 @@ agent:
   opencode:
     command: "opencode"
     args: [ "acp" ]
-    # Leave empty to inherit your local opencode global config (~/.config/opencode/opencode.json/jsonc)
+    # Leave empty to inherit your local opencode global config
+    # (~/.config/opencode/opencode.json or opencode.jsonc)
     model: ""
     # Optional; only used together with a Hone-side model override
     variant: ""
@@ -614,7 +673,7 @@ agent:
     # Optional Hone-side API key override; leave empty to inherit local opencode auth/provider config
     api_key: ""
   hone_cloud:
-    # Default user-facing service; runtime appends /api/public/v1/chat/completions when needed.
+    # Hosted service route seeded by this sample; runtime appends /api/public/v1/chat/completions when needed.
     base_url: "https://hone-claw.com"
     # Per-user Hone Cloud API key. Contact bm@hone-claw.com for an invite and key.
     api_key: ""
@@ -623,8 +682,10 @@ agent:
   multi_agent:
     # Two-stage runner: direct OpenAI-compatible search, then opencode ACP answer.
     # Search uses agent.multi_agent.search.api_key, with legacy llm.auxiliary.api_key
-    # as the only fallback when the search key is empty.
-    # The answer stage can inherit llm.providers.openrouter.api_key/api_keys when answer.api_key is empty.
+    # as the only fallback when the search API key is empty.
+    # The answer stage uses agent.multi_agent.answer.api_key when set; otherwise it
+    # can inherit llm.providers.openrouter.api_key/api_keys, with the legacy
+    # single-key OpenRouter fields still readable as migration fallbacks.
     search:
       base_url: "https://api.minimaxi.com/v1"
       api_key: ""
@@ -638,6 +699,10 @@ agent:
       max_tool_calls: 3
 
 search:
+  # Tavily is the only runtime search provider today. search.provider /
+  # search.search_depth / search.topic stay in the config schema for compatibility
+  # but are not wired into requests yet; the current web_search tool reads
+  # search.api_keys and search.max_results only.
   provider: tavily
   # Tavily API key pool with failover support
   api_keys:

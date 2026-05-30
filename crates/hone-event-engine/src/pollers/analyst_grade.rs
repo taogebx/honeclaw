@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
 
-use crate::event::{EventKind, MarketEvent, Severity};
+use crate::event::{EventKind, MarketEvent, Severity, is_user_visible_url};
 use crate::fmp::FmpClient;
 use crate::source::{EventSource, SourceSchedule};
 use crate::subscription::SharedRegistry;
@@ -49,16 +49,16 @@ impl AnalystGradePoller {
     /// 按指定 ticker 列表拉评级变更。`EventSource::poll` 调它,从 registry 取
     /// watch pool 后传入;测试可以直接用任意 ticker 列表调本函数(不需要 registry)。
     pub async fn fetch(&self, tickers: &[String]) -> anyhow::Result<Vec<MarketEvent>> {
-        let mut out = Vec::new();
+        let mut events = Vec::new();
         let cutoff = Utc::now() - chrono::Duration::days(self.lookback_days);
         for t in tickers {
             let path = format!("/v4/upgrades-downgrades?symbol={t}");
             match self.client.get_json(&path).await {
-                Ok(v) => out.extend(events_from_grades(&v, t, cutoff)),
+                Ok(response_json) => events.extend(events_from_grades(&response_json, t, cutoff)),
                 Err(e) => tracing::warn!("analyst grade fetch failed for {t}: {e:#}"),
             }
         }
-        Ok(out)
+        Ok(events)
     }
 }
 
@@ -126,6 +126,7 @@ fn events_from_grades(raw: &Value, ticker: &str, cutoff: DateTime<Utc>) -> Vec<M
             let url = item
                 .get("newsURL")
                 .and_then(|v| v.as_str())
+                .filter(|url| is_user_visible_url(url))
                 .map(|s| s.to_string());
             Some(MarketEvent {
                 id: format!("grade:{ticker}:{published}:{grading_company}"),
@@ -346,7 +347,7 @@ fn target_change_from_news_title(title: &str) -> Option<TargetChange> {
 
 fn dollar_amounts(title: &str) -> Vec<String> {
     let chars: Vec<char> = title.chars().collect();
-    let mut out = Vec::new();
+    let mut amounts = Vec::new();
     let mut i = 0usize;
     while i < chars.len() {
         if chars[i] != '$' {
@@ -359,10 +360,10 @@ fn dollar_amounts(title: &str) -> Vec<String> {
             i += 1;
         }
         if i > start + 1 {
-            out.push(chars[start..i].iter().collect());
+            amounts.push(chars[start..i].iter().collect());
         }
     }
-    out
+    amounts
 }
 
 fn parse_fmp_datetime(s: &str) -> Option<DateTime<Utc>> {
@@ -485,6 +486,30 @@ mod tests {
     }
 
     #[test]
+    fn thefly_ajax_news_url_is_hidden_but_kept_in_payload() {
+        let published = Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
+        let raw = serde_json::json!([{
+            "symbol": "AMD",
+            "publishedDate": published,
+            "newsURL": "https://www.thefly.com/ajax/news_get.php?id=4357265",
+            "newsTitle": "AMD price target raised to $300 from $250 at Example",
+            "newGrade": "Buy",
+            "previousGrade": "Buy",
+            "gradingCompany": "Example",
+            "action": "hold",
+        }]);
+
+        let events = events_from_grades(&raw, "AMD", Utc::now() - chrono::Duration::days(7));
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].url, None);
+        assert_eq!(
+            events[0].payload.get("newsURL").and_then(|v| v.as_str()),
+            Some("https://www.thefly.com/ajax/news_get.php?id=4357265")
+        );
+    }
+
+    #[test]
     fn cutoff_filters_stale_rows() {
         let raw = serde_json::json!([sample_grade("downgrade", 30)]);
         let events = events_from_grades(&raw, "AAPL", Utc::now() - chrono::Duration::days(3));
@@ -504,13 +529,13 @@ mod tests {
         use crate::subscription::SubscriptionRegistry;
 
         let key = std::env::var("HONE_FMP_API_KEY").expect("需要 HONE_FMP_API_KEY");
-        let cfg = hone_core::config::FmpConfig {
+        let fmp_config = hone_core::config::FmpConfig {
             api_key: key,
             api_keys: vec![],
             base_url: "https://financialmodelingprep.com/api".into(),
             timeout: 30,
         };
-        let client = FmpClient::from_config(&cfg);
+        let client = FmpClient::from_config(&fmp_config);
         let registry = Arc::new(SharedRegistry::from_registry(SubscriptionRegistry::new()));
         let poller = AnalystGradePoller::new(
             client,
@@ -523,8 +548,11 @@ mod tests {
             .await
             .expect("FMP poll failed");
         println!("analyst grade events pulled: {}", events.len());
-        for ev in events.iter().take(10) {
-            println!("  [{:?}] {} · {}", ev.severity, ev.title, ev.summary);
+        for event in events.iter().take(10) {
+            println!(
+                "  [{:?}] {} · {}",
+                event.severity, event.title, event.summary
+            );
         }
     }
 }

@@ -10,12 +10,13 @@ PROMPT="Reply with exactly one line: ${EXPECTED_TOKEN}"
 
 if ! command -v codex >/dev/null 2>&1; then
   echo "[FAIL] codex command not found in PATH" >&2
+  echo "Install Codex CLI or add it to PATH, then rerun: bash tests/regression/manual/test_codex_cli_exec.sh" >&2
   exit 1
 fi
 
-OUT_FILE="$(mktemp /tmp/hone_codex_test_out.XXXXXX)"
-STDOUT_FILE="$(mktemp /tmp/hone_codex_test_stdout.XXXXXX)"
-STDERR_FILE="$(mktemp /tmp/hone_codex_test_stderr.XXXXXX)"
+OUT_FILE="$(mktemp "${TMPDIR:-/tmp}/hone_codex_test_out.XXXXXX")"
+STDOUT_FILE="$(mktemp "${TMPDIR:-/tmp}/hone_codex_test_stdout.XXXXXX")"
+STDERR_FILE="$(mktemp "${TMPDIR:-/tmp}/hone_codex_test_stderr.XXXXXX")"
 trap 'rm -f "$OUT_FILE" "$STDOUT_FILE" "$STDERR_FILE"' EXIT
 
 if ! printf '%s\n' "$PROMPT" | codex exec --skip-git-repo-check -o "$OUT_FILE" - >"$STDOUT_FILE" 2>"$STDERR_FILE"; then

@@ -105,11 +105,11 @@ pub async fn distill_tick(
     now: DateTime<Utc>,
     _interval_hours: i64,
 ) -> (u32, u32) {
-    let mut triggered = 0u32;
-    let mut skipped = 0u32;
+    let mut triggered_count = 0u32;
+    let mut skipped_count = 0u32;
     for (actor, portfolio) in portfolio_storage.list_all() {
         if !actor.is_direct() {
-            skipped += 1;
+            skipped_count += 1;
             continue;
         }
         let holdings: Vec<String> = portfolio
@@ -118,14 +118,14 @@ pub async fn distill_tick(
             .map(|h| h.symbol.clone())
             .collect();
         if holdings.is_empty() {
-            skipped += 1;
+            skipped_count += 1;
             continue;
         }
         let stored_prefs = prefs.load(&actor);
         let reason = match should_trigger(&stored_prefs, &holdings, now) {
             Some(r) => r,
             None => {
-                skipped += 1;
+                skipped_count += 1;
                 continue;
             }
         };
@@ -137,7 +137,7 @@ pub async fn distill_tick(
         );
         match distill_and_persist_one(distiller, prefs, sandbox_base, &actor, &holdings).await {
             Ok(updated) => {
-                triggered += 1;
+                triggered_count += 1;
                 info!(
                     actor = %actor_dbg(&actor),
                     reason = reason.as_str(),
@@ -155,15 +155,15 @@ pub async fn distill_tick(
             }
         }
     }
-    (triggered, skipped)
+    (triggered_count, skipped_count)
 }
 
-fn actor_dbg(a: &ActorIdentity) -> String {
+fn actor_dbg(actor: &ActorIdentity) -> String {
     format!(
         "{}:{}:{}",
-        a.channel,
-        a.channel_scope.clone().unwrap_or_default(),
-        a.user_id
+        actor.channel,
+        actor.channel_scope.clone().unwrap_or_default(),
+        actor.user_id
     )
 }
 
@@ -172,7 +172,7 @@ fn actor_dbg(a: &ActorIdentity) -> String {
 /// 每小时 tick 一次,实际触发由 `distill_tick` 里的 staleness 判断决定。
 ///
 /// `task_runs_dir` 不为 `None` 时每次 tick 末尾会写一行
-/// `data/runtime/task_runs.YYYY-MM-DD.jsonl`(Stage 3 任务观测,跟 heartbeat 同级)。
+/// `data/runtime/task_runs.YYYY-MM-DD.jsonl`,跟 heartbeat 同级。
 pub async fn distill_cron_loop(
     distiller: Arc<dyn MainlineDistiller>,
     prefs: Arc<dyn PrefsProvider>,
@@ -260,7 +260,7 @@ mod tests {
         .unwrap();
     }
 
-    fn make_portfolio(actor: ActorIdentity, symbols: Vec<&str>) -> Portfolio {
+    fn portfolio_fixture(actor: ActorIdentity, symbols: Vec<&str>) -> Portfolio {
         Portfolio {
             actor: Some(actor.clone()),
             user_id: actor.user_id.clone(),
@@ -315,7 +315,10 @@ mod tests {
         let portfolios = PortfolioStorage::new(dir.path().join("portfolios"));
         let actor = ActorIdentity::new("telegram", "u1", None::<&str>).unwrap();
         portfolios
-            .save(&actor, &make_portfolio(actor.clone(), vec!["MU", "RKLB"]))
+            .save(
+                &actor,
+                &portfolio_fixture(actor.clone(), vec!["MU", "RKLB"]),
+            )
             .unwrap();
         let sandbox_base = dir.path().join("sandboxes");
         write_profile(&sandbox_base, &actor, "MU");
@@ -346,7 +349,7 @@ mod tests {
         let portfolios = PortfolioStorage::new(dir.path().join("portfolios"));
         let actor = ActorIdentity::new("telegram", "u1", None::<&str>).unwrap();
         portfolios
-            .save(&actor, &make_portfolio(actor.clone(), vec!["MU"]))
+            .save(&actor, &portfolio_fixture(actor.clone(), vec!["MU"]))
             .unwrap();
         let sandbox_base = dir.path().join("sandboxes");
         write_profile(&sandbox_base, &actor, "MU");
@@ -382,7 +385,10 @@ mod tests {
         let portfolios = PortfolioStorage::new(dir.path().join("portfolios"));
         let actor = ActorIdentity::new("telegram", "u1", None::<&str>).unwrap();
         portfolios
-            .save(&actor, &make_portfolio(actor.clone(), vec!["MU", "RKLB"]))
+            .save(
+                &actor,
+                &portfolio_fixture(actor.clone(), vec!["MU", "RKLB"]),
+            )
             .unwrap();
         let sandbox_base = dir.path().join("sandboxes");
         write_profile(&sandbox_base, &actor, "MU");
@@ -419,7 +425,10 @@ mod tests {
         let portfolios = PortfolioStorage::new(dir.path().join("portfolios"));
         let actor = ActorIdentity::new("telegram", "u1", None::<&str>).unwrap();
         portfolios
-            .save(&actor, &make_portfolio(actor.clone(), vec!["MU", "AAPL"]))
+            .save(
+                &actor,
+                &portfolio_fixture(actor.clone(), vec!["MU", "AAPL"]),
+            )
             .unwrap();
         let sandbox_base = dir.path().join("sandboxes");
         write_profile(&sandbox_base, &actor, "MU");
@@ -457,7 +466,7 @@ mod tests {
         let portfolios = PortfolioStorage::new(dir.path().join("portfolios"));
         let actor = ActorIdentity::new("telegram", "u1", None::<&str>).unwrap();
         portfolios
-            .save(&actor, &make_portfolio(actor.clone(), vec!["MU"]))
+            .save(&actor, &portfolio_fixture(actor.clone(), vec!["MU"]))
             .unwrap();
         let sandbox_base = dir.path().join("sandboxes");
         write_profile(&sandbox_base, &actor, "MU");
@@ -542,7 +551,7 @@ mod tests {
         let portfolios = PortfolioStorage::new(dir.path().join("portfolios"));
         let actor = ActorIdentity::new("telegram", "u1", None::<&str>).unwrap();
         portfolios
-            .save(&actor, &make_portfolio(actor.clone(), vec!["MU"]))
+            .save(&actor, &portfolio_fixture(actor.clone(), vec!["MU"]))
             .unwrap();
         let sandbox_base = dir.path().join("sandboxes");
         write_profile(&sandbox_base, &actor, "MU");

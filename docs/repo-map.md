@@ -1,6 +1,6 @@
 # Repo Map
 
-Last updated: 2026-05-15
+Last updated: 2026-05-27
 
 ## Purpose
 
@@ -26,7 +26,7 @@ Last updated: 2026-05-15
   - `open-source-prep.md`: allowlist / denylist and cleanup checklist before copying to a public repo
 - `crates/`
   - `hone-core`: foundational capabilities such as the config façade / submodules, logging, errors, and agent context
-  - `hone-llm`: model provider abstraction, OpenRouter integration, and generic OpenAI-compatible provider plumbing used by the desktop `multi-agent` search stage
+  - `hone-llm`: model provider abstraction, profile resolver, OpenRouter integration, and generic OpenAI-compatible provider plumbing used by configured LLM routes such as auxiliary/background tasks and selected `multi-agent` stages
   - `hone-tools`: tool traits, registry, and built-in tools; the skill subsystem centers on `src/skill_runtime.rs`, `skill_tool`, the local `discover_skills` index, the `skill_registry` enabled/disabled override layer, and the compatibility `load_skill` shim. `skill_tool` still parses structured script `stdout` and validates local image artifact roots/extensions before exposing them to the model.
   - `hone-integrations`: external integrations such as X, Feishu, and image generation
   - `hone-scheduler`: scheduled task orchestration
@@ -39,12 +39,12 @@ Last updated: 2026-05-15
 - `memory/`
   - Local storage abstractions for sessions, identity quotas, portfolios, cron jobs, and LLM audit logs
   - `memory/src/company_profile/{mod,types,markdown,storage,transfer,tests}.rs` now splits company portraits into stable public types, Markdown/template parsing, actor-scoped storage CRUD, zip transfer helpers, and colocated regression tests; portraits still live under `company_profiles/<profile_id>/profile.md` plus append-only `events/*.md`, and both storage reads and transfer/import paths tolerate legacy plain Markdown files without frontmatter by synthesizing minimal metadata from titles, filenames, file mtimes, and bundle manifest timestamps
-  - `memory/src/web_auth.rs` keeps web invite/whitelist users, hashed per-user Hone Cloud API keys, and public-login cookie sessions in the shared SQLite DB; one active phone number maps to one stable `channel=web` actor, with legacy invite codes retained for admin compatibility
-  - `memory/src/session.rs` currently stores versioned session JSON (v3) and explicitly persists `summary`, legacy `runtime.prompt.frozen_time_beijing`, recoverable `tool` result messages, and the session ownership field `session_identity`; current prompt assembly no longer uses that legacy frozen timestamp as the displayed "当前时间". When a SQLite index is configured, including `storage.session_runtime_backend=sqlite` even with shadow writes disabled, `SessionStorage` performs a best-effort startup JSON -> SQLite backfill so old disabled-shadow windows do not leave `sessions.sqlite3` permanently stale.
+  - `memory/src/web_auth.rs` keeps web invite-list users, hashed per-user Hone Cloud API keys, and public-login cookie sessions in the shared SQLite DB; one active phone number maps to one stable `channel=web` actor, with legacy invite codes retained for admin compatibility
+  - `memory/src/session.rs` stores versioned sessions and explicitly persists `summary`, legacy `runtime.prompt.frozen_time_beijing`, recoverable `tool` result messages, and the session ownership field `session_identity`; current prompt assembly no longer uses that legacy frozen timestamp as the displayed "当前时间". Local mode stores session JSON and can mirror / read through SQLite. `cloud.mode=cloud` uses PG `cloud_sessions` as the session hot path and does not write local session JSON.
   - `memory/src/session_sqlite.rs` hosts the SQLite-backed session persistence used by both shadow backfill and runtime reads/writes when `storage.session_runtime_backend=sqlite`
   - `memory/src/cron_job/mod.rs` keeps cron definitions in per-actor JSON files, mirrors cron execution history into the shared SQLite DB so task detail can query per-run records, and exposes a typed channel-target directory aggregated from cron definitions plus recent execution history
-  - `memory/src/quota.rs` stores `success_count` / `in_flight` in JSON files by `ActorIdentity` and by Beijing date
-- Event-engine Feishu direct delivery is assembled by `crates/hone-web-api/src/lib.rs` plus `crates/hone-event-engine/src/sinks/feishu.rs`: when building the event-engine sink, Web API reads the cron-backed channel-target directory and passes unambiguous per-actor email/mobile targets into the Feishu sink so digest/card sends can resolve current-app `open_id` instead of reusing stale portfolio actor IDs. Ambiguous or non-contact targets are intentionally ignored to avoid cross-user delivery.
+  - `memory/src/quota.rs` stores `success_count` / `in_flight` by `ActorIdentity` and Beijing date; local mode uses JSON files, while `cloud.mode=cloud` uses PG `conversation_quota`
+- Event-engine Feishu direct delivery is assembled by `crates/hone-web-api/src/lib.rs` plus `crates/hone-event-engine/src/sinks/feishu.rs`: when building the event-engine sink, Web API reads both the cron-backed channel-target directory and direct Feishu session metadata, then passes unambiguous per-actor email/mobile targets into the Feishu sink so digest/card sends can resolve current-app `open_id` instead of reusing stale portfolio actor IDs. Ambiguous or non-contact targets are intentionally ignored to avoid cross-user delivery.
 - `bins/`
   - `hone-console-page`: Web console backend, static asset hosting, and API
   - `hone-cli`: local REPL
@@ -54,6 +54,9 @@ Last updated: 2026-05-15
 - `config.yaml` / `data/runtime/`
   - `config.yaml` is the canonical user-writable config; dev uses the repo root copy, and packaged installs seed one under the user config dir
   - LLM provider credentials are config-owned: prefer `llm.providers.<symbol>.api_key/api_keys`, with legacy `llm.openrouter.*` readable only as config fallback; runtime LLM paths do not read parent process API-key env vars
+  - `cloud.mode=local|cloud|auto` controls storage authority. `local` is the default and preserves JSON / SQLite / filesystem behavior even if PG / object-store env vars are present; `cloud` requires PG + object storage and exposes strict cloud status; `auto` keeps the older development behavior where env presence can enable cloud capabilities. `cloud.postgres` / `cloud.oss` define env-backed PG / object-store settings, including `HONE_POSTGRES_PROXY`, `HONE_OSS_PROVIDER=aliyun_oss|r2|s3`, and `HONE_OSS_PROXY`.
+  - `crates/hone-core/src/cloud_runtime.rs` centralizes runtime role parsing, PG schema / health / document-index helpers, PG session and conversation quota runtime helpers, actor-scoped object keys, Aliyun OSS / S3-compatible R2 signing, object-store proxy support, `.env` loading, and the cloud-mode local durable dependency report. `hone-cli cloud doctor` and `/api/meta` use this helper layer instead of inferring authority from config presence alone.
+  - `bins/hone-cli/src/cloud.rs` provides `hone-cli cloud doctor`, `hone-cli cloud migrate`, and `hone-cli cloud object-bench`. The migrator dry-runs local `data/`, uploads recognized durable files to object storage under `users/{actor_storage_key}/documents/...`, indexes them in PG `cloud_documents`, imports legacy `sessions/*.json` rows into PG `cloud_sessions` with `--session-only` or as part of apply, and imports legacy `conversation_quota/*.json` rows into PG with `--quota-only` or as part of apply; SQLite files are counted but skipped until structured table import is implemented.
   - `data/runtime/effective-config.yaml` is the generated runtime snapshot for processes that want a materialized runtime config file
   - legacy `data/runtime/config_runtime.yaml` and sibling `.overrides.yaml` should not be recreated
 - Actor sandbox research docs live under a repo-external `agent-sandboxes/<channel>/<scope__user>/company_profiles/<profile_id>/profile.md` plus `events/*.md`; this actor-local directory is the source of truth for company portraits and long-term fundamental tracking. Portfolio JSON must stay in `storage.portfolio_dir`, never inside actor sandboxes.
@@ -71,7 +74,7 @@ Last updated: 2026-05-15
   - Global skill enabled/disabled override layer for registered skills
 - `tests/regression/`
   - `ci/`: CI-safe
-  - `manual/`: manual regression tests that depend on an external CLI or account
+  - `manual/`: manual regression tests that depend on an external CLI, external account, or local machine state; live wrappers that call real services must stay opt-in behind explicit `RUN_*_LIVE_SMOKES=1` gates
 
 ## Key Entry Points
 
@@ -130,15 +133,15 @@ Last updated: 2026-05-15
     - `SessionIdentity`: which history this message should be written into (group-chat shared sessions are controlled by it)
 5. `hone-channels::execution` builds the concrete execution plan for both persistent conversations and transient tasks: prompt audit, tool registry, runner selection, and actor-sandbox-backed `AgentRunnerRequest`
 6. `hone-channels::runners` executes the chosen runtime based on `agent.runner` and maps provider / CLI events back into unified session events. ACP runners now include a local `hone-mcp` server so Hone built-in tools are exposed as MCP tools to the underlying agent. Channel runners default to a repo-external actor sandbox.
-7. `hone-channels::AgentSession::run()` stores parseable tool-call results returned by the runner into the session for future cross-turn recovery; `hone-channels::outbound` and each channel adapter consume the unified events and finish placeholder / reasoning / chunked / streaming responses according to platform capability。当前本地图表等媒体仍通过最终 assistant 文本里的 inline `file://` marker 传递：Web 保留 marker 并内联渲染，Feishu / Telegram / Discord 则按顺序把它转成真实图片消息。
+7. `hone-channels::AgentSession::run()` stores parseable tool-call results returned by the runner into the session for future cross-turn recovery; `hone-channels::outbound` and each channel adapter consume the unified events and finish placeholder / reasoning / chunked / streaming responses according to platform capability。当前本地图表等媒体仍通过最终 assistant 文本里的 inline `file://` marker 传递：Web 保留 marker 并内联渲染，Feishu / Telegram / Discord 则按顺序把它转成真实图片消息。Cloud mode can upload generated images to OSS and return `oss://...` markers from the finalizer, but session persistence itself is not yet fully PG-backed. Web direct 成功回复还会把本轮新生成、且 final 正文提到文件名的 actor sandbox 文件追加为 `[附件: ...]` marker，供 public history 转成可下载附件 metadata。
 8. `hone-tools` provides data, skills, search, scheduled-task, and other capabilities
    - Skill disclosure is now two-phase: the model first sees a compact listing, and full `SKILL.md` bodies are only expanded into the turn after `skill_tool(...)` or a user slash skill is invoked
    - Invoked skill prompts are persisted in session metadata so context restoration can re-inject them after compression instead of relying on historic tool results
    - 用户可见的研究记忆相关 skill 目前只保留 `company_portrait`
-9. `memory` reads and writes local sessions, quotas, portfolios, and cron jobs
-  - `memory/src/quota.rs` keeps a daily successful-reply quota for each user-initiated conversation; the runtime limit now comes from `agent.daily_conversation_limit`, and `0` means unlimited
+9. `memory` reads and writes sessions, quotas, portfolios, and cron jobs
+  - `memory/src/quota.rs` keeps a daily successful-reply quota for each user-initiated conversation; local mode writes JSON, cloud mode writes PG, the runtime limit comes from `agent.daily_conversation_limit`, and `0` means unlimited
     - `memory/src/llm_audit.rs` uses SQLite to record LLM call audit logs archived by `ActorIdentity`
-    - Session persistence is controlled by `storage.session_runtime_backend`; `json` reads from local files, `sqlite` reads from `storage.session_sqlite_db_path`, and JSON can still be dual-written as a rollback mirror through `storage.session_sqlite_shadow_write_enabled`
+    - Session persistence is controlled by `storage.session_runtime_backend` in local mode; `json` reads from local files, `sqlite` reads from `storage.session_sqlite_db_path`, and JSON can still be dual-written as a rollback mirror through `storage.session_sqlite_shadow_write_enabled`. In cloud mode, `SessionStorage::new_cloud` uses PG `cloud_sessions` directly.
     - Session compaction is now boundary-based: compacted sessions write a `Conversation compacted` marker plus a compact summary message, and the active context window is restored from the most recent boundary forward
     - `codex_acp` and `opencode_acp` session turns now persist restorable assistant/tool transcript structure locally as `assistant(tool_calls)` + `tool` messages; both runners inject the restored transcript into each fresh ACP session prompt instead of relying on remote `session/load` replay, because replay can mix historical prompt/tool updates into the current stream
     - `AgentSession::run()` now also supports explicit `/compact` requests, reusing the same compaction pipeline without charging user conversation quota or persisting the slash command as a normal transcript message
@@ -174,7 +177,7 @@ Last updated: 2026-05-15
 - Frontend backend runtime lives in `packages/app/src/context/backend.tsx` and `packages/app/src/lib/backend.ts`
 - Assistant message parser for inline local images: `packages/app/src/lib/messages.ts`
 - `hone-console-page` `/api/meta` handles version and capability negotiation
-- `hone-console-page` admin app only serves `/api/*` and console SPA on the admin port; the public app serves the public SPA routes (`/`, `/roadmap`, `/chat`, `/me`, `/portfolio`, `/terms`, `/privacy`) plus `/api/public/*` on the public port. `/chat` uses SMS-verified whitelist web users. `/api/public/auth/sms/send` and `/api/public/auth/sms/login` use Aliyun SMS verification while the admin invite table remains the whitelist source. `/api/public/v1/chat/completions` is the API-key-authenticated OpenAI-compatible public chat endpoint used by Hone Cloud clients.
+- `hone-console-page` admin app only serves `/api/*` and console SPA on the admin port; the public app serves the public SPA routes (`/`, `/roadmap`, `/blog`, `/blog/:slug`, `/chat`, `/me`, `/portfolio`, `/terms`, `/privacy`) plus `/api/public/*` on the public port. `/blog` is a static bilingual content surface backed by `packages/app/src/lib/public-blog.ts`, Markdown files under `packages/app/src/content/blog/`, and public images under `packages/app/public/blog/`; Cloudflare Pages metadata for Blog article sharing is injected by `packages/app/public/_worker.js` for crawlers that do not execute the SPA. `/chat` uses SMS-verified invite-list web users and renders non-image attachment cards through `/api/public/file` so generated CSV/XLSX/PDF-style artifacts can be opened from mobile or desktop. `/api/public/auth/sms/send` and `/api/public/auth/sms/login` use Aliyun SMS verification while the admin invite table remains the invite-list admission source. `/api/public/v1/chat/completions` is the API-key-authenticated OpenAI-compatible public chat endpoint used by Hone Cloud clients.
 - `hone-console-page` `/api/skills*` serves the skill management surface: registered listing, detail view, enable/disable mutation, and reset
 - `hone-console-page` `/api/company-profiles*` now serves actor-space listing, portrait detail, full deletion, and actor-scoped portrait bundle transfer (`export`, `import/preview`, `import/apply`) for actor-local portrait docs; portrait creation and section/event updates still rely on runner-native file operations inside the actor sandbox rather than dedicated mutation APIs
 - `packages/app/src/context/company-profiles.tsx` now acts as the memory-page transfer orchestrator: it merges portrait actor spaces with recent session users into one target-selector model, supports manual target entry for first-time imports, runs bundle preview/apply, keeps post-import highlights plus optional pre-import backup blobs, and auto-selects the first company in the current target space so the right panel does not fall back to a false empty state
@@ -184,7 +187,7 @@ Last updated: 2026-05-15
 - Route entrypoint: `packages/app/src/app.tsx`
 - Pages: `packages/app/src/pages/`
   - admin surface keeps `/start` and the management console routes
-  - public surface exposes `/`, `/roadmap`, `/chat`, `/me`, `/portfolio`, `/terms`, and `/privacy`; `/chat` and account views use the phone + SMS-code whitelist login experience
+  - public surface exposes `/`, `/roadmap`, `/blog`, `/blog/:slug`, `/chat`, `/me`, `/portfolio`, `/terms`, and `/privacy`; `/blog` is static bilingual long-form content, while `/chat` and account views use the phone + SMS-code invite-list login experience
 - Page-level pure state/data helpers: `packages/app/src/pages/{settings,users,notifications,task-health}-model.ts`
 - Domain state: `packages/app/src/context/`
 - Composite components: `packages/app/src/components/`
@@ -242,7 +245,7 @@ Last updated: 2026-05-15
 - `ChatMode` only means "this message came from a direct chat or a group chat"; do not treat it as the source of truth for session ownership. Use `SessionIdentity` for shared group context.
 - Telegram / Discord / Feishu now gate direct-vs-group ingress through per-channel `chat_scope` (`DM_ONLY | GROUPCHAT_ONLY | ALL`), while group chats still share one model: untriggered text is buffered in a short pretrigger window, and only an explicit `@bot` / reply-to-bot trigger flushes that buffered text into the shared group session before `AgentSession::run()`.
 - Group explicit triggers now expose a busy lifecycle: if one group session is still processing, the next explicit trigger gets an immediate “wait for the previous message” reply and its text is re-buffered into the pretrigger window instead of starting a second concurrent run.
-- Scripts in `tests/regression/manual/` depend on local environment state or external accounts and must not be promoted to default CI gates
+- Scripts in `tests/regression/manual/` depend on local environment state or external accounts and must not be promoted to default CI gates; wrappers that call real services, send messages, or consume provider quota should skip by default unless their `RUN_*_LIVE_SMOKES=1` gate is set
 - iMessage capabilities depend on local macOS permissions and cannot be assumed to work in CI or on non-macOS environments
 - Desktop packaging depends on a local Rust + Tauri toolchain; if `cargo` or `bun` is missing, only static changes are possible, not a full compile verification
 - Default repo-wide Rust verification should keep using `cargo check --workspace --all-targets --exclude hone-desktop`; desktop packaging is a separate validation lane.

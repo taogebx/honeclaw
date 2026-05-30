@@ -10,11 +10,16 @@ import type {
   LlmProfileSettings,
   MetaInfo,
   TavilySettings,
+  WebInviteInfo,
 } from "@/lib/types"
 
 export type LanguageDraft = "zh" | "en"
 export type SettingsTabKey = "agent" | "data" | "notify" | "channel" | "invite"
 export type LlmProfileBindingKey = keyof Omit<LlmProfileSettings, "profiles">
+export type ApiKeyDraftState<T extends { apiKeys: string[] }> = {
+  settings: T
+  visibility: boolean[]
+}
 export type InviteAction =
   | "disable"
   | "enable"
@@ -123,7 +128,7 @@ function defaultLlmProfileSettings(): LlmProfileSettings {
       {
         id: "news_classifier",
         provider: "openrouter",
-        model: "x-ai/grok-4.1-fast",
+        model: "x-ai/grok-4.3",
         maxTokens: 64,
         temperature: 0,
         responseFormatJson: false,
@@ -131,7 +136,7 @@ function defaultLlmProfileSettings(): LlmProfileSettings {
       {
         id: "filing_summary",
         provider: "openrouter",
-        model: "x-ai/grok-4.1-fast",
+        model: "x-ai/grok-4.3",
         maxTokens: 800,
         temperature: 0.2,
         responseFormatJson: true,
@@ -139,7 +144,7 @@ function defaultLlmProfileSettings(): LlmProfileSettings {
       {
         id: "earnings_quality",
         provider: "openrouter",
-        model: "x-ai/grok-4.1-fast",
+        model: "x-ai/grok-4.3",
         maxTokens: 1800,
         temperature: 0.2,
         responseFormatJson: true,
@@ -147,7 +152,7 @@ function defaultLlmProfileSettings(): LlmProfileSettings {
       {
         id: "digest_fast",
         provider: "openrouter",
-        model: "x-ai/grok-4.1-fast",
+        model: "x-ai/grok-4.3",
         maxTokens: 1200,
         temperature: 0.2,
         responseFormatJson: false,
@@ -155,7 +160,7 @@ function defaultLlmProfileSettings(): LlmProfileSettings {
       {
         id: "digest_strong",
         provider: "openrouter",
-        model: "x-ai/grok-4.1-fast",
+        model: "x-ai/grok-4.3",
         maxTokens: 1600,
         temperature: 0.2,
         reasoningEffort: "low",
@@ -164,7 +169,7 @@ function defaultLlmProfileSettings(): LlmProfileSettings {
       {
         id: "mainline_short",
         provider: "openrouter",
-        model: "x-ai/grok-4.1-fast",
+        model: "x-ai/grok-4.3",
         maxTokens: 1200,
         temperature: 0.2,
         responseFormatJson: false,
@@ -267,6 +272,22 @@ export function isInviteActionRunning(
   return currentKey === inviteActionKey(userId, action)
 }
 
+export function prependWebInvite(
+  current: WebInviteInfo[] | undefined,
+  created: WebInviteInfo,
+): WebInviteInfo[] {
+  return [created, ...(current ?? [])]
+}
+
+export function replaceWebInvite(
+  current: WebInviteInfo[] | undefined,
+  next: WebInviteInfo,
+): WebInviteInfo[] {
+  return (current ?? []).map((invite) =>
+    invite.user_id === next.user_id ? next : invite,
+  )
+}
+
 export function mergeHoneCloudDraft(
   current: AgentSettings,
   patch: Partial<HoneCloudSettings>,
@@ -351,6 +372,16 @@ export function initialApiKeyVisibility(apiKeys?: string[]): boolean[] {
   return normalizeApiKeys(apiKeys).map(() => false)
 }
 
+export function toApiKeyDraftState<T extends { apiKeys: string[] }>(
+  settings: T,
+): ApiKeyDraftState<T> {
+  const apiKeys = normalizeApiKeys(settings.apiKeys)
+  return {
+    settings: { ...settings, apiKeys },
+    visibility: initialApiKeyVisibility(apiKeys),
+  }
+}
+
 export function updateApiKeyList<T extends { apiKeys: string[] }>(
   currentSettings: T,
   targetIndex: number,
@@ -401,6 +432,49 @@ export function removeApiKeyVisibility(
 
 export function appendApiKeyVisibility(currentVisibility: boolean[]): boolean[] {
   return [...currentVisibility, false]
+}
+
+export function updateApiKeyDraftState<T extends { apiKeys: string[] }>(
+  currentState: ApiKeyDraftState<T>,
+  targetIndex: number,
+  apiKey: string,
+): ApiKeyDraftState<T> {
+  return {
+    ...currentState,
+    settings: updateApiKeyList(currentState.settings, targetIndex, apiKey),
+  }
+}
+
+export function appendApiKeyDraftState<T extends { apiKeys: string[] }>(
+  currentState: ApiKeyDraftState<T>,
+): ApiKeyDraftState<T> {
+  return {
+    settings: appendApiKey(currentState.settings),
+    visibility: appendApiKeyVisibility(currentState.visibility),
+  }
+}
+
+export function removeApiKeyDraftState<T extends { apiKeys: string[] }>(
+  currentState: ApiKeyDraftState<T>,
+  targetIndex: number,
+): ApiKeyDraftState<T> {
+  return {
+    settings: removeApiKey(currentState.settings, targetIndex),
+    visibility: removeApiKeyVisibility(currentState.visibility, targetIndex),
+  }
+}
+
+export function toggleApiKeyDraftState<T extends { apiKeys: string[] }>(
+  currentState: ApiKeyDraftState<T>,
+  targetIndex: number,
+): ApiKeyDraftState<T> {
+  return {
+    ...currentState,
+    visibility: toggleApiKeyVisibility(
+      currentState.visibility,
+      targetIndex,
+    ),
+  }
 }
 
 export function toChannelDraft(

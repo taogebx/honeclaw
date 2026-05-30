@@ -2,14 +2,27 @@ import { describe, expect, it } from "bun:test"
 
 import {
   DEFAULT_NOTIFICATION_PREFS,
+  addDigestSlot,
+  digestSlotsOverlapQuiet,
+  enableQuietHours,
   isValidDigestSlotTime,
+  priceHighOverrideFromInput,
+  quietHoursHasEmptyWindow,
+  removeDigestSlot,
   sameActor,
   sortDigestSlots,
+  setQuietHourEnd,
+  setQuietHourStart,
   timeFallsInQuiet,
+  timezonePrefFromInput,
+  toggleAllowedKind,
+  toggleBlockedKind,
+  toggleImmediateKind,
+  toggleQuietExemptKind,
   toggleTag,
 } from "./notification-preferences-model"
 
-function slotIds(slots: Array<{ id: string }>): string[] {
+function digestSlotIds(slots: Array<{ id: string }>): string[] {
   return slots.map((slot) => slot.id)
 }
 
@@ -61,15 +74,17 @@ describe("notification-preferences-model", () => {
   })
 
   it("compares actors by channel, user, and optional scope", () => {
-    const base = { channel: "discord", user_id: "u1" }
-    expect(sameActor(base, { channel: "discord", user_id: "u1" })).toBe(true)
+    const discordActor = { channel: "discord", user_id: "u1" }
+    expect(sameActor(discordActor, { channel: "discord", user_id: "u1" })).toBe(
+      true,
+    )
     expect(
       sameActor(
-        { ...base, channel_scope: "dm" },
-        { ...base, channel_scope: "group" },
+        { ...discordActor, channel_scope: "dm" },
+        { ...discordActor, channel_scope: "group" },
       ),
     ).toBe(false)
-    expect(sameActor(undefined, base)).toBe(false)
+    expect(sameActor(undefined, discordActor)).toBe(false)
   })
 
   it("toggles tags immutably", () => {
@@ -85,11 +100,111 @@ describe("notification-preferences-model", () => {
     expect(isValidDigestSlotTime("24:00")).toBe(false)
     expect(isValidDigestSlotTime("8:00")).toBe(false)
 
-    const slots = [
+    const digestSlots = [
       { id: "late", time: "23:00" },
       { id: "early", time: "08:00" },
     ]
-    expect(slotIds(sortDigestSlots(slots))).toEqual(["early", "late"])
-    expect(slotIds(slots)).toEqual(["late", "early"])
+    expect(digestSlotIds(sortDigestSlots(digestSlots))).toEqual([
+      "early",
+      "late",
+    ])
+    expect(digestSlotIds(digestSlots)).toEqual(["late", "early"])
+  })
+
+  it("keeps nullable tag preferences normalized while toggling", () => {
+    const withAllowed = toggleAllowedKind(DEFAULT_NOTIFICATION_PREFS, "filing")
+    expect(withAllowed.allow_kinds).toEqual(["filing"])
+    expect(toggleAllowedKind(withAllowed, "filing").allow_kinds).toBeNull()
+
+    expect(
+      toggleBlockedKind(DEFAULT_NOTIFICATION_PREFS, "price").blocked_kinds,
+    ).toEqual(["price"])
+
+    const withImmediate = toggleImmediateKind(
+      { ...DEFAULT_NOTIFICATION_PREFS, immediate_kinds: ["news"] },
+      "news",
+    )
+    expect(withImmediate.immediate_kinds).toBeNull()
+  })
+
+  it("updates digest slots without mutating or duplicating times", () => {
+    const prefsWithLateSlot = addDigestSlot(DEFAULT_NOTIFICATION_PREFS, "23:00")
+    const prefsWithSortedSlots = addDigestSlot(prefsWithLateSlot, "08:00")
+    expect(digestSlotIds(prefsWithSortedSlots.digest_slots ?? [])).toEqual([
+      "slot_1",
+      "slot_0",
+    ])
+    expect(
+      (addDigestSlot(prefsWithSortedSlots, "08:00").digest_slots ?? []).length,
+    ).toBe(2)
+    expect(
+      removeDigestSlot(prefsWithSortedSlots, "slot_1").digest_slots,
+    ).toEqual([{ id: "slot_0", time: "23:00" }])
+    expect(DEFAULT_NOTIFICATION_PREFS.digest_slots).toBeNull()
+  })
+
+  it("updates quiet hours through reusable state transforms", () => {
+    const prefsWithQuietHours = enableQuietHours(DEFAULT_NOTIFICATION_PREFS)
+    expect(prefsWithQuietHours.quiet_hours).toEqual({
+      from: "00:00",
+      to: "08:00",
+      exempt_kinds: [],
+    })
+
+    const prefsWithMovedQuietStart = setQuietHourStart(
+      prefsWithQuietHours,
+      "22:00",
+    )
+    expect(prefsWithMovedQuietStart.quiet_hours?.from).toBe("22:00")
+    expect(prefsWithMovedQuietStart.quiet_hours?.to).toBe("08:00")
+
+    const prefsWithMovedQuietEnd = setQuietHourEnd(
+      DEFAULT_NOTIFICATION_PREFS,
+      "07:30",
+    )
+    expect(prefsWithMovedQuietEnd.quiet_hours).toEqual({
+      from: "00:00",
+      to: "07:30",
+      exempt_kinds: [],
+    })
+
+    const prefsWithExemptKind = toggleQuietExemptKind(
+      prefsWithMovedQuietStart,
+      "earnings",
+    )
+    expect(prefsWithExemptKind.quiet_hours?.exempt_kinds).toEqual(["earnings"])
+    expect(toggleQuietExemptKind(DEFAULT_NOTIFICATION_PREFS, "earnings")).toBe(
+      DEFAULT_NOTIFICATION_PREFS,
+    )
+  })
+
+  it("summarizes quiet-hour derived warning state", () => {
+    const prefs = {
+      ...DEFAULT_NOTIFICATION_PREFS,
+      digest_slots: [{ id: "late", time: "23:30" }],
+      quiet_hours: { from: "22:00", to: "08:00", exempt_kinds: [] },
+    }
+    expect(digestSlotsOverlapQuiet(prefs)).toBe(true)
+    expect(
+      digestSlotsOverlapQuiet({
+        ...prefs,
+        digest_slots: [{ id: "midday", time: "12:00" }],
+      }),
+    ).toBe(false)
+    expect(quietHoursHasEmptyWindow(prefs)).toBe(false)
+    expect(
+      quietHoursHasEmptyWindow({
+        ...prefs,
+        quiet_hours: { from: "08:00", to: "08:00", exempt_kinds: [] },
+      }),
+    ).toBe(true)
+  })
+
+  it("normalizes scalar preference inputs", () => {
+    expect(timezonePrefFromInput(" Asia/Shanghai ")).toBe("Asia/Shanghai")
+    expect(timezonePrefFromInput("   ")).toBeNull()
+    expect(priceHighOverrideFromInput("", 3)).toBeNull()
+    expect(priceHighOverrideFromInput("4.5", null)).toBe(4.5)
+    expect(priceHighOverrideFromInput("bad", 3)).toBe(3)
   })
 })

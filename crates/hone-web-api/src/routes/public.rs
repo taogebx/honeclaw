@@ -46,7 +46,7 @@ const SESSION_TTL_DAYS_SHORT: i64 = hone_memory::SESSION_TTL_DAYS_SHORT;
 
 /// 当前生效的协议版本。改动 /terms /privacy 文本时手动 bump,
 /// 并让已登录用户重新勾选接受(可后续增强)。
-pub(crate) const TOS_VERSION: &str = "2.0";
+pub(crate) const TOS_VERSION: &str = "2.1";
 
 pub(crate) async fn handle_captcha_config() -> Response {
     Json(crate::aliyun_captcha::AliyunCaptchaConfig::public_config_from_env()).into_response()
@@ -145,7 +145,7 @@ pub(crate) async fn handle_sms_send_code(
         Err(error) => {
             return crate::routes::json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("查询白名单失败: {error}"),
+                format!("查询邀请资格失败: {error}"),
             );
         }
     };
@@ -153,7 +153,7 @@ pub(crate) async fn handle_sms_send_code(
         let _ = state.public_auth_limiter.record_failure(&phone_key);
         return crate::routes::json_error(
             StatusCode::FORBIDDEN,
-            "目前是邀请制，请联系 bm@hone-claw.com 加入白名单",
+            "目前是邀请制，请联系 bm@hone-claw.com 加入邀请名单",
         );
     }
 
@@ -213,13 +213,13 @@ pub(crate) async fn handle_sms_login(
             let _ = state.public_auth_limiter.record_failure(&phone_key);
             return crate::routes::json_error(
                 StatusCode::FORBIDDEN,
-                "目前是邀请制，请联系 bm@hone-claw.com 加入白名单",
+                "目前是邀请制，请联系 bm@hone-claw.com 加入邀请名单",
             );
         }
         Err(error) => {
             return crate::routes::json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("查询白名单失败: {error}"),
+                format!("查询邀请资格失败: {error}"),
             );
         }
     };
@@ -454,9 +454,15 @@ pub(crate) async fn handle_chat(
     }
 
     let user_upload_root = public_upload_dir(&state, &user.user_id);
+    let oss = crate::cloud_oss::OssClient::from_config(&state.core.config.cloud.oss);
     let mut validated_paths = Vec::with_capacity(attachments.len());
     for attachment in &attachments {
-        match validate_public_upload_path(&user_upload_root, &attachment.path) {
+        match validate_public_upload_path(
+            &user_upload_root,
+            oss.as_ref(),
+            &user.user_id,
+            &attachment.path,
+        ) {
             Ok(path) => validated_paths.push(path),
             Err(response) => return response,
         }
@@ -531,8 +537,11 @@ pub(crate) async fn handle_upload(
 
     let upload_root = public_upload_dir(&state, &user.user_id);
     let day = hone_core::beijing_now().format("%Y-%m-%d").to_string();
+    let oss = crate::cloud_oss::OssClient::from_config(&state.core.config.cloud.oss);
     let target_dir = upload_root.join(&day);
-    if let Err(error) = std::fs::create_dir_all(&target_dir) {
+    if oss.is_none()
+        && let Err(error) = std::fs::create_dir_all(&target_dir)
+    {
         return crate::routes::json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("创建上传目录失败: {error}"),
@@ -590,16 +599,32 @@ pub(crate) async fn handle_upload(
 
         let safe_name = sanitize_attachment_name(&original_name);
         let stored_name = format!("{}-{}", Uuid::new_v4().simple(), safe_name);
-        let final_path = target_dir.join(&stored_name);
-        if let Err(error) = std::fs::write(&final_path, &bytes) {
-            return crate::routes::json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("写入附件失败: {error}"),
-            );
-        }
+        let stored_path = if let Some(oss) = oss.as_ref() {
+            let key = oss.public_upload_key(&user.user_id, &day, &stored_name);
+            if let Err(error) = oss
+                .put_object(
+                    &key,
+                    bytes.to_vec(),
+                    content_type_for_attachment(&original_name),
+                )
+                .await
+            {
+                return crate::routes::json_error(StatusCode::BAD_GATEWAY, error);
+            }
+            oss.object_uri(&key)
+        } else {
+            let final_path = target_dir.join(&stored_name);
+            if let Err(error) = std::fs::write(&final_path, &bytes) {
+                return crate::routes::json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("写入附件失败: {error}"),
+                );
+            }
+            final_path.to_string_lossy().to_string()
+        };
 
         stored.push(PublicUploadedAttachment {
-            path: final_path.to_string_lossy().to_string(),
+            path: stored_path,
             name: safe_name,
             kind: classify_attachment_kind(&original_name),
             size: bytes.len() as u64,
@@ -613,20 +638,21 @@ pub(crate) async fn handle_upload(
     Json(json!({ "attachments": stored })).into_response()
 }
 
-/// Per-user upload root. Lives under the configured sessions dir so the existing
-/// `/api/image` and `/api/file` proxy whitelist already covers reads.
+/// Per-user upload root. Lives under the configured sessions dir so the shared
+/// file proxy roots cover `/api/image`, `/api/file`, and their `/api/public/*`
+/// wrappers.
 fn public_upload_dir(state: &AppState, user_id: &str) -> PathBuf {
     let base = PathBuf::from(&state.core.config.storage.sessions_dir);
     base.join("public-uploads").join(sanitize_user_id(user_id))
 }
 
-fn compose_message_with_attachments(message: &str, attachment_paths: &[PathBuf]) -> String {
+fn compose_message_with_attachments(message: &str, attachment_paths: &[String]) -> String {
     if attachment_paths.is_empty() {
         return message.to_string();
     }
     let att = attachment_paths
         .iter()
-        .map(|path| format!("[附件: {}]", path.to_string_lossy()))
+        .map(|path| format!("[附件: {path}]"))
         .collect::<Vec<_>>()
         .join("\n");
     if message.is_empty() {
@@ -638,7 +664,18 @@ fn compose_message_with_attachments(message: &str, attachment_paths: &[PathBuf])
 
 /// Only accept attachment paths that sit inside this user's upload root, so the
 /// chat endpoint can't be used to reference arbitrary files on disk.
-fn validate_public_upload_path(upload_root: &Path, raw_path: &str) -> Result<PathBuf, Response> {
+fn validate_public_upload_path(
+    upload_root: &Path,
+    oss: Option<&crate::cloud_oss::OssClient>,
+    user_id: &str,
+    raw_path: &str,
+) -> Result<String, Response> {
+    if let Some(oss) = oss
+        && oss.is_public_upload_uri_for_user(raw_path, user_id)
+    {
+        return Ok(raw_path.trim().to_string());
+    }
+
     let cleaned = raw_path.trim().strip_prefix("file://").unwrap_or(raw_path);
     if cleaned.is_empty() {
         return Err(crate::routes::json_error(
@@ -662,7 +699,7 @@ fn validate_public_upload_path(upload_root: &Path, raw_path: &str) -> Result<Pat
             "附件不存在",
         ));
     }
-    Ok(canonical_target)
+    Ok(canonical_target.to_string_lossy().to_string())
 }
 
 fn sanitize_user_id(raw: &str) -> String {
@@ -717,6 +754,23 @@ fn classify_attachment_kind(name: &str) -> String {
         "pdf".to_string()
     } else {
         "file".to_string()
+    }
+}
+
+fn content_type_for_attachment(name: &str) -> &'static str {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".png") {
+        "image/png"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".pdf") {
+        "application/pdf"
+    } else {
+        "application/octet-stream"
     }
 }
 
@@ -1331,6 +1385,39 @@ mod tests {
             !cookie2.contains("Secure"),
             "env=false should suppress Secure"
         );
+    }
+
+    #[test]
+    fn env_force_secure_cookie_accepts_aliases_and_fails_closed() {
+        let _guard = crate::test_env_lock().lock().unwrap();
+        let _env = EnvVarGuard::set(SECURE_COOKIE_ENV, "yes");
+        let headers = HeaderMap::new();
+
+        let yes_cookie = build_session_cookie("tok", &headers, WEB_SESSION_MAX_AGE_LONG_SECS)
+            .to_str()
+            .expect("cookie")
+            .to_string();
+        assert!(yes_cookie.contains("Secure"));
+
+        unsafe { std::env::set_var(SECURE_COOKIE_ENV, "0") };
+        let mut https_headers = HeaderMap::new();
+        https_headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://chat.example.com"),
+        );
+        let zero_cookie =
+            build_session_cookie("tok", &https_headers, WEB_SESSION_MAX_AGE_LONG_SECS)
+                .to_str()
+                .expect("cookie")
+                .to_string();
+        assert!(!zero_cookie.contains("Secure"));
+
+        unsafe { std::env::set_var(SECURE_COOKIE_ENV, "maybe") };
+        let invalid_cookie = build_session_cookie("tok", &headers, WEB_SESSION_MAX_AGE_LONG_SECS)
+            .to_str()
+            .expect("cookie")
+            .to_string();
+        assert!(invalid_cookie.contains("Secure"));
     }
 
     #[test]

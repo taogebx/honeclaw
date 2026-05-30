@@ -1,8 +1,6 @@
 import "@/index.css"
-import { DialogProvider } from "@hone-financial/ui/context/dialog"
 import { MarkedProvider } from "@hone-financial/ui/context/marked"
 import { ToastProvider } from "@hone-financial/ui/context/toast"
-import { ThemeProvider } from "@hone-financial/ui/theme"
 import { MetaProvider, Title } from "@solidjs/meta"
 import { Navigate, Route, Router } from "@solidjs/router"
 import { ErrorBoundary, Suspense, createEffect, createSignal, lazy, type ParentProps } from "solid-js"
@@ -21,6 +19,8 @@ const HomePage = lazy(() => import("@/pages/home"))
 const PublicChatPage = lazy(() => import("@/pages/chat"))
 const PublicSiteHomePage = lazy(() => import("@/pages/public-home"))
 const PublicSiteRoadmapPage = lazy(() => import("@/pages/public-roadmap"))
+const PublicBlogPage = lazy(() => import("@/pages/public-blog"))
+const PublicBlogPostPage = lazy(() => import("@/pages/public-blog-post"))
 const PublicSiteMePage = lazy(() => import("@/pages/public-me"))
 const PublicSiteTermsPage = lazy(() => import("@/pages/public-terms"))
 const PublicSitePrivacyPage = lazy(() => import("@/pages/public-privacy"))
@@ -64,31 +64,25 @@ function AdminProviders(props: ParentProps) {
   return (
     <MetaProvider>
       <Title>Hone Console</Title>
-      <ThemeProvider>
-        <DialogProvider>
-          <MarkedProvider>
-            <ToastProvider>
-              <BackendProvider>
-                <ConsoleProvider>
-                  <SessionsProvider>
-                    <SkillsProvider>
-                      <TasksProvider>
-                        <PortfolioProvider>
-                          <ResearchProvider>
-                            <CompanyProfilesProvider>
-                              {props.children}
-                            </CompanyProfilesProvider>
-                          </ResearchProvider>
-                        </PortfolioProvider>
-                      </TasksProvider>
-                    </SkillsProvider>
-                  </SessionsProvider>
-                </ConsoleProvider>
-              </BackendProvider>
-            </ToastProvider>
-          </MarkedProvider>
-        </DialogProvider>
-      </ThemeProvider>
+      <MarkedProvider>
+        <ToastProvider>
+          <BackendProvider>
+            <ConsoleProvider>
+              <SessionsProvider>
+                <SkillsProvider>
+                  <TasksProvider>
+                    <PortfolioProvider>
+                      <ResearchProvider>
+                        <CompanyProfilesProvider>{props.children}</CompanyProfilesProvider>
+                      </ResearchProvider>
+                    </PortfolioProvider>
+                  </TasksProvider>
+                </SkillsProvider>
+              </SessionsProvider>
+            </ConsoleProvider>
+          </BackendProvider>
+        </ToastProvider>
+      </MarkedProvider>
     </MetaProvider>
   )
 }
@@ -97,11 +91,9 @@ function PublicProviders(props: ParentProps) {
   return (
     <MetaProvider>
       <Title>Hone Chat</Title>
-      <ThemeProvider>
-        <MarkedProvider>
-          <ToastProvider>{props.children}</ToastProvider>
-        </MarkedProvider>
-      </ThemeProvider>
+      <MarkedProvider>
+        <ToastProvider>{props.children}</ToastProvider>
+      </MarkedProvider>
     </MetaProvider>
   )
 }
@@ -114,6 +106,8 @@ function PublicSurface() {
           <Router>
             <Route path="/" component={PublicSiteHomePage} />
             <Route path="/roadmap" component={PublicSiteRoadmapPage} />
+            <Route path="/blog" component={PublicBlogPage} />
+            <Route path="/blog/:slug" component={PublicBlogPostPage} />
             <Route path="/me" component={PublicSiteMePage} />
             <Route path="/portfolio" component={PublicSitePortfolioPage} />
             <Route path="/terms" component={PublicSiteTermsPage} />

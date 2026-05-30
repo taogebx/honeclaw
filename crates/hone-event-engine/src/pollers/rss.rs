@@ -75,32 +75,32 @@ impl EventSource for RssNewsPoller {
     }
 
     async fn poll(&self) -> anyhow::Result<Vec<MarketEvent>> {
-        let resp = self
+        let response = self
             .http
             .get(&self.url)
             .send()
             .await
             .with_context(|| format!("rss fetch {}", self.url))?;
-        let status = resp.status();
+        let status = response.status();
         if !status.is_success() {
             anyhow::bail!("rss {} returned HTTP {status}", self.url);
         }
-        let body = resp
+        let body = response
             .text()
             .await
             .with_context(|| format!("rss body decode {}", self.url))?;
         let items = parse_rss_2(&body)?;
         let now = Utc::now();
-        let out = items
+        let events = items
             .into_iter()
-            .filter_map(|it| self.into_event(it, now))
+            .filter_map(|it| self.build_event(it, now))
             .collect();
-        Ok(out)
+        Ok(events)
     }
 }
 
 impl RssNewsPoller {
-    fn into_event(&self, item: RssItem, now: DateTime<Utc>) -> Option<MarketEvent> {
+    fn build_event(&self, item: RssItem, now: DateTime<Utc>) -> Option<MarketEvent> {
         if item.link.trim().is_empty() || item.title.trim().is_empty() {
             return None;
         }
@@ -158,16 +158,16 @@ const RSS_TITLE_ENTITY_ALIASES: &[(&str, &[&str])] = &[
 ];
 
 fn infer_symbols_from_rss_title(title: &str) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut symbols = Vec::new();
     for (symbol, aliases) in RSS_TITLE_ENTITY_ALIASES {
         if aliases
             .iter()
             .any(|alias| contains_ascii_phrase_ci(title, alias))
         {
-            out.push((*symbol).to_string());
+            symbols.push((*symbol).to_string());
         }
     }
-    out
+    symbols
 }
 
 fn contains_ascii_phrase_ci(text: &str, phrase: &str) -> bool {
@@ -378,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_rss_skips_items_with_empty_title_or_link_via_into_event() {
+    fn parse_rss_skips_items_with_empty_title_or_link_via_build_event() {
         let xml = r#"<?xml version="1.0"?><rss><channel>
             <item><title></title><link>http://x</link></item>
             <item><title>good</title><link></link></item>
@@ -389,7 +389,7 @@ mod tests {
         let poller = RssNewsPoller::new("test", "http://feed", Duration::from_secs(60));
         let events: Vec<_> = parsed
             .into_iter()
-            .filter_map(|it| poller.into_event(it, Utc::now()))
+            .filter_map(|it| poller.build_event(it, Utc::now()))
             .collect();
         // 只有第三条 title+link 都非空
         assert_eq!(events.len(), 1);
@@ -397,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn into_event_skips_bloomberg_video_recaps() {
+    fn build_event_skips_bloomberg_video_recaps() {
         let poller = RssNewsPoller::new(
             "bloomberg_markets",
             "https://feeds.bloomberg.com/markets/news.rss",
@@ -413,11 +413,11 @@ mod tests {
             summary: "A broad market video recap.".into(),
         };
 
-        assert!(poller.into_event(item, Utc::now()).is_none());
+        assert!(poller.build_event(item, Utc::now()).is_none());
     }
 
     #[test]
-    fn into_event_produces_fmp_shaped_payload() {
+    fn build_event_produces_fmp_shaped_payload() {
         let poller = RssNewsPoller::new(
             "spacenews",
             "https://spacenews.com/feed/",
@@ -429,23 +429,24 @@ mod tests {
             pub_date: Some(Utc::now()),
             summary: "Space Force contract for satellite crosslink demo".into(),
         };
-        let ev = poller.into_event(item, Utc::now()).unwrap();
-        assert_eq!(ev.source, "rss:spacenews");
-        assert_eq!(ev.severity, Severity::High);
-        assert!(matches!(ev.kind, EventKind::NewsCritical));
-        assert!(ev.id.starts_with("news:https://spacenews.com/"));
+        let event = poller.build_event(item, Utc::now()).unwrap();
+        assert_eq!(event.source, "rss:spacenews");
+        assert_eq!(event.severity, Severity::High);
+        assert!(matches!(event.kind, EventKind::NewsCritical));
+        assert!(event.id.starts_with("news:https://spacenews.com/"));
         // payload 模拟 FMP shape
         assert_eq!(
-            ev.payload.get("source_class").and_then(|v| v.as_str()),
+            event.payload.get("source_class").and_then(|v| v.as_str()),
             Some("trusted")
         );
         assert_eq!(
-            ev.payload
+            event
+                .payload
                 .get("legal_ad_template")
                 .and_then(|v| v.as_bool()),
             Some(false)
         );
-        let fmp = ev.payload.get("fmp").unwrap();
+        let fmp = event.payload.get("fmp").unwrap();
         assert_eq!(fmp.get("site").and_then(|v| v.as_str()), Some("spacenews"));
         assert!(
             fmp.get("text")
@@ -456,14 +457,14 @@ mod tests {
     }
 
     #[test]
-    fn into_event_links_conservative_title_entities_to_symbols() {
+    fn build_event_links_conservative_title_entities_to_symbols() {
         let poller = RssNewsPoller::new(
             "bloomberg_markets",
             "https://feeds.bloomberg.com/markets/news.rss",
             Duration::from_secs(3600),
         );
         let event = poller
-            .into_event(
+            .build_event(
                 RssItem {
                     title: "CoreWeave’s Stunning Rally Creates Prove-It Moment for Earnings".into(),
                     link: "https://www.bloomberg.com/news/articles/2026-05-07/coreweave-story"
@@ -480,14 +481,14 @@ mod tests {
     }
 
     #[test]
-    fn into_event_links_rocket_lab_title_but_not_spacex_peer_news() {
+    fn build_event_links_rocket_lab_title_but_not_spacex_peer_news() {
         let poller = RssNewsPoller::new(
             "spacenews",
             "https://spacenews.com/feed/",
             Duration::from_secs(3600),
         );
         let rocket_lab = poller
-            .into_event(
+            .build_event(
                 RssItem {
                     title: "Rocket Lab joins Raytheon on space interceptor program for Golden Dome"
                         .into(),
@@ -499,7 +500,7 @@ mod tests {
             )
             .unwrap();
         let spacex = poller
-            .into_event(
+            .build_event(
                 RssItem {
                     title: "SpaceX wins $57M contract".into(),
                     link: "https://spacenews.com/spacex-wins-57-million".into(),
@@ -524,7 +525,7 @@ mod tests {
             Duration::from_secs(3600),
         );
         let premarket = poller
-            .into_event(
+            .build_event(
                 RssItem {
                     title: "US Premarket Movers for May 1, 2026".into(),
                     link: "https://www.bloomberg.com/news/articles/2026-05-01/us-stock-futures-today-amgen-apple-moderna-roblox-sandisk"

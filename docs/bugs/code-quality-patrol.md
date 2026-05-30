@@ -1,5 +1,187 @@
 # Code Quality Patrol Findings
 
+## 2026-05-27 - 注释准确性
+
+### Mainline distill partial failures can drop old ticker mainlines
+
+- status: open
+- direction: 注释准确性
+- evidence: `crates/hone-event-engine/src/global_digest/mainline_distill.rs::distill_for_actor` skips failed tickers but still returns successful tickers in `DistilledMainlines.by_ticker`; `merge_into_prefs` then replaces the entire `NotificationPrefs.mainline_by_ticker` map whenever `by_ticker` is non-empty. The 2026-05-27 comment-accuracy patrol corrected the stale comment that implied failed tickers keep their old mainlines, but did not change runtime behavior.
+- risk: if an actor has old mainlines for `MU` and `RKLB`, and a later run succeeds for `RKLB` but fails for `MU`, the persisted map can lose the old `MU` mainline even though `MU` is only marked in `mainline_distill_skipped`. Changing this directly could alter how intentional removals, missing profile files, and partial LLM failures are reconciled.
+- suggested_fix: decide whether partial distill should merge successful ticker updates into the existing map while preserving skipped tickers, or whether whole-map replacement is intentional. If preserving skipped tickers, add a focused regression around existing prefs with two tickers, one failed distill, one successful distill, then update `merge_into_prefs` and its comments together.
+
+### Periodic task convention still misses real loop exceptions
+
+- status: open
+- direction: 注释准确性
+- evidence: `docs/conventions/periodic_tasks.md` says fixed interval loops in `crates/hone-event-engine/`, `crates/hone-core/heartbeat.rs`, and `crates/hone-web-api/src/lib.rs` must explicitly set `MissedTickBehavior::Delay`. Current code still has intentional-looking exceptions: `crates/hone-core/src/heartbeat.rs::spawn_process_heartbeat` sets `MissedTickBehavior::Skip`, `crates/hone-event-engine/src/global_digest/mainline_cron.rs::distill_cron_loop` sets `Skip`, and `crates/hone-web-api/src/lib.rs::spawn_acp_events_log_rotator` creates a one-hour interval without setting a missed-tick behavior.
+- risk: contributors reading the convention cannot tell which loops are non-compliant bugs versus deliberate exceptions. Changing all three to `Delay` could alter heartbeat freshness, mainline distill recovery after sleep, and log-rotation catch-up behavior; changing the convention without a decision could weaken the shared periodic-task contract.
+- suggested_fix: make a focused periodic-task decision: either align these loops with `Delay`, or document bounded exceptions with rationale and tests/manual notes for sleep or long-task recovery. Then update `docs/conventions/periodic_tasks.md`, the code comments near each exception, and the existing mainline-cron finding together.
+
+## 2026-05-27 - 复杂度热点
+
+### Hone-tools tool implementations still mix schemas, parsing, and execution branches
+
+- status: open
+- direction: 复杂度热点
+- evidence: `cargo clippy -p hone-tools --tests -- -W clippy::cognitive_complexity -W clippy::too_many_lines` still reports oversized async tool impls and schema builders after the 2026-05-27 patrol extracted low-risk helpers from `crates/hone-tools/src/schedule_view.rs` and `crates/hone-tools/src/skill_runtime.rs`. Current examples include `crates/hone-tools/src/cron_job_tool.rs` `parameters` at `120/100` lines and its `#[async_trait]` impl at `283/100`, `crates/hone-tools/src/local_files.rs` async impl at `141/100`, `crates/hone-tools/src/notification_prefs_tool.rs` async impl at `129/100`, and `crates/hone-tools/src/portfolio_tool.rs` `parameters` at `123/100` plus async impl at `252/100`.
+- risk: these paths combine user-visible tool descriptions, JSON parameter schemas, argument parsing, storage calls, validation, and returned error text. Splitting them mechanically could change MCP tool schemas, LLM-facing guidance, validation order, or localized error wording, so they need focused per-tool extraction rather than a broad patrol sweep.
+- suggested_fix: tackle one tool at a time. First extract pure parameter-schema builders and parse/validation helpers behind private functions, then split execute branches only when focused tests lock the current JSON shape and error messages. For each tool, run the relevant `cargo test -p hone-tools <tool_filter>` slice, `cargo check -p hone-tools --tests`, and the repo guardrails before moving to the next implementation.
+
+### LLM audit listing builds query, count, pagination, and row mapping in one path
+
+- status: open
+- direction: 复杂度热点
+- evidence: `cargo clippy -p hone-memory --tests -- -W clippy::cognitive_complexity -W clippy::too_many_lines` reports `memory/src/llm_audit.rs::list_audit_records` at `108/100` lines. The function selects schema-compatible token columns, appends every optional filter to both the data query and count query, owns pagination bounds, builds boxed rusqlite params, runs the count, maps rows into `AuditRecordSummary`, and collects row errors.
+- risk: this is the admin-facing LLM audit query path. A drive-by split could desynchronize the count and data filters, change placeholder numbering, alter legacy token-column compatibility, or change pagination limits.
+- suggested_fix: extract a small query-builder helper that appends each optional filter once to paired SQL buffers and returns ordered params, then split page normalization and row mapping into private helpers. Cover actor/session/source/provider/date filters, old DBs without token columns, and count/data query parity before changing query structure.
+
+### Session SQLite upsert owns serialization, replacement, metadata, and message writes
+
+- status: open
+- direction: 复杂度热点
+- evidence: `cargo clippy -p hone-memory --tests -- -W clippy::cognitive_complexity -W clippy::too_many_lines` reports `memory/src/session_sqlite.rs::upsert_session` at `180/100` lines. The function serializes every session sidecar field, derives source-file metadata and content hashes, deletes old session rows, inserts the session row, rewrites metadata rows, rewrites every message row, and commits the transaction.
+- risk: this path is the SQLite shadow/runtime session truth writer. Mechanical extraction could change delete-before-insert ordering, metadata/message replacement semantics, source path canonicalization, content hashes, or transaction boundaries.
+- suggested_fix: keep the public method as the transaction coordinator, but extract private helpers for serialized session payload preparation, session-row insert parameters, metadata row writes, and message row writes. Preserve the delete-before-insert order and cover replacement, metadata preservation, message metadata columns, source hash, and rollback behavior with focused `hone-memory` tests.
+
+## 2026-05-27 - 配置文档漂移
+
+### Tavily search depth/topic config fields are not wired into runtime requests
+
+- status: open
+- direction: 配置文档漂移
+- evidence: `crates/hone-core/src/config/server.rs` exposes `search.provider`, `search.search_depth`, `search.topic`, and `search.max_results`; `config.example.yaml` also shows all four fields. Runtime construction in `crates/hone-tools/src/web_search.rs::WebSearchTool::from_config` only reads `config.search.api_keys` and `config.search.max_results`, and `search_with_key` hardcodes `"search_depth": "basic"` while omitting `topic` entirely. No existing `docs/bugs` entry mentioned this mismatch.
+- risk: operators can set `search.search_depth: "advanced"` or `search.topic: "news"` in `config.yaml` and believe Tavily requests changed, while runtime behavior remains basic/general. Wiring this directly would change external-provider request semantics for existing non-default configs, so it needs a focused tool/request regression pass rather than a patrol-sized documentation edit.
+- suggested_fix: decide whether `provider/search_depth/topic` should become active runtime knobs or be deprecated. If activating them, extend `WebSearchTool` to store sanitized `search_depth` and optional `topic`, include them in the Tavily request body, and cover default plus non-default config with a local test server that asserts the outgoing JSON body. If deprecating them, remove or hide the fields from examples and update migration docs.
+
+### UDP logging cannot be disabled even though the old sample said `null` disables it
+
+- status: open
+- direction: 配置文档漂移
+- evidence: `config.example.yaml` previously described `logging.udp_port: null` as disabling the UDP sink. Runtime initialization in `crates/hone-core/src/logging.rs::UdpLogLayer::new` instead calls `udp_port.unwrap_or(18118)` and always installs the UDP layer; `crates/hone-web-api/src/lib.rs` also treats `None` as port `18118` when probing log subscribers.
+- risk: operators may set `udp_port: null` expecting no UDP log traffic, but Hone still emits a local UDP copy to the default port. Changing this directly would alter observability behavior and may affect console log streaming, so it needs a focused logging/config decision rather than a patrol-sized behavior change.
+- suggested_fix: decide whether `None` should mean disabled or default port. If disabling is desired, change `setup_logging` to only attach `UdpLogLayer` when `udp_port` is `Some`, update the Web API subscriber probe, and add logging tests for `None`, `Some(18118)`, and custom ports. If default-port semantics are desired, consider renaming or documenting a separate future `logging.udp_enabled` knob.
+
+### Logging console/file config fields are parsed but not applied
+
+- status: open
+- direction: 配置文档漂移
+- evidence: `crates/hone-core/src/config/server.rs::LoggingConfig` exposes `console: bool` and `file: Option<String>`, and `config.example.yaml` shows `console: true` plus `file: "./data/logs/hone.log"`. Runtime initialization in `crates/hone-core/src/logging.rs::setup_logging` only reads `config.level` and `config.udp_port`; it always installs the tracing console formatter and never creates a file appender from `logging.file`. `rg` found no other production reads of `config.logging.console` or `config.logging.file`.
+- risk: operators can set `logging.console: false` or change `logging.file` expecting output routing to change, but runtime logging remains console + local UDP only. Wiring this directly changes observability behavior and may interact with desktop/CLI log collection paths, so it needs a focused logging contract pass.
+- suggested_fix: decide whether `console` and `file` should become active sinks or be deprecated. If activating them, make `setup_logging` conditionally attach the console formatter, add a rolling or plain file appender for `logging.file`, preserve current defaults, and cover `console=false`, `file=null`, and file-path cases with logging initialization tests that avoid double global subscriber setup. If deprecating, remove or hide the fields from examples and migration docs.
+
+## 2026-05-26 - 错误与日志质量
+
+### FMP clients can treat non-auth HTTP failures as successful data
+
+- status: open
+- direction: 错误与日志质量
+- evidence: `crates/hone-tools/src/data_fetch.rs::fetch_with_key` and `crates/hone-event-engine/src/fmp.rs::FmpClient::fetch_once` both parse the HTTP response body as JSON, then only turn `401`/`403` and JSON `"Error Message"` authentication/quota text into errors. For any other non-success HTTP status, such as a provider `500`, `502`, or `404` returning JSON without `"Error Message"`, both paths currently fall through to `Ok(response_json)` / `Ok(data)`.
+- risk: a provider outage or endpoint mismatch can be surfaced to callers as normal data, causing key fallback to stop early and hiding the real HTTP status from operator diagnostics. The event-engine client feeds pollers while the tool client feeds interactive data fetches, so changing this directly affects fallback and poller error semantics across two call surfaces.
+- suggested_fix: after the `401`/`403` branch and provider `"Error Message"` extraction in both FMP clients, add a generic `!status.is_success()` error path that includes the HTTP status plus a bounded, sanitized response preview. Cover JSON error bodies, HTML/non-JSON parse errors, and multi-key fallback with focused `DataFetchTool` and `FmpClient` tests before changing runtime behavior.
+
+## 2026-05-26 - 复杂度热点
+
+### `hone-cli configure` still mixes prompts, section routing, and mutation assembly
+
+- status: open
+- direction: 复杂度热点
+- evidence: `cargo clippy -p hone-cli --bin hone-cli --tests -- -W clippy::too_many_lines -W clippy::cognitive_complexity` reports `bins/hone-cli/src/configure.rs::run_configure` at `357/100` lines. The same scan showed the now-fixed `bins/hone-cli/src/mutations.rs::build_model_mutations` candidate, but `run_configure` still owns section selection, prompt defaults, secret prompts, per-channel allowlist prompting, provider key parsing, mirror writes, and final canonical-config mutation application in one function.
+- risk: a drive-by split could change interactive prompt order, default values, secret-presence handling, or which canonical config paths are mirrored together. This path is operator-facing and shares semantics with `hone-cli models set`, `hone-cli channels set`, and onboarding.
+- suggested_fix: in a focused CLI-configure pass, extract behavior-preserving private builders for agent, channel, and provider sections; reuse the mutation helpers from `bins/hone-cli/src/mutations.rs` where possible; keep prompt order stable; then validate with focused configure/mutation tests plus `cargo check -p hone-cli --tests`.
+
+### Channel onboarding builder owns too many recovery and mutation branches
+
+- status: open
+- direction: 复杂度热点
+- evidence: `cargo clippy -p hone-cli --bin hone-cli --tests -- -W clippy::too_many_lines -W clippy::cognitive_complexity` reports `bins/hone-cli/src/onboard.rs::build_channel_onboard_mutations` at `265/100` lines. The function combines platform skipping, enable prompts, prerequisite copy, allowlist warnings, required-field recovery, disabled-channel detection, chat-scope prompts, per-channel allowlist prompts, iMessage target-handle prompting, and final mutation assembly.
+- risk: the function is interactive and stateful: a user can abandon one required field and the code must reset that channel to `enabled=false` without losing earlier channels. A local split must preserve prompt order, recovery wording, `enabled_channels` side effects, and per-channel mutation order.
+- suggested_fix: extract behavior-preserving private helpers for channel enablement, required-field collection, disabled-channel detection, chat-scope mutation, and allowlist prompts. Keep the current `ChannelOnboardSpec` data shape initially, add tests for required-field abandon paths where possible, then rerun `cargo check -p hone-cli --tests`.
+
+### Top-level CLI dispatch is too broad for safe patrol-sized splitting
+
+- status: open
+- direction: 复杂度热点
+- evidence: `cargo clippy -p hone-cli --bin hone-cli --tests -- -W clippy::too_many_lines -W clippy::cognitive_complexity` reports `bins/hone-cli/src/main.rs::run_cli` at cognitive complexity `33/25` and `340/100` lines. The function parses top-level commands and owns config get/set/unset/validate, models status/set, channel list/set/toggle/targets, web, start, cleanup, probe, doctor, and onboard dispatch paths in one match tree.
+- risk: splitting this directly can change command output ordering, JSON/text behavior, language resolution, mutation application messages, or default `Chat` behavior. It also intersects with large enum-size clippy warnings around `Commands`, `ModelsCommands`, and `ChannelsCommands`, which may require Clap boxing decisions rather than a mechanical extraction.
+- suggested_fix: in a focused CLI-entrypoint pass, extract private `run_config_command`, `run_models_command`, `run_channels_command`, and `run_web_command` helpers while keeping `Cli::parse()` and the default chat branch in `run_cli`. Preserve existing parse tests and add focused output smoke tests for config/model/channel text versus JSON branches before considering enum boxing.
+
+## 2026-05-26 - 用户文案
+
+### Symbol drawer bypasses the admin bilingual content tree
+
+- status: open
+- direction: 用户文案
+- evidence: `packages/app/src/components/symbol-drawer.tsx` is an admin-console surface opened from user/profile/research flows, but visible copy is hardcoded in Chinese instead of routing through `packages/app/src/lib/admin-content/*`. Examples include tab labels (`公司画像`, `研究记录`, `相关会话`, `操作`), fallback states (`先选定用户`, `该用户暂无会话`), watchlist/research actions, feedback text, and the close button `aria-label="关闭"`.
+- risk: English-locale admin users can switch most console navigation and page copy to English, then open the symbol drawer and get a mixed-language workflow. Migrating it directly in this patrol would touch several interaction states, feedback messages, date formatting, and navigation labels in one component, so it needs a focused UI-content pass.
+- suggested_fix: add a small `admin-content/symbol-drawer.ts` tree, wire `SymbolDrawer` and its tab subcomponents through that content, and keep dynamic labels (`{symbol}`, `{user_id}`, counts, timestamps) as placeholders. Validate with the existing admin content shape test plus a focused component/model smoke for profile, research, sessions, and actions states.
+
+### Channel status badge ignores the admin locale switch
+
+- status: open
+- direction: 用户文案
+- evidence: `packages/app/src/components/channel-status-badge-model.ts` and `packages/app/src/components/channel-status-badge.tsx` return and render Chinese strings directly for global admin chrome copy such as `运行中`, `管理端后端未连接`, `渠道加载中`, `系统连接`, `渠道监听`, `清理多余进程`, and duplicate-process hints. The sidebar and page titles around the badge already use `packages/app/src/lib/admin-content/shared.ts`, so switching the admin console to English leaves the top-right runtime status mixed in Chinese.
+- risk: this is global chrome shown on every admin page and has test-covered model helpers. A safe fix needs to preserve the current status derivation while injecting locale-specific labels into both the model tests and component rendering.
+- suggested_fix: move status labels, connection labels, summary templates, and cleanup button/hint text into the shared admin content tree or a dedicated `admin-content/channel-status.ts`. Then update the model helpers to accept a copy bundle or return stable status tokens that the component formats through content, with tests for both locales.
+
+## 2026-05-26 - 注释准确性
+
+### Periodic task convention and mainline distill cron disagree on missed-tick behavior
+
+- status: open
+- direction: 注释准确性
+- evidence: `docs/conventions/periodic_tasks.md` says periodic loops must set `MissedTickBehavior::Delay` and describes `Delay` as the shared convention for avoiding burst recovery after long work. `crates/hone-event-engine/src/global_digest/mainline_cron.rs` instead sets `MissedTickBehavior::Skip` in `distill_cron_loop`, while the same document lists `mainline_cron` among the periodic tasks in scope.
+- risk: changing `Skip` to `Delay` directly could alter how missed hourly distillation windows recover after machine sleep or long-running LLM calls; changing the convention directly would weaken a cross-task workflow rule. This needs an explicit decision about whether mainline distillation is an intentional exception or should follow the standard loop behavior.
+- suggested_fix: in a focused periodic-task pass, decide whether `mainline_cron` should use `Delay` like other internal tasks or stay as a documented exception. If aligning behavior, cover machine-sleep / long-tick recovery expectations with a small unit or manual regression note; if keeping `Skip`, update `docs/conventions/periodic_tasks.md` with a bounded exception and rationale.
+
+## 2026-05-23 - 测试可维护性
+
+### Manual regression runner can trigger live service smokes without per-script gates
+
+- status: open
+- direction: 测试可维护性
+- evidence: `tests/regression/run_manual.sh` expands and runs every `tests/regression/manual/test_*.sh` file. Some existing manual scripts are intentionally live-provider checks but do not have an explicit opt-in gate, for example `tests/regression/manual/test_earnings_calendar_live.sh` and `tests/regression/manual/test_finance_snapshot_live.sh` build `hone-mcp` and call the `data_fetch` tool against the runtime config immediately, while `tests/regression/manual/test_install_brew_smoke.sh` and `test_install_bundle_smoke.sh` start local services and probe ports. The newer live smoke wrappers added on 2026-05-26 skip by default unless `RUN_*_LIVE_SMOKES=1` is set, so the manual directory now has mixed execution semantics.
+- risk: a maintainer following `bash tests/regression/run_manual.sh` from `AGENTS.md` or `tests/regression/README.md` can accidentally spend provider quota, depend on local credentials/config, send real messages, or mutate local installed-service state. Changing this directly is a workflow contract change because some existing scripts may be expected to run when invoked from the aggregate manual runner.
+- suggested_fix: add a small manual-regression metadata convention or split runner modes, such as `run_manual.sh --safe` for no-network/no-send checks and `RUN_ALL_MANUAL_LIVE=1` for live/provider scripts. Then retrofit existing live scripts with explicit gates, preserve single-script invocation ergonomics, and update `AGENTS.md`, `docs/invariants.md`, `docs/repo-map.md`, and `tests/regression/README.md` together.
+
+### Hone-tools skill script tests trip strict clippy on async env locking and module layout
+
+- status: open
+- direction: 测试可维护性
+- evidence: `cargo clippy -p hone-tools --all-targets --no-deps -- -D warnings` reports `clippy::items-after-test-module` in `crates/hone-tools/src/skill_tool.rs` because the large `#[cfg(test)] mod tests` sits before later production helpers and the `impl Tool for SkillTool`. The same strict run reports `clippy::await-holding-lock` for several async skill-tool tests that keep the test-only `std::sync::MutexGuard` from `env_lock()` across `.await` while serializing environment mutations.
+- risk: the current tests pass and the lock intentionally serializes process-wide env changes, but the layout and sync-guard pattern make future strict clippy adoption noisy. A drive-by move would create a large diff around skill execution helpers and could accidentally weaken env isolation in concurrent async tests.
+- suggested_fix: in a focused test-maintenance pass, move the skill-tool test module to the end of the file or split production helpers before tests, then replace the sync env guard pattern with a small async-aware test harness or a scoped helper that performs env mutation and cleanup around awaited calls without holding `std::sync::MutexGuard` across `.await`. Rerun `cargo test -p hone-tools skill_tool` and the skill-runtime CI regression scripts.
+
+### Ignored live smoke tests remain scattered outside manual regression entry points
+
+- status: done
+- direction: 测试可维护性
+- evidence: `AGENTS.md` and `docs/invariants.md` say external-account, external-CLI, or local-machine-state checks should live under `tests/regression/manual/`, but `rg "#\\[ignore\\]|live_|HONE_.*KEY|HONE_.*TOKEN"` still finds credential-backed ignored tests in crate modules. Examples include `crates/hone-web-api/src/aliyun_captcha.rs::live_probe_smoke`, `crates/hone-web-api/src/aliyun_sms.rs::live_send_verify_code_smoke`, and event-engine poller smokes such as `crates/hone-event-engine/src/pollers/news.rs::live_fmp_news_smoke`, `pollers/price.rs::live_fmp_price_smoke`, `pollers/earnings.rs::live_fmp_earnings_smoke`, `pollers/analyst_grade.rs::live_fmp_analyst_grade_smoke`, `pollers/corp_action.rs::live_fmp_corp_action_smoke`, `pollers/earnings_surprise.rs::live_fmp_earnings_surprise_smoke`, and `pollers/macro_events.rs::live_fmp_macro_smoke`.
+- risk: these tests are ignored and do not block CI, but their command surface is hard to discover from `tests/regression/manual/` and remains mixed into unit-test modules. Moving them in a patrol-sized patch could lose useful smoke commands, required environment notes, or fixture setup for live provider checks.
+- suggested_fix: create manual regression wrappers for Aliyun SMS/Captcha and event-engine FMP poller smokes, preserving required env vars, command examples, and expected success criteria. Keep deterministic parsing/auth/signature coverage in Rust unit tests, then update `tests/regression/README.md` if new manual entry points are added.
+- resolution: 2026-05-26 patrol added guarded manual wrappers for Aliyun SMS/Captcha and the event-engine FMP poller live smokes, plus README commands. The Rust ignored tests remain as the implementation targets, but the operator entry points now live under `tests/regression/manual/` and skip by default unless the explicit `RUN_*_LIVE_SMOKES=1` gate is set.
+
+## 2026-05-22 - 注释准确性
+
+### Global digest broadcast dedup channel no longer matches unified scheduler audit writes
+
+- status: open
+- direction: 注释准确性
+- evidence: `crates/hone-event-engine/src/global_digest/collector.rs` documents cross-batch dedup against `GLOBAL_DIGEST_CHANNEL = "global_digest"` and `excludes_already_broadcast_event_ids` only logs that channel in the fixture. The current unified digest path in `crates/hone-event-engine/src/unified_digest/scheduler.rs` logs delivered global items under `delivery_log.channel = "global_digest_item"` and filtered items under the same channel; `rg` finds no production writer for `"global_digest"`. As a result the collector's `broadcasted_event_ids_since(GLOBAL_DIGEST_CHANNEL, ...)` appears to miss the channel that production writes now use.
+- risk: changing the constant directly would alter global-news cross-batch dedup behavior and could hide or newly suppress stories across actors and slots, so it needs a focused event-engine regression pass rather than a comment-only patrol fix.
+- suggested_fix: decide whether the canonical broadcast-dedup channel should be `global_digest_item` or a separate broadcast-level `global_digest` marker. Then align `GLOBAL_DIGEST_CHANNEL`, scheduler delivery-log writes, collector tests, and any audit/report wording in one behavior-preserving change with coverage for delivered and focus-filtered global picks.
+
+## 2026-05-22 - 测试可维护性
+
+### Event-engine live integration checks still live in the crate unit-test module
+
+- status: open
+- direction: 测试可维护性
+- evidence: `AGENTS.md` and `docs/invariants.md` both say external-account or local-machine-state checks should live under `tests/regression/manual/`, but `crates/hone-event-engine/src/tests.rs` still contains ignored live tests such as `live_engine_e2e`, `live_telegram_push_demo`, `live_telegram_push_llm_polished_demo`, `live_portfolio_backtest_push`, and `live_social_engine_e2e`. These tests read `HONE_FMP_API_KEY`, `HONE_TG_BOT_TOKEN`, `HONE_TG_CHAT_ID`, `HONE_OPENROUTER_KEY`, local `data/portfolio/...`, or live Telegram/FMP network state directly from the crate test module.
+- risk: the tests are ignored, so they do not block CI, but their placement makes the manual verification contract hard to discover from `tests/regression/manual/` and keeps long external workflows mixed with unit/integration test code. Moving them directly in a patrol could lose useful operator commands or accidentally change the live smoke setup.
+- suggested_fix: migrate the live event-engine checks into one or more `tests/regression/manual/test_event_engine_*.sh` wrappers or documented manual fixtures, keeping deterministic contract/unit coverage in Rust. Preserve the current trigger commands, required env vars, and expected artifacts, then update `docs/repo-map.md` if the manual regression entry points change.
+- progress: 2026-05-26 patrol added `tests/regression/manual/test_event_engine_live_integration_smokes.sh` as a guarded wrapper for the existing ignored tests. The tests still live in the crate module, so this remains open until the implementation is migrated or the retained-in-crate contract is documented.
+
 ## 2026-05-14 - 配置文档漂移
 
 ### `hone-cli onboard` does not validate multi-agent's OpenCode answer dependency
@@ -50,7 +232,7 @@
 
 - status: open
 - direction: 用户文案
-- evidence: `packages/app/src/pages/public-portfolio.tsx` imports `PublicNav`, `PublicFooter`, and `PublicLoginForm`, but does not import `CONTENT` or `useLocale`; visible strings such as `查看画像`, `投资上下文`, `加载失败`, `立即刷新`, `整体投资风格`, and `公司画像 inventory` are hardcoded in Chinese. The adjacent public chat, login, home, roadmap, and contact surfaces already route visible copy through the bilingual `CONTENT` tree.
+- evidence: `packages/app/src/pages/public-portfolio.tsx` imports `PublicNav`, `PublicFooter`, and `PublicLoginForm`, but does not import `CONTENT` or `useLocale`; visible strings such as `查看画像`, `投资上下文`, `加载失败`, `立即更新`, `整体投资风格`, and `公司画像` are hardcoded in Chinese. The adjacent public chat, login, home, roadmap, and contact surfaces already route visible copy through the bilingual `CONTENT` tree.
 - risk: English-locale users can navigate from the bilingual public site into `/portfolio` and see a mixed-language account surface. Migrating this in a patrol-sized patch would touch many strings plus date formatting and refresh/error messages, with UI regression risk on an authenticated page.
 - suggested_fix: add a focused public-portfolio localization pass: move portfolio copy and relative-date labels into `packages/app/src/lib/public-content.ts`, switch timestamps through locale-aware formatting, and validate `/portfolio` in both `zh` and `en` locales with a lightweight UI smoke or model test around loading, error, empty, and refreshed states.
 
@@ -199,12 +381,13 @@
 - additional_evidence: public/admin mainline views still keep separate load/refresh/modal state machines even after the low-risk derived-state helpers were extracted. The remaining shared UI extraction would need to keep session-scoped public APIs separate from actor-scoped admin APIs.
 - risk: future changes to mainline refresh, profile modal loading, skipped ticker handling, or error presentation can drift between public and admin surfaces. Direct extraction in a patrol could accidentally mix session auth with actor-scoped admin APIs.
 - suggested_fix: introduce a small shared model/helper for the pure view state and ticker derivation first, then consider a shared presentational panel that receives API callbacks for public vs admin data sources. Keep API/auth boundaries explicit and cover both public and admin refresh paths with smoke or model tests before extracting the UI.
-- progress: 2026-05-13 patrol extracted the pure derived profile ticker set into `profileTickerSet` with unit coverage. 2026-05-14 patrol added a shared `firstProfileTicker`, moved public refresh/timestamp/button derivation into `public-portfolio-model`, aligned the public profile modal fetch trigger with `createEffect`, and cleared selected modal tickers on close. The cross-view load/refresh/modal state machines remain open because they still cross public-session and admin-actor API boundaries.
+- progress: 2026-05-13 patrol extracted the pure derived profile ticker set into `profileTickerSet` with unit coverage. 2026-05-14 patrol added a shared `firstProfileTicker`, moved public refresh/timestamp/button derivation into `public-portfolio-model`, aligned the public profile modal fetch trigger with `createEffect`, and cleared selected modal tickers on close. 2026-05-23 patrol added shared holding-card and profile-inventory row derivation for public/admin mainline views. The cross-view load/refresh/modal state machines remain open because they still cross public-session and admin-actor API boundaries.
 
 ### `packages/app/src/pages/settings.tsx` still combines several independent state machines in one page component
 
 - status: open
 - direction: 前端状态复杂度
-- evidence: after two low-risk cleanup passes, `settings.tsx` is still `2600` lines and owns language saves, agent runner/config edits, web invite CRUD, data API key lists, notification preferences, and channel settings in one Solid component. The web invite flow still has six action handlers around lines 589-765, while channel settings still keep Feishu, Discord, Telegram, and iMessage field state in the same page even though simple draft patches now flow through `updateChannelDraft`.
+- evidence: after several low-risk cleanup passes, `settings.tsx` is still about `2600` lines and owns language saves, agent runner/config edits, web invite CRUD, data API key lists, notification preferences, and channel settings in one Solid component. The web invite flow still has multiple CRUD/copy handlers around lines 589-765, while channel settings still keep Feishu, Discord, Telegram, and iMessage field state in the same page even though simple draft patches now flow through `updateChannelDraft`.
 - risk: small UI edits now require reasoning across unrelated state machines, shared message/error signals, clipboard side effects, backend saving state, and tab visibility. Directly extracting everything in one patrol would be high risk because invite CRUD and channel settings touch externally visible configuration and secrets/tokens.
 - suggested_fix: split the page into behavior-preserving child components by tab (`AgentSettingsPanel`, `DataApiKeysPanel`, `WebInvitePanel`, `ChannelSettingsPanel`) and move local state/helpers with each panel. Start with tests or smoke coverage around runner selection, invite action state, and channel draft round-trip before changing component boundaries.
+- progress: 2026-05-23 patrol moved the invite-list prepend/replace transforms into `settings-model` with tests. A later 2026-05-23 patrol consolidated FMP/Tavily API-key values plus visibility into one tested draft-state helper and wrapped repeated invite action bookkeeping in the page. The invite CRUD side effects, channel settings state, and panel/component split remain open.

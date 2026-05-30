@@ -25,7 +25,9 @@ use crate::digest::DigestPayload;
 use crate::renderer::RenderFormat;
 use crate::router::OutboundSink;
 use crate::sinks::feishu_card::build_feishu_card;
-use crate::sinks::http_error::{format_transport_error, format_upstream_http_error};
+use crate::sinks::http_error::{
+    format_provider_api_error, format_transport_error, format_upstream_http_error,
+};
 
 const FEISHU_TOKEN_URL: &str =
     "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal";
@@ -45,6 +47,28 @@ pub struct FeishuSink {
 struct FeishuDirectContacts {
     emails: Vec<String>,
     mobiles: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedFeishuTarget {
+    receive_id_type: &'static str,
+    receive_id: String,
+    direct_open_id_cache_key: Option<String>,
+}
+
+#[derive(Debug)]
+struct FeishuSendError {
+    message: String,
+    open_id_cross_app: bool,
+}
+
+impl FeishuSendError {
+    fn new(message: impl Into<String>, open_id_cross_app: bool) -> Self {
+        Self {
+            message: message.into(),
+            open_id_cross_app,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -92,16 +116,30 @@ impl FeishuSink {
         A: Into<String>,
         T: Into<String>,
     {
-        self.direct_actor_contacts = targets
-            .into_iter()
-            .filter_map(|(actor_user_id, target)| {
-                let actor_user_id = actor_user_id.into().trim().to_string();
-                if actor_user_id.is_empty() {
-                    return None;
-                }
-                direct_contact_from_target(&target.into()).map(|contacts| (actor_user_id, contacts))
-            })
-            .collect();
+        let mut contacts_by_actor: HashMap<String, FeishuDirectContacts> = HashMap::new();
+        for (actor_user_id, target) in targets {
+            let actor_user_id = actor_user_id.into().trim().to_string();
+            if actor_user_id.is_empty() {
+                continue;
+            }
+            let Some(contacts) = direct_contact_from_target(&target.into()) else {
+                continue;
+            };
+            let entry =
+                contacts_by_actor
+                    .entry(actor_user_id)
+                    .or_insert_with(|| FeishuDirectContacts {
+                        emails: Vec::new(),
+                        mobiles: Vec::new(),
+                    });
+            entry.emails.extend(contacts.emails);
+            entry.mobiles.extend(contacts.mobiles);
+            entry.emails.sort();
+            entry.emails.dedup();
+            entry.mobiles.sort();
+            entry.mobiles.dedup();
+        }
+        self.direct_actor_contacts = contacts_by_actor;
         self
     }
 
@@ -114,7 +152,7 @@ impl FeishuSink {
                 return Ok(t.clone());
             }
         }
-        let resp = self
+        let response = self
             .client
             .post(FEISHU_TOKEN_URL)
             .json(&serde_json::json!({
@@ -124,16 +162,21 @@ impl FeishuSink {
             .send()
             .await
             .map_err(|err| anyhow::anyhow!(format_transport_error("feishu", "token", &err)))?;
-        let status = resp.status();
+        let status = response.status();
         if !status.is_success() {
-            let detail = resp.text().await.unwrap_or_default();
+            let detail = response.text().await.unwrap_or_default();
             anyhow::bail!(format_upstream_http_error(
                 "feishu", "token", status, &detail
             ));
         }
-        let parsed: TokenResp = resp.json().await?;
+        let parsed: TokenResp = response.json().await?;
         if parsed.code != 0 {
-            anyhow::bail!("feishu token error code={} msg={}", parsed.code, parsed.msg);
+            anyhow::bail!(format_provider_api_error(
+                "feishu",
+                "token",
+                parsed.code,
+                &parsed.msg
+            ));
         }
         let token = parsed
             .tenant_access_token
@@ -155,41 +198,54 @@ impl FeishuSink {
         }
     }
 
-    async fn receive_target(
-        &self,
-        actor: &ActorIdentity,
-    ) -> anyhow::Result<(&'static str, String)> {
+    async fn receive_target(&self, actor: &ActorIdentity) -> anyhow::Result<ResolvedFeishuTarget> {
         match actor.channel_scope.as_deref() {
             Some(scope) if scope != "direct" => {
                 let chat_id = scope.strip_prefix("chat_").unwrap_or(scope).to_string();
-                Ok(("chat_id", chat_id))
+                Ok(ResolvedFeishuTarget {
+                    receive_id_type: "chat_id",
+                    receive_id: chat_id,
+                    direct_open_id_cache_key: None,
+                })
             }
             _ => {
-                if let Some(contacts) = self.direct_actor_contacts.get(actor.user_id.trim())
-                    && let Some(open_id) = self
-                        .resolve_direct_open_id_for_contacts(
-                            &format!("actor:{}", actor.user_id.trim()),
-                            contacts,
-                        )
+                if let Some(contacts) = self.direct_actor_contacts.get(actor.user_id.trim()) {
+                    let cache_key = format!("actor:{}", actor.user_id.trim());
+                    if let Some(open_id) = self
+                        .resolve_direct_open_id_for_contacts(&cache_key, contacts)
                         .await?
-                {
-                    return Ok(("open_id", open_id));
+                    {
+                        return Ok(ResolvedFeishuTarget {
+                            receive_id_type: "open_id",
+                            receive_id: open_id,
+                            direct_open_id_cache_key: Some(cache_key),
+                        });
+                    }
                 }
-                if let Some(open_id) = self.resolve_direct_open_id().await? {
-                    Ok(("open_id", open_id))
-                } else {
-                    Ok(("open_id", actor.user_id.clone()))
+                if let Some(contacts) = &self.direct_contacts {
+                    let cache_key = "config:single_direct_contact";
+                    if let Some(open_id) = self
+                        .resolve_direct_open_id_for_contacts(cache_key, contacts)
+                        .await?
+                    {
+                        return Ok(ResolvedFeishuTarget {
+                            receive_id_type: "open_id",
+                            receive_id: open_id,
+                            direct_open_id_cache_key: Some(cache_key.to_string()),
+                        });
+                    }
                 }
+                Ok(ResolvedFeishuTarget {
+                    receive_id_type: "open_id",
+                    receive_id: actor.user_id.clone(),
+                    direct_open_id_cache_key: None,
+                })
             }
         }
     }
 
-    async fn resolve_direct_open_id(&self) -> anyhow::Result<Option<String>> {
-        let Some(contacts) = &self.direct_contacts else {
-            return Ok(None);
-        };
-        self.resolve_direct_open_id_for_contacts("config:single_direct_contact", contacts)
-            .await
+    async fn clear_cached_direct_open_id(&self, cache_key: &str) {
+        self.direct_open_id_cache.write().await.remove(cache_key);
     }
 
     async fn resolve_direct_open_id_for_contacts(
@@ -214,7 +270,7 @@ impl FeishuSink {
         if !contacts.mobiles.is_empty() {
             body.insert("mobiles".to_string(), serde_json::json!(contacts.mobiles));
         }
-        let resp = self
+        let response = self
             .client
             .post("https://open.feishu.cn/open-apis/contact/v3/users/batch_get_id?user_id_type=open_id")
             .bearer_auth(&token)
@@ -228,9 +284,9 @@ impl FeishuSink {
                     &err
                 ))
             })?;
-        let status = resp.status();
+        let status = response.status();
         if !status.is_success() {
-            let detail = resp.text().await.unwrap_or_default();
+            let detail = response.text().await.unwrap_or_default();
             anyhow::bail!(format_upstream_http_error(
                 "feishu",
                 "resolve direct contact",
@@ -238,13 +294,14 @@ impl FeishuSink {
                 &detail
             ));
         }
-        let parsed: BatchGetIdResp = resp.json().await?;
+        let parsed: BatchGetIdResp = response.json().await?;
         if parsed.code != 0 {
-            anyhow::bail!(
-                "feishu resolve direct contact error code={} msg={}",
+            anyhow::bail!(format_provider_api_error(
+                "feishu",
+                "resolve direct contact",
                 parsed.code,
-                parsed.msg
-            );
+                &parsed.msg
+            ));
         }
         let Some(open_id) = unique_batch_get_open_id(parsed.data) else {
             return Ok(None);
@@ -350,35 +407,86 @@ impl FeishuSink {
         msg_type: &str,
         content: String,
     ) -> anyhow::Result<()> {
-        let token = self.token().await?;
-        let (receive_id_type, receive_id) = self.receive_target(actor).await?;
-        let resp = self
+        let mut last_error: Option<FeishuSendError> = None;
+        for attempt in 0..2 {
+            let target = self.receive_target(actor).await?;
+            match self
+                .post_message_to_target(&target, msg_type, content.clone())
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(err)
+                    if attempt == 0
+                        && err.open_id_cross_app
+                        && target.direct_open_id_cache_key.is_some() =>
+                {
+                    if let Some(cache_key) = target.direct_open_id_cache_key.as_deref() {
+                        self.clear_cached_direct_open_id(cache_key).await;
+                    }
+                    last_error = Some(err);
+                }
+                Err(err) => {
+                    anyhow::bail!(err.message);
+                }
+            }
+        }
+        if let Some(err) = last_error {
+            anyhow::bail!(err.message);
+        }
+        Ok(())
+    }
+
+    async fn post_message_to_target(
+        &self,
+        target: &ResolvedFeishuTarget,
+        msg_type: &str,
+        content: String,
+    ) -> Result<(), FeishuSendError> {
+        let token = self
+            .token()
+            .await
+            .map_err(|err| FeishuSendError::new(err.to_string(), false))?;
+        let response = self
             .client
             .post(format!(
-                "{FEISHU_SEND_URL}?receive_id_type={receive_id_type}"
+                "{FEISHU_SEND_URL}?receive_id_type={}",
+                target.receive_id_type
             ))
             .bearer_auth(&token)
             .json(&serde_json::json!({
-                "receive_id": receive_id,
+                "receive_id": target.receive_id,
                 "msg_type": msg_type,
                 "content": content,
             }))
             .send()
             .await
-            .map_err(|err| anyhow::anyhow!(format_transport_error("feishu", "send", &err)))?;
-        let status = resp.status();
+            .map_err(|err| {
+                FeishuSendError::new(format_transport_error("feishu", "send", &err), false)
+            })?;
+        let status = response.status();
         if !status.is_success() {
-            let detail = resp.text().await.unwrap_or_default();
-            anyhow::bail!(format_upstream_http_error(
-                "feishu", "send", status, &detail
+            let detail = response.text().await.unwrap_or_default();
+            return Err(FeishuSendError::new(
+                format_upstream_http_error("feishu", "send", status, &detail),
+                feishu_error_is_open_id_cross_app(&detail),
             ));
         }
-        let parsed: SendResp = resp.json().await?;
+        let parsed: SendResp = response.json().await.map_err(|err| {
+            FeishuSendError::new(format!("feishu send parse error: {err}"), false)
+        })?;
         if parsed.code != 0 {
-            anyhow::bail!("feishu send error code={} msg={}", parsed.code, parsed.msg);
+            return Err(FeishuSendError::new(
+                format_provider_api_error("feishu", "send", parsed.code, &parsed.msg),
+                parsed.code == 99992361 || feishu_error_is_open_id_cross_app(&parsed.msg),
+            ));
         }
         Ok(())
     }
+}
+
+fn feishu_error_is_open_id_cross_app(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("99992361") || lower.contains("open_id cross app")
 }
 
 #[async_trait]
@@ -487,6 +595,8 @@ mod tests {
     fn direct_actor_contact_targets_keep_only_resolvable_contacts() {
         let sink = FeishuSink::new("app", "secret").with_direct_actor_contact_targets(vec![
             ("ou_email", "alice@example.com"),
+            ("ou_both", "alice@example.com"),
+            ("ou_both", "+8613800138000"),
             ("ou_mobile", "+8613800138000"),
             ("ou_open", "ou_stale"),
             ("", "bob@example.com"),
@@ -505,6 +615,13 @@ mod tests {
                 mobiles: vec!["+8613800138000".to_string()],
             })
         );
+        assert_eq!(
+            sink.direct_actor_contacts.get("ou_both"),
+            Some(&FeishuDirectContacts {
+                emails: vec!["alice@example.com".to_string()],
+                mobiles: vec!["+8613800138000".to_string()],
+            })
+        );
         assert!(!sink.direct_actor_contacts.contains_key("ou_open"));
         assert!(!sink.direct_actor_contacts.contains_key(""));
     }
@@ -519,10 +636,37 @@ mod tests {
             .insert("actor:ou_stale".to_string(), "ou_current".to_string());
         let actor = ActorIdentity::new("feishu", "ou_stale", None::<String>).unwrap();
 
-        let (ty, id) = sink.receive_target(&actor).await.unwrap();
+        let target = sink.receive_target(&actor).await.unwrap();
 
-        assert_eq!(ty, "open_id");
-        assert_eq!(id, "ou_current");
+        assert_eq!(target.receive_id_type, "open_id");
+        assert_eq!(target.receive_id, "ou_current");
+        assert_eq!(
+            target.direct_open_id_cache_key.as_deref(),
+            Some("actor:ou_stale")
+        );
+    }
+
+    #[tokio::test]
+    async fn open_id_cross_app_cache_can_be_invalidated_for_retry() {
+        let sink = FeishuSink::new("app", "secret")
+            .with_direct_actor_contact_targets(vec![("ou_stale", "+8613800138000")]);
+        sink.direct_open_id_cache
+            .write()
+            .await
+            .insert("actor:ou_stale".to_string(), "ou_old_app".to_string());
+
+        sink.clear_cached_direct_open_id("actor:ou_stale").await;
+
+        assert!(
+            !sink
+                .direct_open_id_cache
+                .read()
+                .await
+                .contains_key("actor:ou_stale")
+        );
+        assert!(feishu_error_is_open_id_cross_app(
+            r#"{"code":99992361,"msg":"open_id cross app"}"#
+        ));
     }
 
     #[test]

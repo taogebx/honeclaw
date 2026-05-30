@@ -25,7 +25,10 @@ impl DeepResearchTool {
         Self {
             api_url: api_url.to_string(),
             api_key: api_key.to_string(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -84,7 +87,7 @@ impl Tool for DeepResearchTool {
             "company_name": company_name
         });
 
-        let mut req = self
+        let mut request_builder = self
             .http
             .post(&self.api_url)
             .header("Content-Type", "application/json")
@@ -92,10 +95,11 @@ impl Tool for DeepResearchTool {
             .timeout(std::time::Duration::from_secs(30));
 
         if !self.api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", self.api_key));
+            request_builder =
+                request_builder.header("Authorization", format!("Bearer {}", self.api_key));
         }
 
-        let response = match req.send().await {
+        let response = match request_builder.send().await {
             Ok(response) => response,
             Err(e) => {
                 let safe_error = sanitize_deep_research_error_detail(&e.to_string());
@@ -200,9 +204,21 @@ fn redact_json_secrets(value: &Value) -> Value {
                             | "api_keys"
                             | "api_key"
                             | "apikeys"
+                            | "x-api-key"
                             | "authorization"
+                            | "bot_token"
+                            | "client_secret"
+                            | "fmp_api_key"
+                            | "gemini_api_key"
+                            | "google_api_key"
+                            | "hone_cloud_api_key"
+                            | "id_token"
+                            | "openrouter_api_key"
                             | "password"
+                            | "refresh_token"
                             | "secret"
+                            | "session_token"
+                            | "tavily_api_key"
                             | "token"
                     );
                     let sanitized = if redacted {
@@ -221,24 +237,11 @@ fn redact_json_secrets(value: &Value) -> Value {
 }
 
 fn redact_bearer_secret(text: &str) -> String {
-    let marker = "Bearer ";
-    let mut remaining = text;
-    let mut output = String::with_capacity(text.len());
-    while let Some(index) = remaining.find(marker) {
-        let value_start = index + marker.len();
-        output.push_str(&remaining[..value_start]);
-        output.push_str("<redacted>");
-        let value_tail = remaining[value_start..]
-            .char_indices()
-            .find_map(|(idx, ch)| {
-                (ch == '&' || ch == ')' || ch == ',' || ch == '"' || ch.is_whitespace())
-                    .then_some(idx)
-            })
-            .unwrap_or(remaining[value_start..].len());
-        remaining = &remaining[value_start + value_tail..];
-    }
-    output.push_str(remaining);
-    output
+    ["Bearer ", "bearer ", "Basic ", "basic "]
+        .into_iter()
+        .fold(text.to_string(), |output, marker| {
+            redact_delimited_secret_value(&output, marker)
+        })
 }
 
 fn redact_url_userinfo(text: &str) -> String {
@@ -267,21 +270,42 @@ fn redact_url_userinfo(text: &str) -> String {
 
 fn redact_query_secrets(text: &str) -> String {
     let mut output = text.to_string();
-    for key in [
-        "access_token",
-        "accessToken",
-        "api_key",
-        "apiKey",
-        "apikey",
-        "token",
-        "secret",
-        "password",
-    ] {
+    for key in SENSITIVE_DEEP_RESEARCH_ERROR_KEYS {
         output = redact_delimited_secret_value(&output, &format!("{key}="));
         output = redact_delimited_secret_value(&output, &format!("{key}:"));
     }
     output
 }
+
+const SENSITIVE_DEEP_RESEARCH_ERROR_KEYS: &[&str] = &[
+    "access_token",
+    "accessToken",
+    "api_key",
+    "apiKey",
+    "apikey",
+    "client_secret",
+    "clientSecret",
+    "refresh_token",
+    "refreshToken",
+    "id_token",
+    "idToken",
+    "session_token",
+    "sessionToken",
+    "bot_token",
+    "botToken",
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "TAVILY_API_KEY",
+    "FMP_API_KEY",
+    "HONE_CLOUD_API_KEY",
+    "token",
+    "secret",
+    "password",
+    "X-API-Key",
+    "x-api-key",
+];
 
 fn redact_delimited_secret_value(text: &str, needle: &str) -> String {
     let mut remaining = text;
@@ -302,6 +326,7 @@ fn redact_delimited_secret_value(text: &str, needle: &str) -> String {
                 (ch == '&'
                     || ch == ')'
                     || ch == ','
+                    || ch == ';'
                     || ch == '"'
                     || ch == '\''
                     || ch == '}'
@@ -319,6 +344,12 @@ fn redact_delimited_secret_value(text: &str, needle: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{assert_text_contains_all, assert_text_contains_none};
+
+    fn expect_failed_tool_result(result: &Value) -> &str {
+        assert_eq!(result["success"], Value::Bool(false));
+        result["error"].as_str().expect("error message")
+    }
 
     #[test]
     fn tool_name_and_description() {
@@ -343,66 +374,84 @@ mod tests {
             .execute(serde_json::json!({"company_name": ""}))
             .await
             .expect("execute should not panic");
-        assert_eq!(result["success"].as_bool(), Some(false));
-        assert!(
-            result["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("company_name")
-        );
+        let err = expect_failed_tool_result(&result);
+        assert_text_contains_all(err, &["company_name"]);
     }
 
     #[tokio::test]
     async fn execute_network_failure_returns_structured_error() {
-        // 使用一个必然失败的端口
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local test port");
+        let addr = listener.local_addr().expect("read local addr");
+        let server = tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
+
         let tool = DeepResearchTool::new(
-            "http://user:pass@127.0.0.1:19/api/research/start?token=secret&ok=1",
+            &format!("http://user:pass@{addr}/api/research/start?token=secret&ok=1"),
             "",
         );
         let result = tool
             .execute(serde_json::json!({"company_name": "NVIDIA"}))
             .await
             .expect("execute should not panic");
-        assert_eq!(result["success"].as_bool(), Some(false));
-        let err = result["error"].as_str().unwrap_or_default();
-        assert!(!err.is_empty(), "error should have message");
-        assert!(!err.contains("secret"));
-        assert!(!err.contains("user:pass"));
-        assert!(err.contains("token=<redacted>"));
-        assert!(err.contains("<redacted>@127.0.0.1"));
+        let _ = server.await;
+        let err = expect_failed_tool_result(&result);
+        assert_text_contains_all(err, &["token=<redacted>", "<redacted>@127.0.0.1"]);
+        assert_text_contains_none(err, &["secret", "user:pass"]);
     }
 
     #[test]
     fn deep_research_error_detail_redacts_url_credentials() {
         let detail = sanitize_deep_research_error_detail(
-            "request failed for https://user:pass@example.test/path?api_key=abc&ok=1",
+            "request failed for https://user:pass@example.test/path?api_key=abc;ok=1",
         );
         assert_eq!(
             detail,
-            "request failed for https://<redacted>@example.test/path?api_key=<redacted>&ok=1"
+            "request failed for https://<redacted>@example.test/path?api_key=<redacted>;ok=1"
         );
     }
 
     #[test]
     fn deep_research_error_detail_redacts_bearer_credentials() {
-        let detail =
-            sanitize_deep_research_error_detail("request failed with Authorization: Bearer abc123");
+        let detail = sanitize_deep_research_error_detail(
+            "request failed with Authorization: Bearer abc123 and Authorization: Basic basic-secret plus authorization: bearer lower-secret",
+        );
         assert_eq!(
             detail,
-            "request failed with Authorization: Bearer <redacted>"
+            "request failed with Authorization: Bearer <redacted> and Authorization: Basic <redacted> plus authorization: bearer <redacted>"
         );
     }
 
     #[test]
     fn deep_research_error_detail_redacts_colon_credentials() {
         let detail = sanitize_deep_research_error_detail(
-            "backend rejected request with apiKey: header-secret and token=token-secret",
+            "backend rejected request with apiKey: header-secret token=token-secret OPENROUTER_API_KEY=env-secret X-API-Key: gateway-secret client_secret: client-secret",
         );
 
-        assert!(detail.contains("apiKey: <redacted>"));
-        assert!(detail.contains("token=<redacted>"));
-        assert!(!detail.contains("header-secret"));
-        assert!(!detail.contains("token-secret"));
+        assert_text_contains_all(
+            &detail,
+            &[
+                "apiKey: <redacted>",
+                "token=<redacted>",
+                "OPENROUTER_API_KEY=<redacted>",
+                "X-API-Key: <redacted>",
+                "client_secret: <redacted>",
+            ],
+        );
+        assert_text_contains_none(
+            &detail,
+            &[
+                "header-secret",
+                "token-secret",
+                "env-secret",
+                "gateway-secret",
+                "client-secret",
+            ],
+        );
     }
 
     #[test]
@@ -416,15 +465,17 @@ mod tests {
             }
         }));
 
-        assert!(detail.contains("backend rejected token=<redacted>"));
-        assert!(detail.contains("Bearer <redacted>"));
-        assert!(detail.contains("\"api_key\":\"<redacted>\""));
-        assert!(detail.contains("\"token\":\"<redacted>\""));
-        assert!(detail.contains("\"safe\":\"kept\""));
-        assert!(!detail.contains("abc"));
-        assert!(!detail.contains("xyz"));
-        assert!(!detail.contains(":\"key\""));
-        assert!(!detail.contains(":\"tok\""));
+        assert_text_contains_all(
+            &detail,
+            &[
+                "backend rejected token=<redacted>",
+                "Bearer <redacted>",
+                "\"api_key\":\"<redacted>\"",
+                "\"token\":\"<redacted>\"",
+                "\"safe\":\"kept\"",
+            ],
+        );
+        assert_text_contains_none(&detail, &["abc", "xyz", ":\"key\"", ":\"tok\""]);
     }
 
     #[tokio::test]
@@ -458,14 +509,12 @@ mod tests {
             .await
             .expect("execute should return structured error");
 
-        assert_eq!(result["success"].as_bool(), Some(false));
+        let error = expect_failed_tool_result(&result);
         assert!(result.get("raw").is_none());
-        let error = result["error"].as_str().expect("error message");
-        assert!(error.contains("HTTP 502"), "{error}");
-        assert!(error.contains("token=<redacted>"), "{error}");
-        assert!(error.contains("Bearer <redacted>"), "{error}");
-        assert!(!error.contains("abc"), "{error}");
-        assert!(!error.contains("xyz"), "{error}");
-        assert!(!error.contains("trace-1"), "{error}");
+        assert_text_contains_all(
+            error,
+            &["HTTP 502", "token=<redacted>", "Bearer <redacted>"],
+        );
+        assert_text_contains_none(error, &["abc", "xyz", "trace-1"]);
     }
 }

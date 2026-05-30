@@ -22,7 +22,7 @@ const ZH = {
     immediate_enabled: "✅ 启用",
     immediate_disabled: "❌ 已禁用",
     immediate_min_prefix: " · 最低：",
-    immediate_only_portfolio: " · 仅持仓",
+    immediate_only_portfolio: " · 仅持仓相关",
     immediate_price_threshold: " · 价格阈值 {pct}%",
   },
   table: {
@@ -34,13 +34,13 @@ const ZH = {
     col_hint: "操作提示",
     empty: "无定时推送（所有事件走即时推）",
     cell_quiet_held: "🌙 勿扰暂存",
-    cell_bypass_quiet: "✅ 跳过勿扰",
+    cell_bypass_quiet: "✅ 勿扰豁免",
     cell_active: "✅",
   },
   filters: {
-    blocked_kinds: "不接收事件类型：",
+    blocked_kinds: "屏蔽事件类型：",
     allow_kinds: "接收事件类型：",
-    exempt_in_quiet: "勿扰豁免类型：",
+    exempt_in_quiet: "勿扰豁免事件类型：",
   },
 }
 
@@ -61,12 +61,12 @@ const EN: typeof ZH = {
     timezone: "Timezone",
     quiet_hours: "Quiet hours",
     quiet_disabled: "Disabled",
-    quiet_exempt_prefix: "exempt: {kinds}",
+    quiet_exempt_prefix: "Exempt: {kinds}",
     immediate: "Immediate",
     immediate_enabled: "✅ Enabled",
     immediate_disabled: "❌ Disabled",
-    immediate_min_prefix: " · min: ",
-    immediate_only_portfolio: " · portfolio only",
+    immediate_min_prefix: " · min severity: ",
+    immediate_only_portfolio: " · portfolio-only",
     immediate_price_threshold: " · price ≥ {pct}%",
   },
   table: {
@@ -76,15 +76,15 @@ const EN: typeof ZH = {
     col_freq: "Frequency",
     col_active: "Today",
     col_hint: "Edit hint",
-    empty: "No scheduled pushes (all events go immediate).",
-    cell_quiet_held: "🌙 Held by quiet",
-    cell_bypass_quiet: "✅ Bypasses quiet",
+    empty: "No scheduled pushes (all events are sent immediately).",
+    cell_quiet_held: "🌙 Held by quiet hours",
+    cell_bypass_quiet: "✅ Bypasses quiet hours",
     cell_active: "✅",
   },
   filters: {
-    blocked_kinds: "Blocked event types: ",
-    allow_kinds: "Received event types: ",
-    exempt_in_quiet: "Quiet-hour exemptions: ",
+    blocked_kinds: "Muted event types: ",
+    allow_kinds: "Events received: ",
+    exempt_in_quiet: "Quiet-hours exemptions: ",
   },
 }
 

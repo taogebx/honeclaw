@@ -2,7 +2,8 @@
 //!
 //! 当前行为：
 //! - `poll()` 从 FMP 拉一页最新新闻（可选 ticker 过滤，`None` 表示全局流）
-//! - 默认 severity = Low；title/text 命中关键词库 → 升级为 High
+//! - 默认 severity = Low；trusted 来源命中关键词库才升 High
+//! - legal-ad / PR wire / opinion blog 保持 Low；uncertain 来源留给 router LLM 仲裁
 //! - id 直接用文章 URL 做稳定去重；缺 URL 则回落到 "title+date" 组合
 //! - 关键词库先内置一组保守的"高影响"词（破产、SEC 调查、召回、被起诉、CEO 辞任、收购等）
 
@@ -177,7 +178,7 @@ pub fn is_earnings_call_transcript_title(title: &str) -> bool {
     lower.contains("earnings call transcript") || lower.contains("earnings transcript")
 }
 
-/// 默认高影响关键词（小写匹配）。后续可从 config 注入覆盖。
+/// 默认高影响关键词（小写匹配）。测试或调用方可通过 `with_keywords` 覆盖。
 const DEFAULT_CRITICAL_KEYWORDS: &[&str] = &[
     "bankruptcy",
     "bankrupt",
@@ -831,13 +832,13 @@ mod tests {
     #[ignore]
     async fn live_fmp_news_smoke() {
         let key = std::env::var("HONE_FMP_API_KEY").expect("需要 HONE_FMP_API_KEY");
-        let cfg = hone_core::config::FmpConfig {
+        let fmp_config = hone_core::config::FmpConfig {
             api_key: key,
             api_keys: vec![],
             base_url: "https://financialmodelingprep.com/api".into(),
             timeout: 30,
         };
-        let client = FmpClient::from_config(&cfg);
+        let client = FmpClient::from_config(&fmp_config);
         let poller = NewsPoller::new(
             client,
             SourceSchedule::FixedInterval(std::time::Duration::from_secs(60)),
@@ -845,8 +846,8 @@ mod tests {
         .with_page_limit(5);
         let events = poller.poll().await.expect("FMP poll failed");
         println!("news events pulled: {}", events.len());
-        for ev in events.iter().take(5) {
-            println!("  [{:?}] {} · {}", ev.severity, ev.title, ev.id);
+        for event in events.iter().take(5) {
+            println!("  [{:?}] {} · {}", event.severity, event.title, event.id);
         }
         assert!(!events.is_empty());
     }

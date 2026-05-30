@@ -52,9 +52,10 @@ pub struct EventEngine {
     sink: Arc<dyn OutboundSink>,
     polisher: Arc<dyn BodyPolisher>,
     news_classifier: Option<Arc<dyn news_classifier::NewsClassifier>>,
-    /// LLM provider 用于 global_digest 的 Curator(Pass 1 + Pass 2)。
-    /// 缺省 None → global_digest 调度器不会启动,即使 config.global_digest.enabled=true
-    /// 也只 warn 不报错。
+    /// global_digest 的通用 LLM provider fallback。未注入分阶段 provider 时,
+    /// Pass 1 / Pass 2 都复用它;event_dedupe 再默认复用 Pass 2 provider。
+    /// 缺省 None 且未注入分阶段 provider → global news section 不装配 curator,
+    /// 即使 config.global_digest.enabled=true 也只 warn 不报错。
     global_digest_provider: Option<Arc<dyn hone_llm::LlmProvider>>,
     global_digest_pass1_provider: Option<Arc<dyn hone_llm::LlmProvider>>,
     global_digest_pass2_provider: Option<Arc<dyn hone_llm::LlmProvider>>,
@@ -162,8 +163,9 @@ impl EventEngine {
         self
     }
 
-    /// 注入 LLM provider 用于 global_digest 的 Curator(Pass 1 + Pass 2)。
-    /// 缺省 None → global_digest 不会启动(即使 config.global_digest.enabled=true 也只 warn)。
+    /// 注入 global_digest 的通用 LLM provider fallback。
+    /// 分阶段 provider 未配置时,Pass 1 / Pass 2 复用该 provider;event_dedupe
+    /// 默认复用 Pass 2 provider。
     pub fn with_global_digest_provider(mut self, provider: Arc<dyn hone_llm::LlmProvider>) -> Self {
         self.global_digest_provider = Some(provider);
         self
@@ -783,20 +785,20 @@ impl EventEngine {
         // ── 社交源监听(通用 EventSource trait)─────────────────────────
         // Telegram channel web preview。
         // 事件一律 Low + payload.source_class="uncertain",交给 router 的
-        // LLM 仲裁链路按"是否重要"决定升 Medium 即时推(见 router.rs
+        // LLM 仲裁链路按"是否重要"决定升 Medium 即时推(见 router::classify 的
         // maybe_llm_upgrade_for_actor)。symbols 多数为空,靠 social
-        // GlobalSubscription(见 subscription.rs registry_from_portfolios)
+        // GlobalSubscription(见 subscription::registry_from_portfolios)
         // 把事件 fanout 给所有 actor 后再过 LLM。
-        for cfg in &sources.telegram_channels {
+        for telegram_channel in &sources.telegram_channels {
             let poller = TelegramChannelPoller::new(
-                cfg.handle.clone(),
-                Duration::from_secs(cfg.interval_secs),
-                cfg.extract_cashtags,
+                telegram_channel.handle.clone(),
+                Duration::from_secs(telegram_channel.interval_secs),
+                telegram_channel.extract_cashtags,
             );
             info!(
-                handle = %cfg.handle,
-                interval_secs = cfg.interval_secs,
-                extract_cashtags = cfg.extract_cashtags,
+                handle = %telegram_channel.handle,
+                interval_secs = telegram_channel.interval_secs,
+                extract_cashtags = telegram_channel.extract_cashtags,
                 "telegram channel poller starting"
             );
             spawn_event_source(
@@ -808,16 +810,16 @@ impl EventEngine {
         }
         // 通用 RSS 源 —— global_digest 的核心数据补充。事件直接落 source="rss:{handle}"
         // 入 events 表,collector 与 FMP news 一同拉,curator 不区分来源。
-        for cfg in &sources.rss_feeds {
+        for rss_feed in &sources.rss_feeds {
             let poller = RssNewsPoller::new(
-                cfg.handle.clone(),
-                cfg.url.clone(),
-                Duration::from_secs(cfg.interval_secs),
+                rss_feed.handle.clone(),
+                rss_feed.url.clone(),
+                Duration::from_secs(rss_feed.interval_secs),
             );
             info!(
-                handle = %cfg.handle,
-                url = %cfg.url,
-                interval_secs = cfg.interval_secs,
+                handle = %rss_feed.handle,
+                url = %rss_feed.url,
+                interval_secs = rss_feed.interval_secs,
                 "rss feed poller starting"
             );
             spawn_event_source(

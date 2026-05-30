@@ -1,6 +1,6 @@
 # Hone Wiki
 
-Last updated: 2026-05-11
+Last updated: 2026-05-27
 
 This page is the practical wiki entry for Honeclaw. It explains the repository layout, the main runtime pieces, and the common ways to install, configure, start, stop, and verify the project.
 
@@ -17,7 +17,7 @@ This page is the practical wiki entry for Honeclaw. It explains the repository l
 - [Desktop Startup Modes](#desktop-startup-modes)
 - [Web Startup Modes](#web-startup-modes)
 - [Configuration](#configuration)
-- [Model And Runner Setup](#model-and-runner-setup)
+- [Model and Runner Setup](#model-and-runner-setup)
 - [Channel Setup](#channel-setup)
 - [Common URLs And Ports](#common-urls-and-ports)
 - [Stop, Restart, And Cleanup](#stop-restart-and-cleanup)
@@ -170,7 +170,7 @@ hone-cli onboard
 hone-cli start
 ```
 
-`hone-cli onboard` guides runner selection, optional channel setup, and provider/API-key setup. `hone-cli start` starts the local backend plus enabled channel listeners in the foreground.
+`hone-cli onboard` guides runner selection, optional channel setup, and provider API key setup. `hone-cli start` starts the local backend plus enabled channel listeners in the foreground.
 
 See the detailed runbook: [`docs/runbooks/hone-cli-install-and-start.md`](./runbooks/hone-cli-install-and-start.md).
 
@@ -283,25 +283,29 @@ hone-cli models set --runner opencode_acp --model openrouter/openai/gpt-5.4 --va
 
 Important config areas:
 
-- `agent.*`: runner choice, model routing, timeout behavior.
+- `agent.*`: runner choice, model routing, `daily_conversation_limit`, and timeout behavior.
 - `llm.*`: provider keys and OpenAI-compatible/OpenRouter routes.
 - `imessage.*`, `feishu.*`, `telegram.*`, `discord.*`: channel enablement, credentials, allowlists, and chat scope.
 - `web.*`: Web console auth token and workflow/research integration settings.
-- `storage.*`: session data paths and backend selection, especially `sessions_dir`, `session_sqlite_db_path`, `session_sqlite_shadow_write_enabled`, and `session_runtime_backend`.
+- `storage.*`: session data paths and backend selection, especially `sessions_dir`, `session_sqlite_db_path`, `session_sqlite_shadow_write_enabled`, `session_runtime_backend`, `conversation_quota_dir`, `llm_audit_db_path`, and `notif_prefs_dir`.
+- `cloud.*`: migration-time managed Postgres / OSS env references. `cloud.enabled` may also become effectively enabled when `HONE_CLOUD_ENABLED` is true or the referenced env vars are present; `cloud.strict_no_local_storage` / `HONE_CLOUD_STRICT_NO_LOCAL_STORAGE` fail startup while local storage dependencies remain.
 - `admins.*`: channel admin identities and runtime admin registration passphrase.
 - `event_engine.*`: market/news event monitoring and delivery.
-- `logging.*`: runtime log level, file output, console output, and optional UDP sink.
+- `logging.*`: runtime log level and local UDP sink port. `udp_port: null` uses the default `18118` UDP sink, with no config-level disable switch today; `console` and `file` remain parsed compatibility fields until file/console sinks are wired.
 - `security.*`: actor isolation and tool-guard policy.
 - `nano_banana.*`: OpenRouter-backed image generation defaults.
 - `search.*`, `fmp.*`: external data/search providers.
 - `language`: UI / CLI display language (`zh` or `en`).
 
 Admin/public Web ports are runtime environment settings, primarily `HONE_WEB_PORT` and `HONE_PUBLIC_WEB_PORT`, rather than `config.yaml` keys.
-Public SMS login and optional Aliyun Captcha are also runtime environment settings; use `config.example.yaml` and `docs/runbooks/backend-deployment.md` as the reference for `ALIBABA_CLOUD_*`, `HONE_ALIYUN_SMS_*`, `HONE_ALIYUN_CAPTCHA_*`, and `HONE_PUBLIC_SECURE_COOKIE`.
+Public SMS login and optional Aliyun Captcha are also runtime environment settings; use `config.example.yaml` and `docs/runbooks/backend-deployment.md` as the reference for `ALIBABA_CLOUD_*`, `HONE_ALIYUN_SMS_*`, `HONE_ALIYUN_CAPTCHA_*`, and `HONE_PUBLIC_SECURE_COOKIE`. Active admin-created Web invite users remain the public-login invite-list admission source. For the public session cookie, `HONE_PUBLIC_SECURE_COOKIE` accepts `true/1/yes` and `false/0/no`; invalid non-empty values keep `Secure=true`.
+For OpenRouter credentials, prefer the `llm.providers.openrouter.api_key/api_keys` pool; legacy `llm.openrouter.*` key fields are migration fallbacks only.
+For Tavily web search, the current runtime tool reads `search.api_keys` and `search.max_results`; `search.provider`, `search.search_depth`, and `search.topic` are preserved schema fields but are not wired into the request yet.
+For managed cloud storage, keep actual `DATABASE_URL`, `HONE_POSTGRES_*`, and `HONE_OSS_*` values outside committed config. `cloud.strict_no_local_storage` is only safe after the remaining local session, cron, audit, portfolio, notification preference, KB, and log stores have managed backends.
 
 Never commit local secrets in `config.yaml`.
 
-## Model And Runner Setup
+## Model and Runner Setup
 
 Hone can use Hone Cloud, local CLI/ACP runners, or OpenAI-compatible cloud APIs.
 
@@ -309,17 +313,18 @@ Common runner choices:
 
 | Runner | Use When |
 | --- | --- |
-| `hone_cloud` | You want the default hosted Hone service from `config.example.yaml`; set `agent.hone_cloud.api_key` before starting. |
+| `hone_cloud` | You want the hosted Hone service seeded by `config.example.yaml`; set `agent.hone_cloud.api_key` before starting. |
 | `opencode_acp` | You want Hone to inherit local OpenCode provider/model config. |
 | `codex_acp` | You use Codex ACP and want ACP session integration. |
 | `codex_cli` | You use Codex CLI directly. |
 | `function_calling` | You want the built-in OpenAI-compatible function-calling path. |
-| `multi-agent` | You want separate search and OpenCode ACP answer stages; search keys come from `agent.multi_agent.search.api_key` or legacy `llm.auxiliary.api_key`, while answer keys can inherit `llm.providers.openrouter`. |
+| `multi-agent` | You want separate search and OpenCode ACP answer stages; search keys come from `agent.multi_agent.search.api_key` or legacy `llm.auxiliary.api_key`, while answer can inherit the `llm.providers.openrouter.api_key/api_keys` pool when `agent.multi_agent.answer.api_key` is empty. |
 
 Typical OpenCode setup:
 
 ```bash
 curl -fsSL https://opencode.ai/install | bash
+opencode # run /connect and set the default provider/model
 hone-cli config set agent.runner opencode_acp
 hone-cli start
 ```

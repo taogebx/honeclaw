@@ -13,7 +13,7 @@ Why the name Hone:
 </p>
 
 <p align="center">
-  <strong>English</strong> | <a href="./README_ZH.md">简体中文</a> | <strong>Website:</strong> <a href="https://hone-claw.com" target="_blank">hone-claw.com</a> | <strong>💬 Community:</strong> <a href="https://discord.gg/TyDNfYXDGF" target="_blank">Discord</a>
+  <strong>English</strong> | <a href="./README_ZH.md">简体中文</a> | <strong>Website:</strong> <a href="https://hone-claw.com" target="_blank">hone-claw.com</a> | <strong>Blog:</strong> <a href="https://hone-claw.com/blog" target="_blank">hone-claw.com/blog</a> | <strong>💬 Community:</strong> <a href="https://discord.gg/TyDNfYXDGF" target="_blank">Discord</a>
 </p>
 
 ---
@@ -39,7 +39,7 @@ The public product website is now live at **[hone-claw.com](https://hone-claw.co
 - 🧠 **An Absolutely Rational Core**: It does not flatter and does not follow blindly. When you make investment decisions, it cross-checks them against data and predefined discipline, identifying flaws in your reasoning.
 - 📱 **Seamless Cross-Platform Access**: Supports Web, iMessage, Lark, Telegram, and Discord, so you can engage with your investment brain anytime, anywhere.
 - 🗂️ **Company Portraits & Long-term Memory**: Hone can continuously accumulate company profiles and event timelines in Markdown, helping you preserve investment mainline, key operating metrics, risks, and major developments as a reusable long-term research asset.
-- 📊 **Position Monitoring & Discipline**: Set your take-profit and stop-loss levels, add-to-position logic, and key indicators to watch, and Hone will monitor the market for you like a cold, vigilant sentinel.
+- 📊 **Position Monitoring & Discipline**: Set your take-profit and stop-loss levels, add-to-position logic, and key indicators to watch, and Hone will monitor the market and alert you when your conditions trigger.
 - ⏰ **Powerful Scheduled Tasks (Cron Jobs)**: Supports complex scheduled monitoring tasks, such as pre-market briefings, post-market summaries, and automatic analysis after specific earnings releases.
 - ⚡ **Rust-powered Extreme Performance**: Built entirely in Rust at the core, ensuring millisecond-level responsiveness for messages across multiple platforms with minimal footprint.
 
@@ -74,7 +74,7 @@ The public product website is now live at **[hone-claw.com](https://hone-claw.co
 ## Prerequisites
 
 - **Environment**: A Unix-like system (**macOS** or **Ubuntu** recommended).
-- **Rust**: Toolchain **Edition 2021** or newer.
+- **Rust**: Stable toolchain with **Edition 2024** support.
 
 ### Tech stack
 
@@ -82,6 +82,8 @@ The public product website is now live at **[hone-claw.com](https://hone-claw.co
 - **Backend**: Rust
 - **Client** (desktop): Rust (Tauri)
 - **Frontend**: SolidJS + Tailwind v4 (Ultra-fast, Clean UI)
+
+Why Rust: see the first Hone Blog post, [Why Hone uses Rust, and why more teams should start using Rust](https://hone-claw.com/blog/why-hone-uses-rust).
 
 ### Supported channels
 

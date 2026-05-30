@@ -4,7 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::Datelike;
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Timelike};
 use hone_scheduler::SchedulerEvent;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -26,7 +26,7 @@ use crate::{AgentSession, HoneBotCore};
 
 const HEARTBEAT_NOOP_SENTINEL: &str = "[[HEARTBEAT_NOOP]]";
 const HEARTBEAT_INTERNAL_PREFIX: &str = "[[HEART";
-const HEARTBEAT_MAX_ITERATIONS: u32 = 10;
+const HEARTBEAT_MAX_ITERATIONS: u32 = 18;
 const HEARTBEAT_MAX_TOKENS: u16 = 4096;
 const HEARTBEAT_ALLOWED_TOOLS: &[&str] = &[
     "data_fetch",
@@ -61,6 +61,30 @@ static RE_HEARTBEAT_TRIGGER_PRICE_BEFORE_CURRENT: LazyLock<regex::Regex> = LazyL
             r"(?is)(?:触发价|触发线|配置线|trigger\s*price|trigger\s*line)[^\d]{0,20}\$?\s*(?P<threshold>\d+(?:\.\d+)?)[\s\S]{0,120}(?:当前(?:价格|价)?|最新(?:价格|价)?|current(?:\s*price)?)[^\d]{0,20}\$?\s*(?P<current>\d+(?:\.\d+)?)",
         )
         .expect("valid heartbeat trigger price regex")
+});
+
+static RE_HEARTBEAT_PRICE_TIMESTAMP_DATE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?isx)
+        (?:当前(?:价格|价)?|最新(?:价格|价)?|现价|现报|收盘价|跌至|跌到|降至|回落至|current(?:\s*price)?|last(?:\s*price)?|quote)
+        [^\n。；;]{0,120}
+        (?:
+            (?P<year_cn>20\d{2})年(?P<month_cn>\d{1,2})月(?P<day_cn>\d{1,2})日
+            |
+            (?P<year_iso>20\d{2})[-/](?P<month_iso>\d{1,2})[-/](?P<day_iso>\d{1,2})
+        )
+        ",
+    )
+    .expect("valid heartbeat price timestamp regex")
+});
+
+const HEARTBEAT_PRICE_TIMESTAMP_MAX_AGE_DAYS: i64 = 3;
+
+static RE_HEARTBEAT_BEIJING_TRIGGER_TIME: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"北京时间\s*(?P<hour>\d{1,2})(?:[:：点时](?P<minute>\d{1,2})?)?(?:分)?(?P<tail>\s*[^\n。；;]{0,24}(?:监控|检查|心跳|任务|本轮)[^\n。；;]{0,16}触发)",
+    )
+    .expect("valid heartbeat beijing trigger time regex")
 });
 
 static RE_HEARTBEAT_FACT_TOKEN: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -112,6 +136,7 @@ pub enum HeartbeatParseKind {
     JsonUnknownStatus,
     JsonMalformed,
     PlainTextSuppressed,
+    PlainTextNoop,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +201,56 @@ fn parse_heartbeat_json_payload(content: &str) -> Option<HeartbeatJsonResponse> 
         .into_iter()
         .rev()
         .find_map(|candidate| serde_json::from_str::<HeartbeatJsonResponse>(candidate).ok())
+}
+
+fn heartbeat_status_indicates_noop(status: &str) -> bool {
+    let compact = status
+        .split_whitespace()
+        .collect::<String>()
+        .replace(['-', '_'], "")
+        .to_ascii_lowercase();
+    matches!(
+        compact.as_str(),
+        "noop"
+            | "none"
+            | "false"
+            | "nottriggered"
+            | "notrigger"
+            | "conditionnotmet"
+            | "conditionsnotmet"
+            | "notmet"
+            | "unmet"
+            | "skip"
+            | "skipped"
+            | "nosend"
+    ) || status.contains("未触发")
+        || status.contains("不触发")
+        || status.contains("未满足")
+        || status.contains("不满足")
+}
+
+fn heartbeat_status_indicates_triggered(status: &str) -> bool {
+    let compact = status
+        .split_whitespace()
+        .collect::<String>()
+        .replace(['-', '_'], "")
+        .to_ascii_lowercase();
+    matches!(
+        compact.as_str(),
+        "triggered"
+            | "trigger"
+            | "alert"
+            | "send"
+            | "true"
+            | "yes"
+            | "met"
+            | "hit"
+            | "conditionmet"
+            | "conditionsmet"
+    ) || status.contains("已触发")
+        || status.contains("触发")
+        || status.contains("命中")
+        || status.contains("满足")
 }
 
 fn previous_visible_char(content: &str, idx: usize) -> Option<char> {
@@ -355,6 +430,37 @@ fn recover_malformed_triggered_heartbeat_message(content: &str) -> Option<String
     None
 }
 
+fn heartbeat_plain_text_indicates_noop(text: &str) -> bool {
+    let compact = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("")
+        .to_ascii_lowercase();
+    [
+        "条件未满足",
+        "条件不满足",
+        "不满足触发",
+        "尚未触发",
+        "未触发",
+        "不触发",
+        "无需触发",
+        "不需要发送",
+        "本轮不发送",
+        "输出{\"status\":\"noop\"}",
+        "输出`{\"status\":\"noop\"}`",
+        "returnnoop",
+        "outputnoop",
+        "shouldoutputnoop",
+        "notmet",
+        "nottriggered",
+        "notrigger",
+        "conditionisnotmet",
+        "conditionsarenotmet",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker))
+}
+
 fn heartbeat_internal_marker_prefix(text: &str) -> bool {
     let trimmed = text.trim_start();
     let upper = trimmed.to_ascii_uppercase();
@@ -490,6 +596,115 @@ fn heartbeat_lower_trigger_price_contradiction(text: &str, compact: &str) -> boo
             .and_then(|m| m.as_str().parse::<f64>().ok());
         matches!((current, threshold), (Some(current), Some(threshold)) if current > threshold)
     })
+}
+
+fn heartbeat_price_timestamp_context_date(captures: &regex::Captures<'_>) -> Option<NaiveDate> {
+    let year = captures
+        .name("year_cn")
+        .or_else(|| captures.name("year_iso"))
+        .and_then(|m| m.as_str().parse::<i32>().ok())?;
+    let month = captures
+        .name("month_cn")
+        .or_else(|| captures.name("month_iso"))
+        .and_then(|m| m.as_str().parse::<u32>().ok())?;
+    let day = captures
+        .name("day_cn")
+        .or_else(|| captures.name("day_iso"))
+        .and_then(|m| m.as_str().parse::<u32>().ok())?;
+    NaiveDate::from_ymd_opt(year, month, day)
+}
+
+fn heartbeat_triggered_price_threshold_context(text: &str) -> bool {
+    let compact = text
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    [
+        "阈值",
+        "触发价",
+        "触发线",
+        "配置线",
+        "警戒线",
+        "跌破",
+        "低于",
+        "突破",
+        "高于",
+        "threshold",
+        "triggerprice",
+        "triggerline",
+        "below",
+        "above",
+    ]
+    .iter()
+    .any(|term| compact.contains(term))
+}
+
+fn heartbeat_stale_price_timestamp(text: &str, reference_date: NaiveDate) -> Option<NaiveDate> {
+    if !heartbeat_triggered_price_threshold_context(text) {
+        return None;
+    }
+    RE_HEARTBEAT_PRICE_TIMESTAMP_DATE
+        .captures_iter(text)
+        .filter_map(|captures| heartbeat_price_timestamp_context_date(&captures))
+        .find(|date| {
+            reference_date.signed_duration_since(*date).num_days()
+                > HEARTBEAT_PRICE_TIMESTAMP_MAX_AGE_DAYS
+        })
+}
+
+fn heartbeat_reference_now_beijing() -> DateTime<FixedOffset> {
+    let beijing_tz = chrono::FixedOffset::east_opt(8 * 3600).expect("valid beijing offset");
+    chrono::Utc::now().with_timezone(&beijing_tz)
+}
+
+fn heartbeat_check_time_text(now: DateTime<FixedOffset>) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        now.year(),
+        now.month(),
+        now.day(),
+        now.hour(),
+        now.minute()
+    )
+}
+
+fn heartbeat_current_check_time_text() -> String {
+    heartbeat_check_time_text(heartbeat_reference_now_beijing())
+}
+
+fn normalize_heartbeat_beijing_trigger_time(
+    text: &str,
+    reference_now: DateTime<FixedOffset>,
+) -> (String, Option<String>) {
+    let reference_hour = reference_now.hour();
+    let reference_minute = reference_now.minute();
+    let mut normalized_from = None;
+    let normalized = RE_HEARTBEAT_BEIJING_TRIGGER_TIME
+        .replace_all(text, |captures: &regex::Captures<'_>| {
+            let hour = captures
+                .name("hour")
+                .and_then(|matched| matched.as_str().parse::<u32>().ok());
+            let minute = captures
+                .name("minute")
+                .and_then(|matched| matched.as_str().parse::<u32>().ok())
+                .unwrap_or(0);
+            let Some(hour) = hour else {
+                return captures[0].to_string();
+            };
+            if hour >= 24 || minute >= 60 || (hour == reference_hour && minute == reference_minute)
+            {
+                return captures[0].to_string();
+            }
+            normalized_from.get_or_insert_with(|| format!("{hour:02}:{minute:02}"));
+            let tail = captures
+                .name("tail")
+                .map(|m| m.as_str())
+                .unwrap_or_default();
+            format!("北京时间 {reference_hour:02}:{reference_minute:02}{tail}")
+        })
+        .into_owned();
+    (normalized, normalized_from)
 }
 
 /// 直接从 `notif_prefs_dir/{actor_slug}.json` 读 actor 的 quiet_hours + timezone。
@@ -877,6 +1092,9 @@ pub fn inspect_heartbeat_result(content: &str) -> (HeartbeatOutcome, HeartbeatPa
     let stripped = strip_internal_reasoning_blocks(content);
     let trimmed = stripped.trim();
     if trimmed.is_empty() {
+        if heartbeat_plain_text_indicates_noop(content) {
+            return (HeartbeatOutcome::Noop, HeartbeatParseKind::PlainTextNoop);
+        }
         return (HeartbeatOutcome::Noop, HeartbeatParseKind::Empty);
     }
     if trimmed == HEARTBEAT_NOOP_SENTINEL || heartbeat_internal_marker_present(trimmed) {
@@ -888,13 +1106,13 @@ pub fn inspect_heartbeat_result(content: &str) -> (HeartbeatOutcome, HeartbeatPa
 
     if let Some(parsed) = parse_heartbeat_json_payload(trimmed) {
         let status = parsed.status.unwrap_or_default();
-        if status.eq_ignore_ascii_case("noop") {
+        if heartbeat_status_indicates_noop(&status) {
             return (HeartbeatOutcome::Noop, HeartbeatParseKind::JsonNoop);
         }
         if status.is_empty() {
             return (HeartbeatOutcome::Noop, HeartbeatParseKind::JsonEmptyStatus);
         }
-        if status.eq_ignore_ascii_case("triggered") {
+        if heartbeat_status_indicates_triggered(&status) {
             let raw_message = parsed.message.unwrap_or_default();
             let message = unwrap_nested_json_message(raw_message.trim())
                 .trim()
@@ -924,6 +1142,10 @@ pub fn inspect_heartbeat_result(content: &str) -> (HeartbeatOutcome, HeartbeatPa
         return (HeartbeatOutcome::Noop, HeartbeatParseKind::JsonMalformed);
     }
 
+    if heartbeat_plain_text_indicates_noop(trimmed) {
+        return (HeartbeatOutcome::Noop, HeartbeatParseKind::PlainTextNoop);
+    }
+
     (
         HeartbeatOutcome::Noop,
         HeartbeatParseKind::PlainTextSuppressed,
@@ -941,9 +1163,7 @@ pub struct ScheduledTaskExecution {
 fn heartbeat_parse_error_message(parse_kind: &HeartbeatParseKind) -> Option<String> {
     match parse_kind {
         HeartbeatParseKind::Empty => Some("heartbeat 输出为空，任务已标记失败".to_string()),
-        HeartbeatParseKind::JsonEmptyStatus => {
-            Some("heartbeat 输出缺少状态字段，任务已标记失败".to_string())
-        }
+        HeartbeatParseKind::JsonEmptyStatus => None,
         HeartbeatParseKind::JsonUnknownStatus => {
             Some("heartbeat 输出包含未知状态，任务已标记失败".to_string())
         }
@@ -960,6 +1180,40 @@ fn heartbeat_parse_error_message(parse_kind: &HeartbeatParseKind) -> Option<Stri
 fn heartbeat_execution_from_content(
     content: &str,
     heartbeat_model: &str,
+) -> ScheduledTaskExecution {
+    heartbeat_execution_from_content_at_beijing(
+        content,
+        heartbeat_model,
+        heartbeat_reference_now_beijing(),
+    )
+}
+
+fn heartbeat_execution_from_content_at(
+    content: &str,
+    heartbeat_model: &str,
+    reference_date: NaiveDate,
+) -> ScheduledTaskExecution {
+    heartbeat_execution_from_content_internal(content, heartbeat_model, reference_date, None)
+}
+
+fn heartbeat_execution_from_content_at_beijing(
+    content: &str,
+    heartbeat_model: &str,
+    reference_now: DateTime<FixedOffset>,
+) -> ScheduledTaskExecution {
+    heartbeat_execution_from_content_internal(
+        content,
+        heartbeat_model,
+        reference_now.date_naive(),
+        Some(reference_now),
+    )
+}
+
+fn heartbeat_execution_from_content_internal(
+    content: &str,
+    heartbeat_model: &str,
+    reference_date: NaiveDate,
+    reference_now: Option<DateTime<FixedOffset>>,
 ) -> ScheduledTaskExecution {
     let raw_preview = truncate_for_log(content.trim(), 280);
     let raw_chars = content.chars().count();
@@ -992,7 +1246,7 @@ fn heartbeat_execution_from_content(
             session_id: None,
         },
         HeartbeatOutcome::Deliver(message) => {
-            let sanitized_message = sanitize_scheduler_delivery_text(&message);
+            let mut sanitized_message = sanitize_scheduler_delivery_text(&message);
             if sanitized_message.trim().is_empty() {
                 return ScheduledTaskExecution {
                     should_deliver: false,
@@ -1010,7 +1264,13 @@ fn heartbeat_execution_from_content(
                     session_id: None,
                 };
             }
-            let deliver_preview = truncate_for_log(message.trim(), 200);
+            let normalized_beijing_trigger_time = reference_now.and_then(|reference_now| {
+                let (normalized, normalized_from) =
+                    normalize_heartbeat_beijing_trigger_time(&sanitized_message, reference_now);
+                sanitized_message = normalized;
+                normalized_from
+            });
+            let deliver_preview = truncate_for_log(sanitized_message.trim(), 200);
             if heartbeat_near_threshold_without_crossing(&sanitized_message) {
                 return ScheduledTaskExecution {
                     should_deliver: false,
@@ -1028,6 +1288,27 @@ fn heartbeat_execution_from_content(
                     session_id: None,
                 };
             }
+            if let Some(stale_price_timestamp) =
+                heartbeat_stale_price_timestamp(&sanitized_message, reference_date)
+            {
+                return ScheduledTaskExecution {
+                    should_deliver: false,
+                    content: String::new(),
+                    error: None,
+                    metadata: json!({
+                        "heartbeat_model": heartbeat_model,
+                        "parse_kind": format!("{:?}", parse_kind),
+                        "raw_chars": raw_chars,
+                        "starts_with_json": starts_with_json,
+                        "raw_preview": raw_preview,
+                        "deliver_preview": deliver_preview,
+                        "failure_kind": "stale_price_timestamp",
+                        "stale_price_timestamp": stale_price_timestamp.to_string(),
+                        "stale_price_timestamp_suppressed": true,
+                    }),
+                    session_id: None,
+                };
+            }
             ScheduledTaskExecution {
                 should_deliver: true,
                 content: sanitized_message,
@@ -1039,6 +1320,8 @@ fn heartbeat_execution_from_content(
                     "starts_with_json": starts_with_json,
                     "raw_preview": raw_preview,
                     "deliver_preview": deliver_preview,
+                    "beijing_trigger_time_normalized": normalized_beijing_trigger_time.is_some(),
+                    "original_beijing_trigger_time": normalized_beijing_trigger_time,
                 }),
                 session_id: None,
             }
@@ -1047,19 +1330,62 @@ fn heartbeat_execution_from_content(
 }
 
 fn scheduler_event_is_commodity_related(event: &SchedulerEvent) -> bool {
-    let haystack = format!("{} {}", event.job_name, event.task_prompt).to_ascii_lowercase();
-    event.job_name.contains("原油")
+    let job_name = event.job_name.to_ascii_lowercase();
+    let prompt = event.task_prompt.to_ascii_lowercase();
+    let job_is_commodity_focused = event.job_name.contains("原油")
         || event.job_name.contains("油价")
         || event.job_name.contains("布伦特")
         || event.job_name.contains("大宗商品")
-        || event.task_prompt.contains("原油")
-        || event.task_prompt.contains("油价")
-        || event.task_prompt.contains("布伦特")
-        || event.task_prompt.contains("大宗商品")
-        || haystack.contains("crude")
-        || haystack.contains("wti")
-        || haystack.contains("brent")
-        || haystack.contains("oil price")
+        || job_name.contains("crude")
+        || job_name.contains("wti")
+        || job_name.contains("brent")
+        || job_name.contains("oil_price")
+        || job_name.contains("oil price");
+    if job_is_commodity_focused {
+        return true;
+    }
+
+    let prompt_is_commodity_focused = event.task_prompt.contains("原油价格")
+        || event.task_prompt.contains("油价播报")
+        || event.task_prompt.contains("大宗商品播报")
+        || event.task_prompt.contains("播报 WTI")
+        || event.task_prompt.contains("播报WTI")
+        || event.task_prompt.contains("汇总 WTI")
+        || event.task_prompt.contains("汇总WTI")
+        || prompt.contains("crude oil")
+        || prompt.contains("oil price monitor")
+        || prompt.contains("wti/brent")
+        || prompt.contains("wti / brent");
+    prompt_is_commodity_focused && !scheduler_event_is_broad_market_review(event)
+}
+
+fn scheduler_event_is_broad_market_review(event: &SchedulerEvent) -> bool {
+    let haystack = compact_lowercase_text(&format!("{} {}", event.job_name, event.task_prompt));
+    [
+        "复盘",
+        "简报",
+        "风控",
+        "温度",
+        "收盘",
+        "盘后",
+        "盘前",
+        "大盘",
+        "市场",
+        "指数",
+        "情绪",
+        "早报",
+        "降息",
+        "概率",
+        "宏观",
+        "briefing",
+        "morningbriefing",
+        "marketreview",
+        "postmarket",
+        "premarket",
+        "riskbrief",
+    ]
+    .iter()
+    .any(|term| haystack.contains(term))
 }
 
 fn compact_lowercase_text(text: &str) -> String {
@@ -1067,6 +1393,13 @@ fn compact_lowercase_text(text: &str) -> String {
         .filter(|ch| !ch.is_whitespace())
         .collect::<String>()
         .to_ascii_lowercase()
+}
+
+fn count_distinct_keyword_hits(compact: &str, keywords: &[&str]) -> usize {
+    keywords
+        .iter()
+        .filter(|term| compact.contains(**term))
+        .count()
 }
 
 fn text_has_commodity_causality_claim(text: &str) -> bool {
@@ -1327,6 +1660,53 @@ fn text_has_explicit_grounded_commodity_source(text: &str) -> bool {
     .any(|term| compact.contains(term))
 }
 
+fn text_has_broad_market_review_context(text: &str) -> bool {
+    broad_market_review_anchor_hits(text) >= 2
+}
+
+fn broad_market_review_anchor_hits(text: &str) -> usize {
+    let compact = compact_lowercase_text(text);
+    count_distinct_keyword_hits(
+        &compact,
+        &[
+            "a股",
+            "港股",
+            "美股",
+            "纳指",
+            "nasdaq",
+            "qqq",
+            "标普",
+            "s&p",
+            "sp500",
+            "道指",
+            "dow",
+            "vix",
+            "fear&greed",
+            "feargreed",
+            "恒生",
+            "hsi",
+            "上证",
+            "深成指",
+            "创业板",
+            "科技股",
+            "半导体",
+            "ai",
+            "etf",
+            "xme",
+            "加密",
+            "降息",
+            "fomc",
+            "fedwatch",
+            "pce",
+            "利率",
+            "宏观",
+            "国债收益率",
+            "10年期美债",
+            "风险偏好",
+        ],
+    )
+}
+
 fn rewrite_commodity_causality_message(text: &str) -> String {
     let mut retained_segments = Vec::new();
     for segment in split_commodity_message_segments(text) {
@@ -1365,10 +1745,11 @@ fn guard_commodity_causality_for_event(text: &str, event: &SchedulerEvent) -> Op
     if !has_unsafe_commodity_claim {
         return None;
     }
-    if !scheduler_event_is_commodity_related(event) && !text_looks_commodity_related(text) {
+    let event_is_commodity_related = scheduler_event_is_commodity_related(event);
+    let text_is_predominantly_commodity_related = text_is_predominantly_commodity_related(text);
+    if !event_is_commodity_related && !text_is_predominantly_commodity_related {
         return None;
     }
-
     let rewritten = rewrite_commodity_causality_message(text);
     if rewritten.trim() == text.trim() {
         None
@@ -1382,6 +1763,68 @@ fn text_looks_commodity_related(text: &str) -> bool {
     ["原油", "油价", "布伦特", "wti", "brent", "crude", "oil"]
         .iter()
         .any(|term| compact.contains(term))
+}
+
+fn text_is_predominantly_commodity_related(text: &str) -> bool {
+    if !text_looks_commodity_related(text) {
+        return false;
+    }
+
+    let segments = split_commodity_message_segments(text);
+    let meaningful_segments: Vec<&str> = segments
+        .iter()
+        .map(|segment| segment.trim())
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if meaningful_segments.is_empty() {
+        return true;
+    }
+    if meaningful_segments.len() <= 2 {
+        let compact = compact_lowercase_text(text);
+        let commodity_hits = count_distinct_keyword_hits(
+            &compact,
+            &[
+                "原油",
+                "油价",
+                "布伦特",
+                "wti",
+                "brent",
+                "crude",
+                "oil",
+                "uso",
+            ],
+        );
+        let broad_market_hits = broad_market_review_anchor_hits(text);
+        if broad_market_hits >= 3 {
+            return commodity_hits >= 4 && commodity_hits > broad_market_hits;
+        }
+        return commodity_hits >= 3 || !text_has_broad_market_review_context(text);
+    }
+
+    let total_chars: usize = meaningful_segments
+        .iter()
+        .map(|segment| segment.chars().count())
+        .sum();
+    if total_chars == 0 {
+        return false;
+    }
+
+    let commodity_segments = meaningful_segments
+        .iter()
+        .filter(|segment| text_looks_commodity_related(segment))
+        .count();
+    let commodity_chars: usize = meaningful_segments
+        .iter()
+        .filter(|segment| text_looks_commodity_related(segment))
+        .map(|segment| segment.chars().count())
+        .sum();
+
+    if text_has_broad_market_review_context(text) {
+        return commodity_segments * 3 >= meaningful_segments.len() * 2
+            && commodity_chars * 3 >= total_chars * 2;
+    }
+
+    commodity_segments * 2 >= meaningful_segments.len() || commodity_chars * 2 >= total_chars
 }
 
 fn scheduler_metadata_with_commodity_guard(original: &str, guarded: &str) -> Value {
@@ -1471,14 +1914,23 @@ fn guard_direct_trade_instruction_for_event(text: &str, event: &SchedulerEvent) 
 }
 
 fn heartbeat_runner_failure_kind(error: &str) -> &'static str {
+    if is_context_overflow_error(error) {
+        return "context_window_overflow";
+    }
     let lower = error.to_ascii_lowercase();
     if lower.contains("upstream http 402")
+        || lower.contains("upstream http 429")
         || lower.contains("http 402")
+        || lower.contains("http 429")
         || lower.contains("code: 402")
+        || lower.contains("code: 429")
         || lower.contains("requires more credits")
         || lower.contains("insufficient credit")
         || lower.contains("insufficient balance")
         || lower.contains("quota exceeded")
+        || lower.contains("rate limit exceeded")
+        || lower.contains("too many requests")
+        || lower.contains("resource exhausted")
     {
         return "provider_quota_exhausted";
     }
@@ -1498,14 +1950,23 @@ fn heartbeat_execution_from_runner_error(
     heartbeat_model: &str,
 ) -> ScheduledTaskExecution {
     let failure_kind = heartbeat_runner_failure_kind(&error);
+    let mut metadata = json!({
+        "heartbeat_model": heartbeat_model,
+        "failure_kind": failure_kind,
+    });
+    if is_context_overflow_error(&error)
+        && let Value::Object(map) = &mut metadata
+    {
+        map.insert(
+            "parse_kind".to_string(),
+            Value::String("ContextOverflowError".to_string()),
+        );
+    }
     ScheduledTaskExecution {
         should_deliver: false,
         content: String::new(),
         error: Some(error),
-        metadata: json!({
-            "heartbeat_model": heartbeat_model,
-            "failure_kind": failure_kind,
-        }),
+        metadata,
         session_id: None,
     }
 }
@@ -1957,6 +2418,7 @@ fn build_scheduled_prompt_with_recovered_local_context(
 
 pub fn build_scheduled_prompt(event: &SchedulerEvent) -> String {
     if event.heartbeat {
+        let check_time = heartbeat_current_check_time_text();
         let history_section = if event.last_delivered_previews.is_empty() {
             String::new()
         } else {
@@ -1975,27 +2437,31 @@ pub fn build_scheduled_prompt(event: &SchedulerEvent) -> String {
         return format!(
             "[心跳检测任务] 任务名称：{}。\n\
 你正在执行一个每 30 分钟运行一次的后台条件检查。\n\
+本轮权威检查时间（北京时间）：{}。\n\
 请使用可用工具检查用户设置的触发条件是否已经满足。\n\
 \n\
 规则：\n\
 1. 如果条件尚未满足，优先只输出 `{{\"status\":\"noop\"}}`；为兼容旧行为，也允许只输出 `{{}}`。\n\
 2. 如果条件已满足，只输出一段 JSON：`{{\"status\":\"triggered\",\"message\":\"...\"}}`。\n\
-3. `message` 必须是一条可以直接发给用户的提醒消息，包含：满足的条件、关键数据、检查时间。\n\
+3. `message` 必须是一条可以直接发给用户的提醒消息，包含：满足的条件、关键数据、检查时间；检查时间必须使用上方“本轮权威检查时间（北京时间）”，不得自行换算或推断另一个北京时间。\n\
 4. 不要创建新的定时任务，也不要修改现有任务。\n\
 5. 不要输出 Markdown 代码块，不要输出额外解释，不要暴露任何内部控制标记。\n\
 6. 如果你不确定是否满足条件，或者输出格式不是严格 JSON，就必须返回 noop，不允许发送自由文本。\n\
 6a. 输出契约：整条回复必须是单段 JSON，第一个可见字符必须是 `{{`。严禁使用 `<think>...</think>`、```json ... ```、`## 分析`、分步解释或任何前置/收尾的自由文本。推理过程不要对外展示；需要推理时在内部完成后，直接给出最终 JSON。\n\
 6b. 如果你发现用户条件、交易动作边界、来源归因或输出契约之间存在冲突，不要解释冲突、不要复述规则、不要输出空文本；必须返回 `{{\"status\":\"noop\"}}`，除非你能用合规的 `triggered` JSON 只报告触发事实和条件化风险提示。\n\
+6c. 严禁输出工具配置、任务配置、画像建档说明、`set_immediate_kinds`、`cron_job` 或任何“已配置/将创建监控”的说明；如果本轮误入配置/建档/任务治理路径，必须返回 `{{\"status\":\"noop\"}}`。\n\
 7. 时间一致性约束：对于发射、财报、业绩会等有明确时间窗口的事件，必须先判断当前时间是否已越过事件预定时间，才能输出完成态结论。若当前时间早于事件计划时间，必须返回 noop，不允许把未来计划误报成已完成。\n\
-8. 价格时间口径约束：引用股价时，必须核实价格的时间戳。若市场已停盘、股票停牌或价格来自上一交易日，必须在 message 中明确标注（最新可得价格为停牌前/上一交易日），不允许把旧价格包装成事件发生后的即时市场反应。\n\
+7a. 时间口径命名约束：`message` 中写“北京时间 HH:MM 触发/监控触发/检查触发”时，只能使用上方权威检查时间；市场时段、数据时间或美东盘前/盘后只能标注为“数据时间”“美东时间”“交易时段”，不能写成另一个“北京时间触发”。\n\
+8. 价格时间口径约束：引用股价、金价、汇率或商品价格时，必须核实价格的时间戳。价格阈值 / 跌破 / 突破类 heartbeat 只有在最新可得价格属于当前检查窗口或最近可解释交易窗口时才能 triggered；若工具只返回明显旧日期、缺少价格时间戳，或无法证明该价格仍是最新可得价格，必须返回 noop，不允许把旧价格包装成当前触发依据。\n\
 9. 价格阈值口径约束：除非用户条件里明确写的是“日内最高/最低/振幅/区间波动”，否则“盘中涨跌幅超过 X%”一律按最新可得价格相对昨收的涨跌幅判断；不允许用日内高点相对昨收、日内低点相对昨收，或高低点振幅去替代当前涨跌幅。\n\
 10. 若最新可得价格相对昨收尚未达到阈值，但日内高点、日内低点或盘中振幅达到阈值，且任务没有明确要求这些口径，本轮必须返回 noop，不允许触发。\n\
 11. 重复事件约束：若某条件（如某只股票的某次发射或某次事件）已经在前一轮被判定为 noop 或 triggered，本轮如果没有获取到新的独立行情时间戳或新的独立事件窗口，就不允许改变结论，也不允许重复 triggered。\n\
 12. 来源归因约束：引用 Reuters、WSJ、Bloomberg、官方公告等来源时，必须确认本轮工具结果明确出现该来源与对应事实；没有明确来源时，只能写“未核验/市场传闻/需继续确认”，不得把地缘政治、谈判、航运限制等叙述写成已被权威媒体共同确认的事实。\n\
 13. 交易动作边界：预警只能报告触发事实、价格/成交量/时间口径和条件化风险管理框架，不得输出“无条件止损”“必须卖出”“立即清仓”“马上买入”等直接交易指令；涉及买卖、止损、加仓、减仓时必须明确这是分析参考，并要求用户结合仓位、成本、流动性和风险承受能力复核。\n\
+14. 工具预算约束：必须以最少工具调用收口。优先复用本轮已经拿到的价格、新闻、组合和文件信息；若需要逐标的穷举或反复重复同一查询才能确认，本轮只检查最可能触发的少数候选并尽快返回 noop 或 triggered，禁止为了展示分析过程反复调用相同工具。\n\
 {}\
 \n以下是需要检查的用户条件：\n{}",
-            event.job_name, history_section, event.task_prompt
+            event.job_name, check_time, history_section, event.task_prompt
         );
     }
     let trigger_note = format!(
@@ -2325,43 +2791,16 @@ pub async fn execute_scheduler_event(
             execution
         }
         Err(error) => {
-            let (parse_kind_label, treat_as_noop) = if is_context_overflow_error(&error) {
-                ("ContextOverflowNoop", true)
-            } else {
-                ("", false)
-            };
-            if treat_as_noop {
-                tracing::warn!(
-                    "[HeartbeatDiag] transient_noop parse_kind={} job_id={} job={} target={} model={} error=\"{}\"",
-                    parse_kind_label,
-                    event.job_id,
-                    event.job_name,
-                    event.channel_target,
-                    heartbeat_model,
-                    truncate_for_log(&error, 280).replace('\n', "\\n"),
-                );
-                ScheduledTaskExecution {
-                    should_deliver: false,
-                    content: String::new(),
-                    error: None,
-                    metadata: json!({
-                        "heartbeat_model": heartbeat_model,
-                        "parse_kind": parse_kind_label,
-                    }),
-                    session_id: None,
-                }
-            } else {
-                tracing::warn!(
-                    "[HeartbeatDiag] runner_error job_id={} job={} target={} model={} failure_kind={} error=\"{}\"",
-                    event.job_id,
-                    event.job_name,
-                    event.channel_target,
-                    heartbeat_model,
-                    heartbeat_runner_failure_kind(&error),
-                    truncate_for_log(&error, 280).replace('\n', "\\n"),
-                );
-                heartbeat_execution_from_runner_error(error, &heartbeat_model)
-            }
+            tracing::warn!(
+                "[HeartbeatDiag] runner_error job_id={} job={} target={} model={} failure_kind={} error=\"{}\"",
+                event.job_id,
+                event.job_name,
+                event.channel_target,
+                heartbeat_model,
+                heartbeat_runner_failure_kind(&error),
+                truncate_for_log(&error, 280).replace('\n', "\\n"),
+            );
+            heartbeat_execution_from_runner_error(error, &heartbeat_model)
         }
     }
 }
@@ -2481,7 +2920,8 @@ mod tests {
         build_scheduled_prompt_with_recovered_local_context, execute_scheduler_event,
         guard_commodity_causality_for_event, guard_direct_trade_instruction_for_event,
         has_skip_delivery_signal, heartbeat_duplicate_preview_match,
-        heartbeat_execution_from_content, heartbeat_execution_from_runner_error,
+        heartbeat_execution_from_content, heartbeat_execution_from_content_at,
+        heartbeat_execution_from_content_at_beijing, heartbeat_execution_from_runner_error,
         heartbeat_runner_selection, inspect_heartbeat_result, is_empty_success_fallback,
         is_stale_market_data_success_fallback, load_actor_quiet_hours,
         persist_suppressed_scheduler_failure_turn, rollback_skipped_scheduler_assistant_turn,
@@ -2740,6 +3180,70 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_stale_price_timestamp_trigger_is_suppressed() {
+        let execution = heartbeat_execution_from_content_at(
+            r#"{"status":"triggered","message":"XAU/USD 现货黄金当前价格已跌破 $4,500 阈值，现报 $4,483.12（2026年4月4日），较昨收下跌约 0.54%。"}"#,
+            "MiniMax-M2.7-highspeed",
+            chrono::NaiveDate::from_ymd_opt(2026, 5, 27).expect("date"),
+        );
+
+        assert!(!execution.should_deliver);
+        assert!(execution.error.is_none());
+        assert_eq!(
+            execution.metadata["failure_kind"].as_str(),
+            Some("stale_price_timestamp")
+        );
+        assert_eq!(
+            execution.metadata["stale_price_timestamp"].as_str(),
+            Some("2026-04-04")
+        );
+        assert_eq!(
+            execution.metadata["stale_price_timestamp_suppressed"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn heartbeat_recent_price_timestamp_trigger_is_allowed() {
+        let execution = heartbeat_execution_from_content_at(
+            r#"{"status":"triggered","message":"XAU/USD 现货黄金当前价格已跌破 $4,500 阈值，现报 $4,483.12（2026年5月26日），检查时间 2026年5月27日。"}"#,
+            "MiniMax-M2.7-highspeed",
+            chrono::NaiveDate::from_ymd_opt(2026, 5, 27).expect("date"),
+        );
+
+        assert!(execution.should_deliver);
+        assert!(execution.error.is_none());
+        assert_ne!(
+            execution.metadata["stale_price_timestamp_suppressed"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn heartbeat_normalizes_conflicting_beijing_trigger_time() {
+        let reference_now =
+            chrono::DateTime::parse_from_rfc3339("2026-05-29T11:31:32+08:00").expect("time");
+        let execution = heartbeat_execution_from_content_at_beijing(
+            r#"{"status":"triggered","message":"2026年5月29日 北京时间 04:00 盘后监控触发。已核验事实：AI 产业链出现关键事件。"}"#,
+            "MiniMax-M2.7-highspeed",
+            reference_now,
+        );
+
+        assert!(execution.should_deliver);
+        assert!(execution.error.is_none());
+        assert!(execution.content.contains("北京时间 11:31 盘后监控触发"));
+        assert!(!execution.content.contains("北京时间 04:00 盘后监控触发"));
+        assert_eq!(
+            execution.metadata["beijing_trigger_time_normalized"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            execution.metadata["original_beijing_trigger_time"].as_str(),
+            Some("04:00")
+        );
+    }
+
+    #[test]
     fn heartbeat_prompt_rejects_direct_trade_instructions() {
         let event = SchedulerEvent {
             actor: ActorIdentity::new("feishu", "ou_cai", None::<String>).expect("actor"),
@@ -2794,6 +3298,10 @@ mod tests {
         assert!(prompt.contains("不要复述规则"));
         assert!(prompt.contains("不要输出空文本"));
         assert!(prompt.contains(r#"必须返回 `{"status":"noop"}`"#));
+        assert!(prompt.contains("必须以最少工具调用收口"));
+        assert!(prompt.contains("严禁输出工具配置"));
+        assert!(prompt.contains("set_immediate_kinds"));
+        assert!(prompt.contains("误入配置/建档/任务治理路径"));
     }
 
     #[test]
@@ -2960,10 +3468,7 @@ mod tests {
         let content = "如果条件满足，应输出 `{\"status\":\"triggered\",\"message\":\"小米跌破 30 港元\"}`；当前条件未满足。";
         assert_eq!(
             inspect_heartbeat_result(content),
-            (
-                HeartbeatOutcome::Noop,
-                HeartbeatParseKind::PlainTextSuppressed
-            )
+            (HeartbeatOutcome::Noop, HeartbeatParseKind::PlainTextNoop)
         );
     }
 
@@ -3159,30 +3664,77 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_empty_json_marks_execution_failed() {
+    fn heartbeat_not_triggered_json_status_is_compatible_noop() {
+        let content = r#"{"status":"not_triggered","message":"条件未触发"}"#;
+        assert_eq!(
+            inspect_heartbeat_result(content),
+            (HeartbeatOutcome::Noop, HeartbeatParseKind::JsonNoop)
+        );
+        let execution = heartbeat_execution_from_content(content, "model-x");
+        assert!(!execution.should_deliver);
+        assert!(execution.error.is_none());
+        assert_eq!(execution.metadata["parse_kind"], "JsonNoop");
+    }
+
+    #[test]
+    fn heartbeat_trigger_alias_json_status_delivers_message() {
+        let content = r#"{"status":"condition_met","message":"触发事实"}"#;
+        assert_eq!(
+            inspect_heartbeat_result(content),
+            (
+                HeartbeatOutcome::Deliver("触发事实".to_string()),
+                HeartbeatParseKind::JsonTriggered
+            )
+        );
+    }
+
+    #[test]
+    fn heartbeat_empty_json_is_compatible_noop() {
         let (outcome, parse_kind) = inspect_heartbeat_result("{}");
         assert_eq!(parse_kind, HeartbeatParseKind::JsonEmptyStatus);
         assert_eq!(outcome, HeartbeatOutcome::Noop);
         let execution = heartbeat_execution_from_content("{}", "model-x");
         assert!(!execution.should_deliver);
-        assert_eq!(
-            execution.error.as_deref(),
-            Some("heartbeat 输出缺少状态字段，任务已标记失败")
-        );
+        assert!(execution.error.is_none());
+        assert_eq!(execution.metadata["parse_kind"], "JsonEmptyStatus");
     }
 
     #[test]
-    fn heartbeat_think_plus_empty_json_marks_execution_failed() {
+    fn heartbeat_think_plus_empty_json_is_compatible_noop() {
         let (outcome, parse_kind) = inspect_heartbeat_result("<think>reasoning</think>\n\n{}");
         assert_eq!(parse_kind, HeartbeatParseKind::JsonEmptyStatus);
         assert_eq!(outcome, HeartbeatOutcome::Noop);
         let execution =
             heartbeat_execution_from_content("<think>reasoning</think>\n\n{}", "model-x");
         assert!(!execution.should_deliver);
+        assert!(execution.error.is_none());
+        assert_eq!(execution.metadata["parse_kind"], "JsonEmptyStatus");
+    }
+
+    #[test]
+    fn heartbeat_plain_text_noop_is_compatible_noop() {
+        let content = "<think>\n当前价格高于触发线，条件未满足，所以本轮应该返回 noop。\n";
         assert_eq!(
-            execution.error.as_deref(),
-            Some("heartbeat 输出缺少状态字段，任务已标记失败")
+            inspect_heartbeat_result(content),
+            (HeartbeatOutcome::Noop, HeartbeatParseKind::PlainTextNoop)
         );
+        let execution = heartbeat_execution_from_content(content, "MiniMax-M2.7-highspeed");
+        assert!(!execution.should_deliver);
+        assert!(execution.error.is_none());
+        assert_eq!(execution.metadata["parse_kind"], "PlainTextNoop");
+    }
+
+    #[test]
+    fn heartbeat_closed_think_only_noop_is_compatible_noop() {
+        let content = "<think>当前没有触发条件，本轮不发送。</think>";
+        assert_eq!(
+            inspect_heartbeat_result(content),
+            (HeartbeatOutcome::Noop, HeartbeatParseKind::PlainTextNoop)
+        );
+        let execution = heartbeat_execution_from_content(content, "MiniMax-M2.7-highspeed");
+        assert!(!execution.should_deliver);
+        assert!(execution.error.is_none());
+        assert_eq!(execution.metadata["parse_kind"], "PlainTextNoop");
     }
 
     #[test]
@@ -3227,10 +3779,11 @@ mod tests {
             "moonshotai/kimi-k2.5",
         );
         assert!(!execution.should_deliver);
-        assert_eq!(
-            execution.error.as_deref().unwrap().contains("HTTP 402"),
-            true
-        );
+        let error = execution
+            .error
+            .as_deref()
+            .expect("provider quota error should be recorded");
+        assert!(error.contains("HTTP 402"), "unexpected error: {error}");
         assert_eq!(
             execution.metadata["failure_kind"],
             "provider_quota_exhausted"
@@ -3239,6 +3792,21 @@ mod tests {
             execution.metadata["heartbeat_model"],
             "moonshotai/kimi-k2.5"
         );
+    }
+
+    #[test]
+    fn heartbeat_provider_429_quota_error_is_classified() {
+        let execution = heartbeat_execution_from_runner_error(
+            "LLM 错误: 所有 OpenAI-compatible API Key 均失败（共 1 个）。最后错误：LLM 错误: upstream HTTP 429: rate limit exceeded (code: 429)"
+                .to_string(),
+            "mimo-v2.5-pro",
+        );
+        assert!(!execution.should_deliver);
+        assert_eq!(
+            execution.metadata["failure_kind"],
+            "provider_quota_exhausted"
+        );
+        assert_eq!(execution.metadata["heartbeat_model"], "mimo-v2.5-pro");
     }
 
     #[test]
@@ -3253,13 +3821,35 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_context_overflow_error_is_not_classified_as_noop() {
+        let execution = heartbeat_execution_from_runner_error(
+            "LLM 错误: bad_request_error: invalid params, context window exceeds limit (2013)"
+                .to_string(),
+            "mimo-v2.5-pro",
+        );
+        assert!(!execution.should_deliver);
+        assert_eq!(
+            execution.error.as_deref(),
+            Some(
+                "LLM 错误: bad_request_error: invalid params, context window exceeds limit (2013)"
+            )
+        );
+        assert_eq!(
+            execution.metadata["failure_kind"],
+            "context_window_overflow"
+        );
+        assert_eq!(execution.metadata["parse_kind"], "ContextOverflowError");
+        assert_eq!(execution.metadata["heartbeat_model"], "mimo-v2.5-pro");
+    }
+
+    #[test]
     fn heartbeat_runner_uses_capped_completion_budget() {
         match heartbeat_runner_selection() {
             ExecutionRunnerSelection::AuxiliaryFunctionCalling {
                 max_iterations,
                 max_tokens_override,
             } => {
-                assert_eq!(max_iterations, 10);
+                assert_eq!(max_iterations, 18);
                 assert_eq!(max_tokens_override, Some(4096));
             }
             ExecutionRunnerSelection::Configured => {
@@ -3307,6 +3897,9 @@ mod tests {
         };
 
         let prompt = build_scheduled_prompt(&event);
+        assert!(prompt.contains("本轮权威检查时间（北京时间）"));
+        assert!(prompt.contains("检查时间必须使用上方"));
+        assert!(prompt.contains("时间口径命名约束"));
         assert!(prompt.contains("也允许只输出 `{}`。"));
         assert!(!prompt.contains("[[HEARTBEAT_NOOP]]"));
     }
@@ -3595,6 +4188,8 @@ mod tests {
 
         let prompt = build_scheduled_prompt(&event);
         assert!(prompt.contains("盘中涨跌幅超过 X%"));
+        assert!(prompt.contains("明显旧日期、缺少价格时间戳"));
+        assert!(prompt.contains("旧价格包装成当前触发依据"));
         assert!(prompt.contains("不允许用日内高点相对昨收"));
         assert!(prompt.contains("本轮必须返回 noop"));
     }
@@ -3967,6 +4562,319 @@ mod tests {
         assert!(!guarded.contains("101.02"));
         assert!(!guarded.contains("105.63"));
         assert!(!guarded.contains("风险偏好修复"));
+    }
+
+    #[test]
+    fn commodity_guard_skips_broad_market_review_with_secondary_oil_clause() {
+        let event = SchedulerEvent {
+            actor: ActorIdentity::new("feishu", "ou_market", None::<String>).expect("actor"),
+            job_id: "job-market-review".to_string(),
+            job_name: "每日美股大盘风险简报".to_string(),
+            task_prompt: "生成包含 Nasdaq、S&P 500、VIX 与风险偏好的市场复盘".to_string(),
+            channel: "feishu".to_string(),
+            channel_scope: None,
+            channel_target: "ou_market".to_string(),
+            delivery_key: "delivery-market-review".to_string(),
+            push: Value::Null,
+            tags: vec![],
+            heartbeat: false,
+            schedule_hour: 20,
+            schedule_minute: 0,
+            schedule_repeat: "daily".to_string(),
+            schedule_date: None,
+            last_delivered_previews: vec![],
+            bypass_quiet_hours: false,
+        };
+
+        let original = "美股因 Memorial Day 休市，纳指期货与标普期货波动有限，VIX 回落到 13 附近，Fear & Greed 维持中性。科技股整体等待英伟达链条与长端利率信号，能源板块则受油价回落与库存预期压制。";
+
+        assert_eq!(
+            guard_commodity_causality_for_event(original, &event),
+            None,
+            "broad market reviews should not be fully replaced by the commodity guard"
+        );
+    }
+
+    #[test]
+    fn commodity_guard_skips_cross_market_review_with_oil_sector_mention() {
+        let event = SchedulerEvent {
+            actor: ActorIdentity::new("feishu", "ou_market", None::<String>).expect("actor"),
+            job_id: "job-ah-review".to_string(),
+            job_name: "A股港股收盘后跨市场复盘".to_string(),
+            task_prompt: "总结 A 股、港股与美股休市背景下的跨市场结构变化".to_string(),
+            channel: "feishu".to_string(),
+            channel_scope: None,
+            channel_target: "ou_market".to_string(),
+            delivery_key: "delivery-ah-review".to_string(),
+            push: Value::Null,
+            tags: vec![],
+            heartbeat: false,
+            schedule_hour: 17,
+            schedule_minute: 30,
+            schedule_repeat: "daily".to_string(),
+            schedule_date: None,
+            last_delivered_previews: vec![],
+            bypass_quiet_hours: false,
+        };
+
+        let original = "A股今日由算力和机器人链领涨，港股因佛诞翌日休市，美股则因 Memorial Day 休市。上证与恒生科技相关映射资产仍偏强，油气板块因油价回落承压，但这只是结构分化的一部分。";
+
+        assert_eq!(
+            guard_commodity_causality_for_event(original, &event),
+            None,
+            "cross-market reviews should keep their main content when oil is only one sector clause"
+        );
+    }
+
+    #[test]
+    fn commodity_guard_skips_low_segmentation_ah_market_review_with_oil_risk_note() {
+        let event = SchedulerEvent {
+            actor: ActorIdentity::new("feishu", "ou_market", None::<String>).expect("actor"),
+            job_id: "job-ah-close-review".to_string(),
+            job_name: "A股港股收盘后跨市场复盘".to_string(),
+            task_prompt: "复盘 A 股、港股、美股映射、AI 硬件链和跨市场风险提示。".to_string(),
+            channel: "feishu".to_string(),
+            channel_scope: None,
+            channel_target: "ou_market".to_string(),
+            delivery_key: "delivery-ah-close-review".to_string(),
+            push: Value::Null,
+            tags: vec![],
+            heartbeat: false,
+            schedule_hour: 17,
+            schedule_minute: 30,
+            schedule_repeat: "daily".to_string(),
+            schedule_date: None,
+            last_delivered_previews: vec![],
+            bypass_quiet_hours: false,
+        };
+
+        let original = "北京时间 2026年5月29日 17:30，A股、港股今天均实际开市；结论是：A股从昨天硬科技反攻切到高位兑现，港股则靠联想、百度、内房、航空托住指数，AI 硬件、港股科技和美股映射仍是正文主体，风险提示里只把 WTI、Brent 与油价波动作为通胀和航空成本的边际变量，不能把它当成本轮 A/H 收盘复盘的主因。";
+
+        assert_eq!(
+            guard_commodity_causality_for_event(original, &event),
+            None,
+            "low-segmentation A/H market reviews should not be treated as commodity-first text"
+        );
+    }
+
+    #[test]
+    fn commodity_guard_does_not_rewrite_broad_us_market_risk_brief() {
+        let event = SchedulerEvent {
+            actor: ActorIdentity::new("feishu", "ou_market", None::<String>).expect("actor"),
+            job_id: "job-us-risk".to_string(),
+            job_name: "每日美股大盘风控简报".to_string(),
+            task_prompt: "复盘 Nasdaq、S&P 500、VIX、长端利率和主要风险因子。".to_string(),
+            channel: "feishu".to_string(),
+            channel_scope: None,
+            channel_target: "ou_market".to_string(),
+            delivery_key: "delivery-us-risk".to_string(),
+            push: Value::Null,
+            tags: vec![],
+            heartbeat: false,
+            schedule_hour: 20,
+            schedule_minute: 0,
+            schedule_repeat: "daily".to_string(),
+            schedule_date: None,
+            last_delivered_previews: vec![],
+            bypass_quiet_hours: false,
+        };
+
+        assert!(
+            guard_commodity_causality_for_event(
+                "【每日美股大盘风控简报】\n美股因 Memorial Day 休市，Nasdaq、S&P 500 和 QQQ 缺少新的收盘确认。\nVIX 与 Fear & Greed 仍指向风险偏好偏谨慎，长端利率是今晚估值压力的主线。\n油价与能源需求担忧只是观察项，不足以解释整个科技股风险温度。\n操作上继续关注 AI 算力、半导体和高 beta 成长股的开盘确认。",
+                &event,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn commodity_guard_skips_broad_market_prompt_with_oil_watch_item() {
+        let event = SchedulerEvent {
+            actor: ActorIdentity::new("feishu", "ou_market", None::<String>).expect("actor"),
+            job_id: "job-us-premarket".to_string(),
+            job_name: "美股盘前宏观与财报日历梳理".to_string(),
+            task_prompt: "梳理美股盘前宏观、财报日历、AI 芯片链与油价观察项。".to_string(),
+            channel: "feishu".to_string(),
+            channel_scope: None,
+            channel_target: "ou_market".to_string(),
+            delivery_key: "delivery-us-premarket".to_string(),
+            push: Value::Null,
+            tags: vec![],
+            heartbeat: false,
+            schedule_hour: 20,
+            schedule_minute: 30,
+            schedule_repeat: "daily".to_string(),
+            schedule_date: None,
+            last_delivered_previews: vec![],
+            bypass_quiet_hours: false,
+        };
+
+        assert!(
+            guard_commodity_causality_for_event(
+                "【美股盘前宏观与财报日历梳理】\n今晚美股盘前的主线仍是 Nasdaq、S&P 500 与 QQQ 的风险偏好修复，长端利率和消费者信心数据决定估值压力。\nAI 芯片、半导体和云资本开支是财报日历的重点。\n油价回落受中东谈判预期和能源需求担忧影响，但这只是宏观观察项，不应替代大盘、财报和科技股主线。",
+                &event,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn commodity_guard_skips_owalert_premarket_when_market_context_dominates() {
+        let event = SchedulerEvent {
+            actor: ActorIdentity::new("feishu", "ou_market", None::<String>).expect("actor"),
+            job_id: "job-owalert-premarket".to_string(),
+            job_name: "OWALERT_PreMarket".to_string(),
+            task_prompt: "盘前扫描美股期货、QQQ、AI 二阶链、油价与宏观风险，形成市场行动简报。"
+                .to_string(),
+            channel: "feishu".to_string(),
+            channel_scope: None,
+            channel_target: "ou_market".to_string(),
+            delivery_key: "delivery-owalert-premarket".to_string(),
+            push: Value::Null,
+            tags: vec![],
+            heartbeat: false,
+            schedule_hour: 21,
+            schedule_minute: 0,
+            schedule_repeat: "daily".to_string(),
+            schedule_date: None,
+            last_delivered_previews: vec![],
+            bypass_quiet_hours: false,
+        };
+
+        assert!(
+            guard_commodity_causality_for_event(
+                "【OWALERT_PreMarket】\n美股期货修复，QQQ 盘前走强，Nasdaq 与 S&P 500 的风险偏好改善。\nAI 二阶链继续跟踪电力、光模块和半导体设备，开盘后看成交确认。\n油价低于 100 美元，主要受中东谈判预期和需求担忧影响，对今晚市场只是风险变量之一，不是本轮盘前结论的主体。",
+                &event,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn commodity_guard_skips_ai_morning_briefing_with_secondary_oil_clause() {
+        let event = SchedulerEvent {
+            actor: ActorIdentity::new("feishu", "ou_market", None::<String>).expect("actor"),
+            job_id: "job-ai-morning".to_string(),
+            job_name: "Hone_AI_Morning_Briefing".to_string(),
+            task_prompt: "生成 AI 科技前沿、宏观风险、持仓标的和油价观察项的早间 briefing。"
+                .to_string(),
+            channel: "feishu".to_string(),
+            channel_scope: None,
+            channel_target: "ou_market".to_string(),
+            delivery_key: "delivery-ai-morning".to_string(),
+            push: Value::Null,
+            tags: vec![],
+            heartbeat: false,
+            schedule_hour: 8,
+            schedule_minute: 30,
+            schedule_repeat: "daily".to_string(),
+            schedule_date: None,
+            last_delivered_previews: vec![],
+            bypass_quiet_hours: false,
+        };
+
+        assert!(
+            guard_commodity_causality_for_event(
+                "【Hone AI Morning Briefing】AI 基建和半导体仍是今日主线，QQQ 与 Nasdaq 的风险偏好需要看长端利率确认。宏观侧关注 PCE、FOMC 纪要和美元指数。油价回落主要受中东谈判预期影响，但这只是组合风险变量，不能替代 AI 科技和持仓标的早报主体。",
+                &event,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn commodity_guard_skips_rate_cut_probability_digest() {
+        let event = SchedulerEvent {
+            actor: ActorIdentity::new("discord", "rate-cut", None::<String>).expect("actor"),
+            job_id: "job-rate-cut".to_string(),
+            job_name: "每日美股降息概率推送".to_string(),
+            task_prompt: "汇总 FedWatch、FOMC、PCE 风险和美股降息概率。".to_string(),
+            channel: "discord".to_string(),
+            channel_scope: None,
+            channel_target: "rate-cut".to_string(),
+            delivery_key: "delivery-rate-cut".to_string(),
+            push: Value::Null,
+            tags: vec![],
+            heartbeat: false,
+            schedule_hour: 9,
+            schedule_minute: 30,
+            schedule_repeat: "daily".to_string(),
+            schedule_date: None,
+            last_delivered_previews: vec![],
+            bypass_quiet_hours: false,
+        };
+
+        assert!(
+            guard_commodity_causality_for_event(
+                "【每日美股降息概率推送】FedWatch 显示市场继续押注年内降息，FOMC 纪要和 PCE 是本周利率路径的核心变量。美股方面，Nasdaq 与 S&P 500 对长端利率更敏感。油价上行会影响通胀预期，但不是本轮降息概率分析的主体。",
+                &event,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn commodity_guard_skips_us_market_risk_brief_with_repeated_oil_risk_clauses() {
+        let event = SchedulerEvent {
+            actor: ActorIdentity::new("feishu", "ou_market", None::<String>).expect("actor"),
+            job_id: "job-us-evening-risk".to_string(),
+            job_name: "美股大盘晚间风控简报".to_string(),
+            task_prompt: "生成美股盘前、PCE、GDP、伊朗局势、油价和利率扰动的广义风控简报。"
+                .to_string(),
+            channel: "feishu".to_string(),
+            channel_scope: None,
+            channel_target: "ou_market".to_string(),
+            delivery_key: "delivery-us-evening-risk".to_string(),
+            push: Value::Null,
+            tags: vec![],
+            heartbeat: false,
+            schedule_hour: 20,
+            schedule_minute: 0,
+            schedule_repeat: "daily".to_string(),
+            schedule_date: None,
+            last_delivered_previews: vec![],
+            bypass_quiet_hours: false,
+        };
+
+        assert!(
+            guard_commodity_causality_for_event(
+                "【美股大盘晚间风控简报】Nasdaq、S&P 500、QQQ 盘前维持强势，VIX 与 Fear & Greed 显示风险偏好仍偏热，AI 半导体和电力链是今晚主线。\nPCE 与 GDP 修正值会影响长端利率，科技股仓位需要看开盘后成交和涨跌家数确认。\n油价受伊朗局势、供应担忧和需求预期影响回落，但这只是通胀路径的边际变量。\n若油价继续下行，能源通胀压力会缓和，不过不能把它作为今晚 AI 成长股修复的核心解释。",
+                &event,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn commodity_guard_skips_ai_chain_digest_with_secondary_oil_mentions() {
+        let event = SchedulerEvent {
+            actor: ActorIdentity::new("feishu", "ou_market", None::<String>).expect("actor"),
+            job_id: "job-ai-chain".to_string(),
+            job_name: "美股盘后AI及高景气产业链推演".to_string(),
+            task_prompt: "盘后推演 AI 硬件、CPO、PCB、服务器、液冷电源与美股盘前映射。".to_string(),
+            channel: "feishu".to_string(),
+            channel_scope: None,
+            channel_target: "ou_market".to_string(),
+            delivery_key: "delivery-ai-chain".to_string(),
+            push: Value::Null,
+            tags: vec![],
+            heartbeat: false,
+            schedule_hour: 20,
+            schedule_minute: 45,
+            schedule_repeat: "daily".to_string(),
+            schedule_date: None,
+            last_delivered_previews: vec![],
+            bypass_quiet_hours: false,
+        };
+
+        assert!(
+            guard_commodity_causality_for_event(
+                "【美股盘后AI及高景气产业链推演】AI 硬件、CPO、PCB、服务器和液冷电源仍是盘后映射的主体，重点看 NVDA、AVGO、ANET、VRT 与光模块链条。\nNasdaq 与 QQQ 的风险偏好主要取决于长端利率、财报指引和半导体成交强度。\n油价受中东谈判预期和需求担忧影响回落，会降低部分能源通胀压力。\n但油价变化只是宏观噪音，不应覆盖 AI 产业链、半导体和高景气方向的推演正文。",
+                &event,
+            )
+            .is_none()
+        );
     }
 
     #[test]

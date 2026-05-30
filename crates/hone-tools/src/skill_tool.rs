@@ -181,21 +181,74 @@ fn sanitize_skill_script_stderr(stderr: &str) -> String {
 }
 
 fn redact_skill_script_stderr_secrets(text: &str) -> String {
-    let mut output = redact_skill_script_marker_value(text, "Bearer ");
-    for key in [
-        "access_token",
-        "accessToken",
-        "api_key",
-        "apiKey",
-        "apikey",
-        "token",
-        "secret",
-        "password",
-    ] {
+    let mut output = redact_url_userinfo(text);
+    for marker in ["Bearer ", "bearer ", "Basic ", "basic "] {
+        output = redact_skill_script_marker_value(&output, marker);
+    }
+    for key in SENSITIVE_SKILL_SCRIPT_STDERR_KEYS {
         output = redact_skill_script_marker_value(&output, &format!("{key}="));
         output = redact_skill_script_marker_value(&output, &format!("{key}:"));
         output = redact_skill_script_json_string_field(&output, key);
     }
+    for key in ["authorization", "Authorization"] {
+        output = redact_skill_script_json_string_field(&output, key);
+    }
+    output
+}
+
+const SENSITIVE_SKILL_SCRIPT_STDERR_KEYS: &[&str] = &[
+    "access_token",
+    "accessToken",
+    "api_key",
+    "apiKey",
+    "apikey",
+    "client_secret",
+    "clientSecret",
+    "refresh_token",
+    "refreshToken",
+    "id_token",
+    "idToken",
+    "session_token",
+    "sessionToken",
+    "bot_token",
+    "botToken",
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "TAVILY_API_KEY",
+    "FMP_API_KEY",
+    "HONE_CLOUD_API_KEY",
+    "token",
+    "secret",
+    "password",
+    "X-API-Key",
+    "x-api-key",
+];
+
+fn redact_url_userinfo(text: &str) -> String {
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    while let Some(index) = remaining.find("://") {
+        let authority_start = index + 3;
+        let authority = &remaining[authority_start..];
+        let authority_end = authority
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                (ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | ')')).then_some(idx)
+            })
+            .unwrap_or(authority.len());
+        let authority_slice = &authority[..authority_end];
+        if let Some(at_index) = authority_slice.rfind('@') {
+            output.push_str(&remaining[..authority_start]);
+            output.push_str("<redacted>@");
+            remaining = &remaining[authority_start + at_index + 1..];
+        } else {
+            output.push_str(&remaining[..authority_start]);
+            remaining = &remaining[authority_start..];
+        }
+    }
+    output.push_str(remaining);
     output
 }
 
@@ -218,6 +271,7 @@ fn redact_skill_script_marker_value(text: &str, marker: &str) -> String {
                 (ch == '&'
                     || ch == ')'
                     || ch == ','
+                    || ch == ';'
                     || ch == '"'
                     || ch == '\''
                     || ch == '}'
@@ -277,6 +331,7 @@ fn redact_skill_script_json_string_field(text: &str, key: &str) -> String {
 mod tests {
     use super::*;
     use crate::base::Tool;
+    use crate::test_support::{assert_text_contains_all, assert_text_contains_none};
     use hone_memory::SessionStorage;
     use serde_json::Value;
     use std::fs;
@@ -312,19 +367,42 @@ mod tests {
 
     #[test]
     fn skill_script_stderr_preview_redacts_common_credentials() {
-        let stderr = r#"failed https://api.test/path?api_key=abc&token=tok auth=Bearer xyz apiKey: header-secret {"secret": "json-secret"}"#;
+        let stderr = r#"failed https://user:password@api.test/path?api_key=abc&token=tok auth=Bearer xyz apiKey: header-secret; OPENROUTER_API_KEY=env-secret X-API-Key: gateway-secret Authorization: Basic basic-secret authorization: bearer lower-secret {"secret": "json-secret","client_secret":"json-client","authorization":"Basic json-basic"}"#;
         let detail = sanitize_skill_script_stderr(stderr);
 
-        assert!(detail.contains("api_key=<redacted>"));
-        assert!(detail.contains("token=<redacted>"));
-        assert!(detail.contains("Bearer <redacted>"));
-        assert!(detail.contains("apiKey: <redacted>"));
-        assert!(detail.contains("\"secret\": \"<redacted>\""));
-        assert!(!detail.contains("abc"));
-        assert!(!detail.contains("=tok"));
-        assert!(!detail.contains("xyz"));
-        assert!(!detail.contains("header-secret"));
-        assert!(!detail.contains("json-secret"));
+        assert_text_contains_all(
+            &detail,
+            &[
+                "https://<redacted>@api.test/path",
+                "api_key=<redacted>",
+                "token=<redacted>",
+                "Bearer <redacted>",
+                "apiKey: <redacted>;",
+                "OPENROUTER_API_KEY=<redacted>",
+                "X-API-Key: <redacted>",
+                "Basic <redacted>",
+                "bearer <redacted>",
+                "\"secret\": \"<redacted>\"",
+                "\"client_secret\":\"<redacted>\"",
+                "\"authorization\":\"<redacted>\"",
+            ],
+        );
+        assert_text_contains_none(
+            &detail,
+            &[
+                "abc",
+                "password",
+                "=tok",
+                "xyz",
+                "header-secret",
+                "json-secret",
+                "env-secret",
+                "gateway-secret",
+                "basic-secret",
+                "json-client",
+                "json-basic",
+            ],
+        );
     }
 
     #[tokio::test]
@@ -474,13 +552,16 @@ mod tests {
 
         assert_eq!(result["success"], Value::Bool(false));
         let error = result["error"].as_str().expect("error message");
-        assert!(error.contains("exit_code=Some(2)"));
-        assert!(error.contains("token=<redacted>"));
-        assert!(error.contains("api_key=<redacted>"));
-        assert!(error.contains("Bearer <redacted>"));
-        assert!(!error.contains("token=tok"));
-        assert!(!error.contains("api_key=abc"));
-        assert!(!error.contains("xyz"));
+        assert_text_contains_all(
+            error,
+            &[
+                "exit_code=Some(2)",
+                "token=<redacted>",
+                "api_key=<redacted>",
+                "Bearer <redacted>",
+            ],
+        );
+        assert_text_contains_none(error, &["token=tok", "api_key=abc", "xyz"]);
         clear_test_env();
     }
 

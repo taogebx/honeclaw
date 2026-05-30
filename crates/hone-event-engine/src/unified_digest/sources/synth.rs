@@ -43,17 +43,19 @@ impl<'a> SynthSource<'a> {
         let local_today = offset.from_utc_datetime(&now.naive_utc()).date_naive();
         let synth_pool = synthesize_countdowns(&teasers, local_today);
         let registry = self.registry.load();
-        let mut out = Vec::new();
-        for ev in synth_pool {
+        let mut candidates = Vec::new();
+        for synth_event in synth_pool {
             if registry
-                .resolve(&ev)
+                .resolve(&synth_event)
                 .into_iter()
-                .any(|(a, _sev)| &a == actor && a.is_direct())
+                .any(|(resolved_actor, _severity)| {
+                    &resolved_actor == actor && resolved_actor.is_direct()
+                })
             {
-                out.push(UnifiedCandidate::from_synth(ev, now));
+                candidates.push(UnifiedCandidate::from_synth(synth_event, now));
             }
         }
-        Ok(out)
+        Ok(candidates)
     }
 }
 

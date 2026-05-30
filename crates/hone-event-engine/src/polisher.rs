@@ -100,12 +100,12 @@ impl BodyPolisher for LlmPolisher {
         }
         let messages = Self::build_prompt(event, default_body);
         match self.provider.chat(&messages, self.model.as_deref()).await {
-            Ok(res) => {
-                let t = res.content.trim();
-                if t.is_empty() {
+            Ok(llm_response) => {
+                let trimmed_content = llm_response.content.trim();
+                if trimmed_content.is_empty() {
                     None
                 } else {
-                    Some(t.to_string())
+                    Some(trimmed_content.to_string())
                 }
             }
             Err(e) => {
@@ -119,17 +119,17 @@ impl BodyPolisher for LlmPolisher {
 /// 把 config 里的字符串 severity 列表转换为 `HashSet<Severity>`。
 /// 不识别的字符串被忽略（记一条 warn）。
 pub fn parse_polish_levels(names: &[String]) -> HashSet<Severity> {
-    let mut out = HashSet::new();
+    let mut levels = HashSet::new();
     for name in names {
         match name.trim().to_ascii_lowercase().as_str() {
             "low" => {
-                out.insert(Severity::Low);
+                levels.insert(Severity::Low);
             }
             "medium" | "med" => {
-                out.insert(Severity::Medium);
+                levels.insert(Severity::Medium);
             }
             "high" => {
-                out.insert(Severity::High);
+                levels.insert(Severity::High);
             }
             other if !other.is_empty() => {
                 tracing::warn!("unknown polish severity level: {other}");
@@ -137,7 +137,7 @@ pub fn parse_polish_levels(names: &[String]) -> HashSet<Severity> {
             _ => {}
         }
     }
-    out
+    levels
 }
 
 #[cfg(test)]
@@ -149,11 +149,11 @@ mod tests {
     use hone_llm::{ChatResponse, Message};
     use std::sync::Mutex;
 
-    fn ev(sev: Severity) -> MarketEvent {
+    fn market_event_fixture(severity: Severity) -> MarketEvent {
         MarketEvent {
             id: "e1".into(),
             kind: EventKind::EarningsReleased,
-            severity: sev,
+            severity,
             symbols: vec!["AAPL".into()],
             occurred_at: Utc::now(),
             title: "earnings".into(),
@@ -209,7 +209,11 @@ mod tests {
     #[tokio::test]
     async fn noop_always_returns_none() {
         let p = NoopPolisher;
-        assert!(p.polish(&ev(Severity::High), "body").await.is_none());
+        assert!(
+            p.polish(&market_event_fixture(Severity::High), "body")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -223,12 +227,16 @@ mod tests {
         levels.insert(Severity::High);
         let p = LlmPolisher::new(provider.clone(), levels);
 
-        let polished = p.polish(&ev(Severity::High), "default").await;
+        let polished = p
+            .polish(&market_event_fixture(Severity::High), "default")
+            .await;
         assert_eq!(polished.as_deref(), Some("polished!"));
         assert_eq!(*provider.calls.lock().unwrap(), 1);
 
         // Medium 不在 level 集合内，不调用 LLM
-        let medium = p.polish(&ev(Severity::Medium), "default").await;
+        let medium = p
+            .polish(&market_event_fixture(Severity::Medium), "default")
+            .await;
         assert!(medium.is_none());
         assert_eq!(*provider.calls.lock().unwrap(), 1);
     }
@@ -243,7 +251,11 @@ mod tests {
         let mut levels = HashSet::new();
         levels.insert(Severity::High);
         let p = LlmPolisher::new(provider, levels);
-        assert!(p.polish(&ev(Severity::High), "default").await.is_none());
+        assert!(
+            p.polish(&market_event_fixture(Severity::High), "default")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -256,7 +268,11 @@ mod tests {
         let mut levels = HashSet::new();
         levels.insert(Severity::High);
         let p = LlmPolisher::new(provider, levels);
-        assert!(p.polish(&ev(Severity::High), "default").await.is_none());
+        assert!(
+            p.polish(&market_event_fixture(Severity::High), "default")
+                .await
+                .is_none()
+        );
     }
 
     #[test]

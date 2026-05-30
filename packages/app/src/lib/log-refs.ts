@@ -6,9 +6,9 @@ import { actorFromSessionId, type ActorRef } from "./actors"
  * 优先用 entry.extra 里的结构化字段(后端结构化日志),fallback 到 message 里的 Actor_ 模式串识别。
  *
  * 安全策略:不在自由文本里做模糊正则(避免把 ERROR/INFO/AAPL 等误识别为实体);
- * symbol/research/skill 等弱结构 ref 推迟到 Phase 3 引入 SymbolDrawer 时再加。
+ * symbol/research/skill 等弱结构 ref 暂不从 message 文本猜测;新增时应先接结构化字段。
  */
-export type LogRef =
+type LogRef =
   | { kind: "actor"; actor: ActorRef }
   | { kind: "session"; sessionId: string; actor?: ActorRef }
   | { kind: "task"; taskId: string }
@@ -16,8 +16,8 @@ export type LogRef =
 const SESSION_ID_PATTERN = /Actor_[A-Za-z0-9_-]+__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+/g
 
 function readString(record: Record<string, unknown> | undefined, key: string): string | undefined {
-  const v = record?.[key]
-  return typeof v === "string" && v.trim() ? v.trim() : undefined
+  const rawValue = record?.[key]
+  return typeof rawValue === "string" && rawValue.trim() ? rawValue.trim() : undefined
 }
 
 function readActorFromExtra(extra: Record<string, unknown> | undefined): ActorRef | undefined {

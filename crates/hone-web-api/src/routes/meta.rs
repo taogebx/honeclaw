@@ -10,6 +10,9 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
 
+use hone_core::cloud_runtime::{
+    CloudPgRuntime, OssObjectStore, RuntimeRole, local_durable_dependencies,
+};
 use hone_core::config::{ConfigMutation, HoneConfig, apply_overlay_mutations};
 use hone_core::{
     HEARTBEAT_STALE_AFTER_SECS, HeartbeatErrorRecord, ProcessHeartbeatSnapshot,
@@ -57,6 +60,25 @@ pub(crate) async fn handle_put_language(
 }
 
 pub(crate) async fn handle_meta(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let runtime_role = RuntimeRole::from_env();
+    let local_deps = local_durable_dependencies(&state.core.config);
+    let postgres_health = match CloudPgRuntime::from_cloud_config(&state.core.config.cloud) {
+        Some(pg) => Some(pg.health().await),
+        None => None,
+    };
+    let oss_health = match OssObjectStore::from_config(&state.core.config.cloud.oss) {
+        Some(oss) => Some(oss.health().await),
+        None => None,
+    };
+    let cloud_storage_authoritative = state
+        .core
+        .config
+        .cloud
+        .effective_mode()
+        .is_cloud_authoritative()
+        && postgres_health.as_ref().is_some_and(|health| health.ok)
+        && oss_health.as_ref().is_some_and(|health| health.ok)
+        && local_deps.is_empty();
     Json(json!(MetaInfo {
         name: "Hone".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -66,6 +88,19 @@ pub(crate) async fn handle_meta(State(state): State<Arc<AppState>>) -> impl Into
         capabilities: meta_capabilities(&state.core.config, &state.deployment_mode),
         deployment_mode: state.deployment_mode.clone(),
         language: state.core.config.language.as_str().to_string(),
+        cloud_mode: state
+            .core
+            .config
+            .cloud
+            .effective_mode()
+            .as_str()
+            .to_string(),
+        runtime_role: runtime_role.as_str().to_string(),
+        worker_leader: None,
+        cloud_storage_authoritative,
+        local_durable_dependency_count: local_deps.len(),
+        cloud_postgres_health: postgres_health,
+        cloud_oss_health: oss_health,
     }))
 }
 
@@ -167,6 +202,16 @@ fn meta_capabilities(config: &HoneConfig, deployment_mode: &str) -> Vec<String> 
 
     if deployment_mode == "local" {
         capabilities.push("local_file_proxy".to_string());
+    }
+    if config.cloud.effective_enabled() {
+        capabilities.push("cloud_runtime".to_string());
+    }
+    if config.cloud.postgres.is_configured() {
+        capabilities.push("cloud_postgres".to_string());
+    }
+    if config.cloud.oss.is_configured() {
+        capabilities.push("cloud_oss".to_string());
+        capabilities.push("oss_file_proxy".to_string());
     }
 
     if cfg!(target_os = "macos") && config.imessage.enabled {

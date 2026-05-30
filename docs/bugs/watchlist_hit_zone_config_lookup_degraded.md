@@ -3,8 +3,110 @@
 - **发现时间**: 2026-04-29 23:06 CST
 - **Bug Type**: System Error
 - **严重等级**: P3
-- **状态**: Fixed
+- **状态**: Closed
 - **修复结论复核**:
+  - `2026-05-24 03:04 CST` 本轮确认修复在最新真实送达样本中生效，状态从 `Fixed` 更新为 `Closed`：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=31770`
+      - `job_name=核心观察股池晚间快报`
+      - `executed_at=2026-05-23T23:02:21.288909+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 明确写出“击球区沿用本地观察池配置”，并为 `MSFT / NVDA / GOOGL / AAPL` 等核心股恢复具体击球区，如 `MSFT $335-$350`、`NVDA $150-$165`、`GOOGL $255-$275`、`AAPL $205-$225`。
+    - `data/sessions.sqlite3` -> `session_messages`
+      - `session_id=Actor_feishu__direct__ou_5f2ccd43e67b89664af3a72e13f9d48773`
+      - assistant `timestamp=2026-05-23T23:02:18.589760+08:00`
+      - final 正文同样包含具体击球区，未再批量退化为“待确认”，也未外泄工具轨迹、绝对路径或内部错误。
+    - 仍定为历史 `P3`：该缺陷此前不阻断投递链路，只影响报告参考字段质量；本轮看到最新真实送达样本恢复配置字段，因此关闭。
+  - `2026-05-22 11:01 CST` 本轮在最近四小时真实运行窗口继续看到一条坏样本，但不推翻仓库代码层面的 `Fixed` 结论：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=30164`
+      - `job_name=核心观察池早间简报`
+      - `executed_at=2026-05-22T09:02:13.419722+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 写出“除 LITE 外，其余 24 支击球区区间本轮未提供，先标注待确认”，并把 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 以及多支拓展股批量写成 `击球区：待确认`。
+    - `data/sessions.sqlite3` -> `session_messages`
+      - `session_id=Actor_feishu__direct__ou_5f2ccd43e67b89664af3a72e13f9d48773`
+      - assistant `ordinal=225`
+      - `timestamp=2026-05-22T09:02:11.565523+08:00`
+      - final 正文同样批量输出 `击球区：待确认`，没有外泄工具轨迹、绝对路径或内部错误。
+    - 本轮仍按旧/未确认部署运行态证据处理，不把状态从 `Fixed` 回退为 `New`。若后续确认运行进程已部署当前 HEAD 的 compact summary / session summary 击球区恢复逻辑后仍复现，再重新打开。
+    - 仍定为 `P3 / Fixed`：任务按时完成并送达，价格与财报字段仍可读；受损的是固定观察池字段恢复与报告参考价值，没有阻断主投递链路，因此不是 `P2` 或更高。
+  - `2026-05-18 11:03 CST` 本轮在当前机器旧/非生产运行态中继续看到一条坏样本，但不推翻仓库代码层面的 `Fixed` 结论：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=25054`
+      - `job_name=核心观察池早间简报`
+      - `executed_at=2026-05-18T09:01:32.580186+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 继续把核心股 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 和拓展股批量写成 `击球区：待确认`。
+    - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，早于 `2026-05-15 04:05 CST` 的紧凑 summary 解析修复复核；因此本轮按旧 live / 非生产运行态证据处理，不把状态从 `Fixed` 回退为 `New`。
+    - 仍定为 `P3 / Fixed`：任务按时完成并送达，价格与财报字段仍可读；受损的是固定观察池字段恢复与报告参考价值，没有阻断主投递链路。
+  - `2026-05-17 23:04 CST` 本轮在当前机器旧/非生产运行态中继续看到两条坏样本，但不推翻仓库代码层面的 `Fixed` 结论：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=24500`
+      - `job_name=科技核心股池 · 晚间击球区快报`
+      - `executed_at=2026-05-17T21:36:47.659945+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 继续把核心股 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 批量写成 `击球区：待确认`。
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=24570`
+      - `job_name=核心观察股池晚间快报`
+      - `executed_at=2026-05-17T23:01:28.041311+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 继续把核心股 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 批量写成 `击球区：待确认`。
+    - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，早于 `2026-05-15 04:05 CST` 的紧凑 summary 解析修复复核；因此本轮按旧 live / 非生产运行态证据处理，不把状态从 `Fixed` 回退为 `New`。
+    - 仍定为 `P3 / Fixed`：任务按时完成并送达，价格与财报字段仍可读；受损的是固定观察池字段恢复与报告参考价值，没有阻断主投递链路。
+  - `2026-05-17 11:03 CST` 本轮在当前机器旧/非生产运行态中继续看到一条坏样本，但不推翻仓库代码层面的 `Fixed` 结论：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=23916`
+      - `job_name=核心观察池早间简报`
+      - `executed_at=2026-05-17T09:01:19.845674+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 继续把核心股 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 和拓展股批量写成 `击球区：待确认`。
+    - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，早于 `2026-05-15 04:05 CST` 的紧凑 summary 解析修复复核；因此本轮按旧 live / 非生产运行态证据处理，不把状态从 `Fixed` 回退为 `New`。
+    - 仍定为 `P3 / Fixed`：任务按时完成并送达，价格与财报字段仍可读；受损的是固定观察池字段恢复与报告参考价值，没有阻断主投递链路。
+  - `2026-05-16 23:03 CST` 本轮在当前机器旧/非生产运行态中继续看到两条坏样本，但不推翻仓库代码层面的 `Fixed` 结论：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=23347`
+      - `job_name=科技核心股池 · 晚间击球区快报`
+      - `executed_at=2026-05-16T21:37:44.421662+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 继续把核心股 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 和拓展股批量写成 `击球区：待确认`。
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=23456`
+      - `job_name=核心观察股池晚间快报`
+      - `executed_at=2026-05-16T23:01:20.191067+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 继续把核心股和拓展股批量写成 `击球区：待确认`。
+    - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，早于 `2026-05-15 04:05 CST` 的紧凑 summary 解析修复复核；因此本轮按旧 live / 非生产运行态证据处理，不把状态从 `Fixed` 回退为 `New`。
+    - 仍定为 `P3 / Fixed`：任务按时完成并送达，价格与财报字段仍可读；受损的是固定观察池字段恢复与报告参考价值，没有阻断主投递链路。
+  - `2026-05-16 11:03 CST` 本轮在当前机器旧/非生产运行态中继续看到一条坏样本，但不推翻仓库代码层面的 `Fixed` 结论：
+    - `data/sessions.sqlite3` -> `cron_job_runs`
+      - `run_id=22803`
+      - `job_name=核心观察池早间简报`
+      - `executed_at=2026-05-16T09:03:10.629733+08:00`
+      - `execution_status=completed`
+      - `message_send_status=sent`
+      - `delivered=1`
+      - `response_preview` 继续把核心股 `MSFT / NVDA / GOOGL / AAPL / AVGO / AMZN / META` 批量写成 `击球区：待确认`。
+    - 同窗 `run_id=22783` 为同一任务的 `running + pending` started 行，后续终态已另起为 `run_id=22803`；这部分台账残留由 `feishu_scheduler_running_rows_never_finalized.md` 跟踪。
+    - 当前 `hone-console-page` 仍启动于 `2026-05-13 19:28 CST`，早于 `2026-05-15 04:05 CST` 的紧凑 summary 解析修复复核；因此本轮按旧 live / 非生产运行态证据处理，不把状态从 `Fixed` 回退为 `New`。
+    - 仍定为 `P3 / Fixed`：任务按时完成并送达，价格与财报字段仍可读；受损的是固定观察池字段恢复与报告参考价值，没有阻断主投递链路。
   - `2026-05-15 04:05 CST` 本轮修复最新可复现解析缺口，状态从 `New` 更新为 `Fixed`：
     - 复核当前代码确认，既有恢复链路已覆盖 Markdown 表格和 `击球区:` 行，但没有覆盖缺陷文档中多次出现的紧凑 compact summary 形态，例如 `MSFT $335-$350`、`NVDA $150-$165`、`GOOGL $255-$275`。
     - `crates/hone-channels/src/scheduler.rs` 现在会在观察池 / 击球区定时任务的 compact summary / session summary 中逐行提取 `ticker + $区间` 形态，并支持同一行多个 ticker 与 `保守/合理/激进` 分档区间；`待确认` 不会被回灌为有效区间。

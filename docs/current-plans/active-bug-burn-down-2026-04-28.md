@@ -3,7 +3,7 @@
 - title: Active Bug Burn-down 2026-04-28
 - status: in_progress
 - created_at: 2026-04-28
-- updated_at: 2026-05-16 03:05 CST
+- updated_at: 2026-05-30 00:09 CST
 - owner: Codex
 - related_files:
   - `docs/bugs/README.md`
@@ -34,6 +34,9 @@ Clear the current active bug queue as far as software changes can responsibly do
 
 ## Progress
 
+- 2026-05-30 00:09: Re-closed the reopened P2 scheduler commodity-guard false positive for low-segmentation A/H market reviews. `text_is_predominantly_commodity_related(...)` now compares broad-market anchors against commodity anchors even when the response has only one or two sentence segments, so an A股/港股/美股/AI market review with WTI/Brent/oil only in a risk note is not fully replaced by the commodity safety notice. Added `commodity_guard_skips_low_segmentation_ah_market_review_with_oil_risk_note`; `commodity_guard_`, `commodity_`, `cargo check -p hone-channels --tests`, and rustfmt check passed. Active bug queue is back to 0.
+- 2026-05-29 00:13: Reconciled the active queue after `a78d3f2e fix: harden event digest and commodity guards` landed on `origin/main`. Current HEAD already covers both remaining active bugs: Feishu event digest `open_id cross app` now invalidates direct open_id cache and retries after `99992361`, while scheduler commodity guard skips broad-market review samples that only mention oil as a secondary risk variable. Verified `cargo test -p hone-event-engine feishu --lib -- --nocapture` and `cargo test -p hone-channels commodity_guard_ --lib -- --nocapture`; `docs/bugs/README.md` active queue is back to 0. This run did not require a new code patch because the code fix was already present; it synchronized the ledger and issue follow-up state.
+- 2026-05-28 03:11: Re-closed the reopened P1 event-engine Feishu direct digest `open_id cross app` regression by restoring the intended “all stable contacts resolve to one current-app open_id” contract end-to-end: Web API now forwards every stable direct contact target per actor, and `FeishuSink` now merges repeated actor entries instead of overwriting them. The same run also closed the active P2 heartbeat stale gold-price trigger by suppressing `JsonTriggered` deliveries whose current/latest-price message carries an explicit date older than the current Beijing date. Targeted `hone-event-engine` / `hone-web-api` / `hone-channels` tests and `cargo check -p hone-event-engine -p hone-web-api -p hone-channels --tests` passed. The remaining active bug is the scheduler commodity-guard false positive; current local regressions already pass, so the next run needs a live sample shape that still reproduces before making another code change.
 - 2026-04-28: Started from a clean `main...origin/main` workspace, then pulled latest before the burn-down.
 - 2026-04-28: Closed 6 active bugs with code changes and moved them to `Fixed` in `docs/bugs/README.md`:
   - Desktop bundled restart 8077 port conflict
@@ -78,6 +81,7 @@ Clear the current active bug queue as far as software changes can responsibly do
 - 2026-05-07 11:06: Closed the active P3 watchlist hit-zone degradation by tightening the shared scheduled-task contract rather than adding another data-source special case. `build_scheduled_prompt` now injects a stable-local-field rule for ordinary scheduled tasks that mention both watchlists/观察池 and hit zones/击球区, and `multi_agent` search-stage guidance now preserves hit zones from task text, restored context, portfolio/local state, or local files while using `data_fetch` only for fresh prices, fundamentals, and earnings dates. Targeted `hone-channels` prompt/guidance regressions passed. No GitHub issue was linked for this bug.
 - 2026-05-09 03:28: Closed the remaining active P2 `sessions.sqlite3` mirror stall by combining two rollout fixes: `hone-cli` config generation/writeback now normalizes `storage.session_sqlite_shadow_write_enabled=true`, and `SessionStorage` now performs startup JSON -> SQLite shadow backfill when JSON remains the runtime backend and shadow write is enabled. This covers both non-desktop launch paths that could keep the writer disabled and historical windows where the writer was disabled: restarting with the corrected config now repairs the existing JSON session mirror instead of waiting for each session to receive another turn. Active `docs/bugs/README.md` queue is now empty; open GitHub Issues from older fixed docs still need human/automation follow-up comments or closure review.
 - 2026-05-09 19:06: Re-closed the reopened P2 heartbeat malformed-triggered leak. `recover_malformed_triggered_heartbeat_message` now uses a lossy JSON string-field scanner that confirms `status=triggered`, extracts only the `message` value, tolerates unescaped quotes inside the message, and stops before subsequent fields such as `source/confidence`. The latest `Cerebras IPO` / `RKLB` / `TSLA` shape is covered without turning ordinary malformed JSON, empty output, internal markers, or free text into delivered alerts. No GitHub Issue is linked to the malformed-triggered bug.
+- 2026-05-27 03:04: Re-closed the reopened P2 scheduler commodity-guard false positive. `guard_commodity_causality_for_event(...)` now compares broad-market anchors against commodity anchors before treating a long paragraph as predominantly commodity-related, so OWALERT / XME / 宏观日历 / 大盘风控类正文里的局部油价观察项不再触发整篇 rewrite. Updated `hone-channels` regressions keep the broad-market false-positive samples open while still guarding genuinely oil-dominant bodies. Active `docs/bugs/README.md` queue is back to 0; live deployment verification remains a follow-up because this automation does not restart services.
 - 2026-05-09 19:12: Re-closed the reopened P2 heartbeat cross-job duplicate suppression false skip. `heartbeat_entity_anchors_compatible` now applies a ticker-level hard gate before loose token overlap: if both the current message and prior preview contain explicit ticker anchors and there is no intersection, the preview cannot suppress delivery. Generic English anchors such as `Q1/Q2/Q3/Q4`, `CEO`, `SEC`, and `FDA` are excluded from entity compatibility. Added regressions for `RKLB -> ASTS`, `RKLB -> TEM`, and `RKLB -> portfolio ASTS`; active `docs/bugs/README.md` queue is now empty again. No GitHub Issue is linked to this bug.
 - 2026-05-10 03:07: Re-closed the reopened P3 watchlist hit-zone degradation again, this time by moving the fix from prompt-only guidance into scheduler input construction. Watchlist tasks that mention hit zones now recover ticker -> zone mappings from the current actor session's `compact summary` / `session.summary` and append them as explicit `【已恢复的本地击球区参考】` bullets before execution, so the answer stage no longer has to rediscover or remember the stable local ranges on its own. Added `scheduled_watchlist_prompt_recovers_hit_zones_from_compact_summary` and re-ran the existing stable-local-field regression; active queue is now reduced to the oil heartbeat causality-guard bug.
 - 2026-05-13 04:36: Closed the active P2 heartbeat `mimo-v2.5-pro` `Param Incorrect` batch failure. The root cause was not a generic provider parameter mismatch: the auxiliary function-calling loop dropped assistant `reasoning_content` between the first tool-calling turn and the follow-up tool-result turn, while `mimo-v2.5-pro` thinking mode requires that field to be echoed back. Fixed the shared path in `hone-agent` + `hone-llm` by preserving/replaying `reasoning_content`, switched OpenAI-compatible non-streaming requests with reasoning transcripts onto explicit raw JSON bodies, and narrowed heartbeat tool exposure to a small allowlist to reduce schema bloat. Targeted `hone-llm` / `hone-agent` / `hone-channels` regressions pass. Remaining active queue is now 2 Feishu-facing output issues (`feishu_direct_partial_reply_before_tool_completion` and `feishu_company_profile_absolute_path_leak`), both higher priority than any remaining P2/P3 and should be handled first next run.
@@ -86,6 +90,12 @@ Clear the current active bug queue as far as software changes can responsibly do
 - 2026-05-15 08:07: Closed the active P1 Daily macOS release app API lifecycle bug by adding `HONE_DESKTOP_SMOKE_SERVER=1` to `hone-desktop`. The packaged desktop executable can now run a headless Web/API smoke server on fixed ports, independent of Tauri window lifecycle, and stays alive until Ctrl-C. Local smoke verified `/api/meta`, the public user page, and disabled channel status on `18077/18088`; Issue #42 is linked in the bug doc.
 - 2026-05-15 08:07: Re-closed the active P2 oil scheduler recurrence based on current code and a new exact regression for the latest contract-month sample. The existing ordinary scheduler commodity guard already rewrites unsafe `Brent Jul 2026 / WTI Jun 2026` approximate prices and tech-stock tail-risk causality into a safe notice; the latest `detail_json.scheduler=null` evidence is treated as old/non-production runtime state, not as a current HEAD failure. Active bug queue is now empty.
 - 2026-05-16 03:05: Re-closed the reopened P1 Feishu direct empty/invalid answer bug after the latest 2026-05-15 21:48 / 22:07 samples showed two remaining `planning_sentence_suppressed` gaps. `response_finalizer` now recovers successful `portfolio` side effects into user-visible confirmations, and `is_transitional_planning_sentence(...)` keeps “把图发给我 / 上传截图” style attachment guidance instead of collapsing it into the generic fallback. Added focused `hone-channels` regressions plus `cargo check`; active bug queue remains empty.
+- 2026-05-20 11:30: Closed the user-reported The Fly broken-link push regression. AnalystGrade events now keep raw FMP `payload.newsURL` for fanout/cooldown dedupe, but user-visible rendering filters The Fly internal `/ajax/news_get.php` and app-shell `/news.php` entrypoints. The attempted `news.php?symbol=AMD` replacement was verified to land on the The Fly app/home shell rather than a stable AMD news list, so the final policy is to omit unstable The Fly links unless upstream provides a stable public permalink or a non-The Fly URL.
+- 2026-05-20 20:06: Closed GitHub Issue #44 / P1 heartbeat `mimo-v2.5-pro` 429 quota exhaustion. The controllable bug was not the external quota itself, but the runtime ignoring configured non-OpenRouter `llm.providers.<name>.api_keys` after the first key. `OpenAiCompatibleProvider` now performs non-streaming key-pool fallback, profile resolution passes the full key pool, and heartbeat classifies 429 / rate-limit / resource-exhausted failures as `provider_quota_exhausted`. Active bug queue is empty again.
+- 2026-05-22 10:05: Closed the active P2 Feishu PDF CMap parser panic bug. Shared PDF extraction now catches `pdf_extract` / `adobe-cmap-parser` panics and returns stable `pdf_text_extract_failed`; attachment prompt lines, PDF notes, and ack messages sanitize historical `task panicked`, crate source path, and local absolute-path details before they can enter LLM-visible context. Active bug queue is empty again. No GitHub Issue is linked to this bug.
+- 2026-05-23 12:04: Closed the reopened P2 heartbeat context-window overflow status bug. Heartbeat runner context overflow is no longer converted into `ContextOverflowNoop`; it now keeps `ScheduledTaskExecution.error` and records `failure_kind=context_window_overflow` plus `parse_kind=ContextOverflowError`, so channel histories land as `execution_failed + skipped_error` instead of `noop + skipped_noop`. No GitHub Issue is linked to the context-overflow bug.
+- 2026-05-23 12:13: Closed the remaining active P2 heartbeat structured-status degradation bug. Heartbeat JSON status aliases now normalize common `not_triggered` / `condition_met` shapes, complete internal-only `<think>` outputs that explicitly say no trigger normalize to `PlainTextNoop`, and the heartbeat prompt now blocks tool/task/profile configuration fragments such as `set_immediate_kinds` / `cron_job` as final output. Active bug queue is empty again. No GitHub Issue is linked to this bug.
+- 2026-05-26 03:05: Closed the remaining active P2 `scheduler_commodity_guard_false_positive_market_review`. Ordinary scheduler commodity rewrite now stays limited to commodity-first tasks or commodity-dominant content, while broad market reviews with only secondary oil/energy clauses skip the full rewrite. Added focused `hone-channels` regressions for US market risk briefs and cross-market close reviews plus reran the `commodity_` suite and `cargo check -p hone-channels --tests`. Active bug queue is empty again.
 
 ## Validation
 
@@ -153,6 +163,24 @@ Completed this round:
 - `cargo test -p hone-channels transitional_clarification_question_is_not_treated_as_planning_sentence -- --nocapture`
 - `cargo test -p hone-channels finalize_agent_response_keeps_user_facing_clarification_question -- --nocapture`
 - `cargo check -p hone-channels --tests`
+- `cargo test -p hone-event-engine user_visible_url_filters_unstable_thefly_entrypoints --lib -- --nocapture`
+- `cargo test -p hone-event-engine thefly_ajax_news_url_is_hidden_but_kept_in_payload --lib -- --nocapture`
+- `cargo test -p hone-event-engine immediate_render_omits_unstable_thefly_ajax_url --lib -- --nocapture`
+- `cargo test -p hone-event-engine digest_payload_omits_unstable_thefly_urls --lib -- --nocapture`
+- `cargo test -p hone-event-engine --lib`
+- `cargo test -p hone-llm chat_with_tools_falls_back_to_next_key_after_http_429 -- --nocapture`
+- `cargo test -p hone-channels heartbeat_provider_429_quota_error_is_classified --lib -- --nocapture`
+- `cargo test -p hone-llm openai_compatible -- --nocapture`
+- `cargo test -p hone-llm resolver -- --nocapture`
+- `cargo test -p hone-channels heartbeat_provider_ --lib -- --nocapture`
+- `cargo check -p hone-llm -p hone-channels --tests`
+- `rustfmt --edition 2024 --check crates/hone-llm/src/openai_compatible.rs crates/hone-llm/src/resolver.rs crates/hone-channels/src/scheduler.rs`
+- `cargo test -p hone-channels pdf_extract --lib -- --nocapture`
+- `cargo test -p hone-channels pdf_note_contains_extracted_text --lib -- --nocapture`
+- `cargo check -p hone-channels --tests`
+- `rustfmt --edition 2024 --check crates/hone-channels/src/attachments/vector_store.rs crates/hone-channels/src/attachments/ingest.rs`
+- `git diff --check`
+- `cargo fmt --all -- --check`
 - `rustfmt --edition 2024 crates/hone-channels/src/runtime.rs crates/hone-channels/src/agent_session/tests.rs`
 - `cargo test -p hone-channels session_event_emitter_ -- --nocapture`
 - `cargo check -p hone-channels --tests`
@@ -194,6 +222,12 @@ Completed this round:
 - `cargo test -p hone-channels heartbeat_malformed --lib -- --nocapture`
 - `cargo test -p hone-channels heartbeat_ --lib -- --nocapture`
 - `rustfmt --edition 2024 --check crates/hone-channels/src/scheduler.rs`
+- `cargo check -p hone-channels --tests`
+- `cargo test -p hone-channels heartbeat_context_overflow_error_is_not_classified_as_noop --lib -- --nocapture`
+- `cargo test -p hone-channels heartbeat_ --lib -- --nocapture`
+- `cargo check -p hone-channels --tests`
+- `rustfmt --edition 2024 --config skip_children=true --check crates/hone-channels/src/scheduler.rs`
+- `cargo test -p hone-channels heartbeat_ --lib -- --nocapture`
 - `cargo check -p hone-channels --tests`
 - `cargo test -p hone-channels heartbeat_duplicate_preview_match --lib -- --nocapture`
 - `cargo test -p hone-channels scheduled_watchlist_hit_zone_prompt_keeps_stable_local_fields -- --nocapture`

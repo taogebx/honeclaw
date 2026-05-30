@@ -3,6 +3,12 @@
 
 set -euo pipefail
 
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "[FAIL] python3 is required to read Hone config and probe FMP/Tavily" >&2
+    echo "Install Python 3 or add it to PATH, then rerun: bash scripts/diagnose_fmp_tavily.sh" >&2
+    exit 1
+fi
+
 python3 - "$@" <<'PY'
 import argparse
 import json
@@ -15,11 +21,17 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError:
+    raise SystemExit(
+        "PyYAML is required to read Hone config. Install it with: python3 -m pip install PyYAML"
+    ) from None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        prog="scripts/diagnose_fmp_tavily.sh",
         description="Diagnose FMP and Tavily API keys, including quota exhaustion."
     )
     parser.add_argument(
@@ -164,12 +176,12 @@ def http_json_request(method: str, url: str, timeout: float, body=None, headers=
         data = json.dumps(body).encode("utf-8")
         request_headers.setdefault("Content-Type", "application/json")
 
-    req = urllib.request.Request(url, data=data, method=method, headers=request_headers)
+    request = urllib.request.Request(url, data=data, method=method, headers=request_headers)
     started = time.perf_counter()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            status = resp.getcode()
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            status = response.getcode()
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
         status = exc.code

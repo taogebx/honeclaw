@@ -2,11 +2,11 @@ import { makeContentProxy } from "../i18n"
 
 const ZH = {
   capability: {
-    unavailable: "当前后端未开放 LLM 审计能力。",
+    unavailable: "当前后端未提供 LLM 审计能力。",
   },
   toolbar: {
     title: "LLM 审计",
-    filter_user_placeholder: "过滤用户 ID",
+    filter_user_placeholder: "过滤账号",
     filter_session_placeholder: "过滤会话",
     status_all: "全部状态",
     status_success: "成功",
@@ -50,11 +50,11 @@ const ZH = {
 
 const EN: typeof ZH = {
   capability: {
-    unavailable: "The current backend does not expose the LLM audit capability.",
+    unavailable: "LLM audit is not available from this backend.",
   },
   toolbar: {
     title: "LLM audit",
-    filter_user_placeholder: "Filter user ID",
+    filter_user_placeholder: "Filter account",
     filter_session_placeholder: "Filter session",
     status_all: "All statuses",
     status_success: "Success",
@@ -64,13 +64,13 @@ const EN: typeof ZH = {
   },
   table: {
     col_time: "Time",
-    col_actor_session: "User / Session",
+    col_actor_session: "User / session",
     col_provider_model: "Provider / Model",
     col_operation: "Operation",
     col_status: "Status",
     col_tokens: "Tokens",
     col_latency: "Latency",
-    empty: "No audit records",
+    empty: "No audit records yet",
     status_success: "Success",
     status_failed: "Failed",
     actor_user_none: "none",

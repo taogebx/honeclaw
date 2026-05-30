@@ -24,6 +24,7 @@ const CONTENT_ZH = {
     logo_tagline: "OPEN FINANCIAL CONSOLE",
     home: "首页",
     roadmap: "路线图与文档",
+    blog: "Blog",
     me: "个人",
     chat: "对话",
     back_home: "返回首页",
@@ -65,6 +66,11 @@ const CONTENT_ZH = {
     video_demo: "视频演示",
     view_full_roadmap: "完整路线图",
     zoom_hint: "查看详情",
+    blog_eyebrow: "工程 Blog",
+    blog_title: "为什么 Hone 选择 Rust",
+    blog_desc:
+      "从 Python + Node.js 到 Rust 的重构复盘：AI Coding 时代的上下文、稳定性和多端工程选择。",
+    blog_cta: "阅读文章",
   },
 
   trust: {
@@ -287,7 +293,7 @@ const CONTENT_ZH = {
       "透明、务实、长期主义。下面是 Hone 目前能做什么、接下来做什么、以及如何接入你的投研工作流。",
     hero_meta: "ROADMAP · DOCS · API",
     sidebar_title: "ON THIS PAGE",
-    version: "v0.12.2",
+    version: "v0.12.4",
 
     toc: [
       { id: "quick-start", label: "快速开始", sub: "Quick Start" },
@@ -324,7 +330,7 @@ const CONTENT_ZH = {
         eyebrow: "§ 04 · ARCHITECTURE",
         title: "系统架构",
         intro:
-          "Rust 核心引擎 · 多 Agent 引擎抽象 · SolidJS 前端。公开用户端、管理后台和渠道进程共用同一套后端能力，但按界面、端口和进程边界隔离。",
+          "Rust 核心引擎 · 多 Agent 引擎抽象 · SolidJS 前端。公开用户端、管理后台和渠道进程共用同一套后端能力，但按界面、端口和进程边界隔离；Cloud PG / OSS 正在分阶段接管运行时存储。",
         footnote_prefix: "完整模块说明见",
         footnote_link: "docs/repo-map.md ↗",
       },
@@ -415,19 +421,23 @@ const CONTENT_ZH = {
       },
       {
         title: "公开用户端",
-        desc: "公开用户端路由包含 `/`、`/roadmap`、`/chat`、`/me`、`/portfolio`、`/terms`、`/privacy`，并保留开发用 `/__share-preview` 分享卡预览页；`/chat` 使用阿里云行为验证 + 手机短信验证码登录，管理端白名单是准入来源，桌面端为可收起左侧导航 + 右侧对话工作台，支持助手回答复制、图片分享、联系入口和 GitHub stars 兜底；`/portfolio` 只读展示推送上下文与公司画像入口，后端公开面收敛在 `/api/public/*`。",
+        desc: "公开用户端路由包含 `/`、`/roadmap`、`/blog`、`/blog/:slug`、`/chat`、`/me`、`/portfolio`、`/terms`、`/privacy`，并保留开发用 `/__share-preview` 分享卡预览页；`/blog` 是双语静态长文内容面，Cloudflare Worker 为文章分享卡注入 crawler 友好的 metadata；`/chat` 使用阿里云行为验证 + 手机短信验证码登录，管理端邀请名单是准入来源，桌面端为可收起左侧栏 + 右侧对话工作台，侧栏聚合导航、账号、最近对话历史、联系入口和 GitHub stars，支持助手回答复制、图片分享、非图片生成物附件下载与历史回看；`/portfolio` 只读展示推送上下文与公司画像入口，后端公开面收敛在 `/api/public/*`，其中 `/api/public/file` 代理可下载生成物，`/api/public/v1/chat/completions` 提供 API key 鉴权的 OpenAI-compatible 对话接口。",
+      },
+      {
+        title: "存储与云运行时",
+        desc: "`cloud.postgres` / `cloud.oss` 是 v0.12.4 起的一等配置项，并通过 env 引用真实凭证；配置 OSS 后，公开 Web 上传会写入 `public-uploads/...` 并返回 `oss://bucket/key`，`/api/public/image` 与 `/api/public/file` 可代理托管对象；`/api/meta` 暴露 `cloud_runtime`、`cloud_postgres`、`cloud_oss`、`oss_file_proxy` 等能力。迁移仍在进行中，sessions、quota、audit、portfolio、cron、notification prefs、生成物和日志仍保留本地 fallback，`cloud.strict_no_local_storage=true` 只适合确认无本地依赖后启用。",
       },
       {
         title: "管理后台",
-        desc: "管理后台提供 dashboard、sessions、skills、tasks、users、research、llm-audit、task-health、notifications、schedule、settings、logs 等维护入口。",
+        desc: "管理后台提供 dashboard、sessions、skills、tasks、users、research、llm-audit、task-health、notifications、schedule、settings、logs 等维护入口；users 页把持仓、公司画像、会话与研究任务按用户主体聚合，公司画像支持 actor 空间列表、详情查看、删除、zip 导出、导入预览与冲突处理后导入。",
       },
       {
         title: "Agent 引擎层",
-        desc: "推荐 Agent 引擎是 Hone Cloud、Codex ACP 和 OpenCode ACP；同时保留 OpenAI 兼容函数调用、Gemini CLI、Codex CLI 与 multi-agent。`gemini_acp` 仅保留为迁移配置，不作为运行时入口。",
+        desc: "推荐 Agent 引擎是 Hone Cloud、Codex ACP 和 OpenCode ACP；同时保留 OpenAI 兼容函数调用、Gemini CLI、Codex CLI 与 multi-agent。LLM 凭证以 `config.yaml` 为唯一真相源，OpenRouter 与通用 OpenAI-compatible provider 都支持 `llm.providers.*.api_key/api_keys` key pool，遇到上游 429 / 配额错误时可尝试下一个 key；`gemini_acp` 仅保留为迁移配置，不作为运行时入口。",
       },
       {
         title: "事件与任务",
-        desc: "Cron 任务、事件引擎摘要、`/missed` 回查、通知偏好与渠道投递共享 Rust 后端、SQLite/JSON 存储和用户归属模型；Feishu 等渠道的 scheduler heartbeat 已补齐 revision-aware 重复抑制与 running 行终结回归覆盖。",
+        desc: "Cron 任务、事件引擎摘要、`/missed` 回查、通知偏好与渠道投递共享 Rust 后端、SQLite/JSON 存储和用户归属模型；Feishu 等渠道的 scheduler heartbeat 已补齐 revision-aware 重复抑制与 running 行终结回归覆盖，event-engine 默认 LLM 配置已切到当前可用的 `x-ai/grok-4.3`，避免继续依赖已下线的 Grok 4.1 Fast。",
       },
     ],
 
@@ -443,7 +453,7 @@ const CONTENT_ZH = {
           {
             name: "公司画像 & 长期记忆",
             status: "stable",
-            note: "公司画像 Skill",
+            note: "公司画像 Skill + 管理端导入/导出",
           },
           {
             name: "个股研究 / 深度研究",
@@ -453,7 +463,7 @@ const CONTENT_ZH = {
           {
             name: "持仓追踪与提醒",
             status: "stable",
-            note: "portfolio_management + cron",
+            note: "portfolio_management + cron + 成功持仓读取确认恢复",
           },
           {
             name: "估值 / 选股 / 仓位建议",
@@ -466,9 +476,9 @@ const CONTENT_ZH = {
             note: "chart_visualization / image_generation",
           },
           {
-            name: "公开聊天分享长图",
+            name: "公开聊天工作台与分享",
             status: "stable",
-            note: "html2canvas + qrcode + markdown 渲染 + CJK 代码块字体",
+            note: "侧栏历史 + html2canvas + qrcode + markdown 渲染 + CJK 代码块字体 + 附件下载卡片",
           },
           { name: "向量检索增强记忆", status: "planned", note: "规划中" },
         ],
@@ -486,11 +496,31 @@ const CONTENT_ZH = {
             status: "stable",
             note: "Vite · Tailwind v4 · stale asset recovery",
           },
+          {
+            name: "公开 Blog 与文档内容面",
+            status: "stable",
+            note: "双语 Markdown 文章 + 文章路由 + Cloudflare 分享 metadata",
+          },
           { name: "Tauri 桌面端", status: "stable", note: "macOS 已发布" },
           {
             name: "多 Agent 引擎抽象",
             status: "stable",
             note: "OpenAI-compatible · Gemini CLI · Codex CLI/ACP · OpenCode ACP · multi-agent",
+          },
+          {
+            name: "LLM provider key pool 与上游错误保真",
+            status: "stable",
+            note: "config.yaml llm.providers.*.api_key/api_keys · OpenRouter / OpenAI-compatible fallback",
+          },
+          {
+            name: "Cloud PG / OSS 运行时迁移",
+            status: "beta",
+            note: "cloud.postgres / cloud.oss env refs · OSS 公开上传代理 · 本地 fallback 仍保留",
+          },
+          {
+            name: "渠道回复收口与副作用确认",
+            status: "stable",
+            note: "response_finalizer 可从成功 cron / portfolio 工具结果恢复用户可见确认",
           },
           {
             name: "Windows / Linux 桌面端",
@@ -505,7 +535,7 @@ const CONTENT_ZH = {
           {
             name: "Cron 定时任务",
             status: "stable",
-            note: "scheduled_task skill + /api/cron-jobs",
+            note: "scheduled_task skill + /api/cron-jobs + 普通市场复盘 guard 回归",
           },
           {
             name: "自定义 Skill",
@@ -525,7 +555,12 @@ const CONTENT_ZH = {
           {
             name: "公开用户 SMS 登录与验证码守门",
             status: "stable",
-            note: "Aliyun Captcha + Aliyun SMS + 管理端 Web 白名单",
+            note: "Aliyun Captcha + Aliyun SMS + 管理端 Web 邀请名单",
+          },
+          {
+            name: "公开 OpenAI-compatible Chat API",
+            status: "beta",
+            note: "用户 API key + /api/public/v1/chat/completions",
           },
           {
             name: "按用户细粒度推送偏好",
@@ -547,7 +582,7 @@ const CONTENT_ZH = {
         name: "Web",
         icon: "⚡",
         status: "stable",
-        desc: "手机号 + 短信验证码登录的白名单聊天页",
+        desc: "手机号 + 短信验证码登录的邀请制聊天页",
       },
       {
         name: "iMessage",
@@ -621,18 +656,28 @@ const CONTENT_ZH = {
     now: {
       label: "当前已有",
       items: [
-        "Web 聊天界面（阿里云行为验证 + 手机短信验证码，管理端白名单准入）+ 公开门面站",
-        "公开 `/chat` 桌面工作台布局：可收起左侧导航、账号入口、联系入口、GitHub stars 与右侧完整高度对话区",
+        "Web 聊天界面（阿里云行为验证 + 手机短信验证码，管理端邀请名单准入）+ 公开门面站",
+        "公开 `/chat` 桌面工作台布局：可收起左侧栏、账号入口、最近对话历史、联系入口、GitHub stars 与右侧完整高度对话区",
         "公开 `/chat` 助手回答复制与分享：可选择消息，导出品牌长图、复制图片/文字或调用系统分享；分享卡支持 CJK 代码块字体并有开发预览页",
+        "公开 `/chat` 非图片生成物附件卡片：runner 新生成且正文提到的 CSV / XLSX / PDF 等文件会追加为可下载附件，经 `/api/public/file` 打开",
         "公开 `/chat` markdown 渲染、移动输入框、键盘聚焦、滚动锚定与回到底部按钮已完成稳定性打磨",
+        "公开 `/blog` 与 `/blog/:slug` 双语长文页面，首篇 Rust 迁移复盘已随仓库发布，并由 Cloudflare Worker 为分享卡补齐 metadata",
         "Tauri macOS 桌面端 + 内置后端",
         "7 个渠道：Web / iMessage / Lark / Discord / Telegram / CLI / MCP",
         "16 个公开 Skill（个股、持仓、估值/筛选入口、图表、PDF、Cron、漏推回查、推送偏好…）",
         "投研纪律约束 & 零幻觉协议",
         "公司画像与跨会话长期记忆",
+        "管理端用户视图聚合持仓、画像、会话与研究任务；公司画像可按 actor 空间查看详情、删除、导出 zip、导入预览并处理冲突",
         "Cron 定时任务系统",
+        "定时任务投递安全 guard：原油 / 大宗商品归因防护仍覆盖商品播报，但不会因市场复盘中的局部油价从句整篇替换 A/H 或美股大盘复盘",
         "事件引擎推送质量收口：digest 去重 / min-gap / topic memory / 分类预算 / 方向性价格阈值 / Feishu scheduler heartbeat revision 去重",
+        "Event-engine 默认模型与示例配置已替换为 `x-ai/grok-4.3`，避免 Grok 4.1 Fast 下线导致新闻分类、global digest、mainline distill 等 LLM 增强链路失效",
+        "LLM provider 配置收口到 `config.yaml`，OpenRouter 与通用 OpenAI-compatible provider 支持 `api_key/api_keys` 轮换，并保留上游错误详情便于诊断",
+        "Cloud PG / OSS 运行时第一段：`cloud.postgres` / `cloud.oss` 可通过 env 配置，公开上传可写入 OSS，公开图片 / 文件代理可读取 `oss://bucket/key` 托管对象，`/api/meta` 会暴露云能力状态",
+        "云迁移边界清晰：sessions、quota、audit、portfolio、cron、notification prefs、生成物和日志仍保留本地 fallback；`cloud.strict_no_local_storage=true` 会在仍有本地依赖时阻止启动",
+        "渠道回复收口层可在 runner 只产出过渡性规划句时，从成功的定时任务或持仓工具结果恢复用户可见确认，避免真实成功被空回复 fallback 遮蔽",
         "前端部署资产恢复：service worker 与全局错误处理可识别 stale chunk，并在安全间隔内自动刷新到新版本",
+        "公开 API key 对话入口：管理端可为 Web 用户生成 API key，客户端可按 OpenAI-compatible `/api/public/v1/chat/completions` 形状调用 Hone",
         "ACP 自管上下文与 compact 防泄漏，支持 codex_acp / opencode_acp 长会话恢复",
         "多 Agent 引擎：OpenAI-compatible / Gemini CLI / Codex CLI/ACP / OpenCode ACP / multi-agent",
         "`scripts/diagnose_llm.sh` 已按当前 LLM provider 配置路径读取 OpenRouter key，保留 legacy 路径兼容",
@@ -643,7 +688,8 @@ const CONTENT_ZH = {
       items: [
         "Windows / Linux 桌面端打包",
         "用户自定义 Skill 编辑器（前端化的 skill_manager）",
-        "数据导入 / 导出工具",
+        "更广泛的数据导入 / 导出工具（公司画像包转移已上线，继续补持仓、研究结果等迁移面）",
+        "继续补齐 PG-backed repositories，逐步减少 sessions、quota、audit、portfolio、cron、notification prefs、生成物和日志的本地 fallback",
         "公开 Skill 文档与示例集",
         "向量检索增强长期记忆",
       ],
@@ -653,7 +699,7 @@ const CONTENT_ZH = {
       items: [
         "多用户协作研究空间",
         "可视化持仓分析面板",
-        "面向开发者的开放 API",
+        "更完整的开发者 API、SDK 与示例",
         "社区 Skill 市场",
         "多 Agent 协同编排",
       ],
@@ -690,6 +736,16 @@ const CONTENT_ZH = {
         title: "Wiki",
         url: "https://github.com/B-M-Capital-Research/honeclaw/blob/main/docs/wiki.md",
         desc: "安装、启动、端口、配置、验证与排障入口",
+      },
+      {
+        title: "Release Notes v0.12.4",
+        url: "https://github.com/B-M-Capital-Research/honeclaw/blob/main/docs/releases/v0.12.4.md",
+        desc: "最新 release 的用户影响、升级方式与已知注意事项",
+      },
+      {
+        title: "Hone Blog",
+        url: "https://hone-claw.com/blog",
+        desc: "公开双语长文，记录架构选择、迁移复盘与产品说明",
       },
       {
         title: "Repo Map",
@@ -761,7 +817,7 @@ const CONTENT_ZH = {
       },
       {
         q: "支持哪些 LLM？",
-        a: "通过 Agent 引擎抽象层支持：OpenAI 兼容协议（含 OpenRouter）、Gemini CLI、Codex CLI / ACP、OpenCode ACP，以及 multi-agent 搜索+回答链路。可以在桌面端设置里随时切换。",
+        a: "通过 Agent 引擎抽象层支持：Hone Cloud、OpenAI 兼容协议（含 OpenRouter）、Gemini CLI、Codex CLI / ACP、OpenCode ACP，以及 multi-agent 搜索+回答链路。凭证统一写入 `config.yaml` 的 `llm.providers.*.api_key/api_keys`，通用 OpenAI-compatible provider 与 OpenRouter 都能在 key pool 内尝试下一个可用 key。",
       },
       {
         q: "开源协议？能商用吗？",
@@ -769,7 +825,7 @@ const CONTENT_ZH = {
       },
       {
         q: "数据存在哪里？",
-        a: "所有会话、公司画像、研究结果默认存储在本地（macOS 桌面端用户目录 ~/.honeclaw 或自部署服务器）。Hone 官方不托管用户数据。",
+        a: "默认仍在本地或自部署服务器存储（macOS 桌面端用户目录 ~/.honeclaw）。v0.12.4 已加入 Cloud PG / OSS 运行时配置第一段：OSS 可托管公开上传和公开图片 / 文件代理对象，但 sessions、quota、audit、portfolio、cron、notification prefs、生成物和日志仍保留本地 fallback；Hone 官方不默认托管你的数据。",
       },
       {
         q: "和 Codex / RooCode 等 coding agent 的关系？",
@@ -784,7 +840,7 @@ const CONTENT_ZH = {
     logged_out_title: "请先登录",
     logged_out_desc: "登录后查看你的历史记录和账号信息。",
     logged_out_cta: "前往对话页登录",
-    invite_note: "需要手机号加入白名单后才能进入对话",
+    invite_note: "需要手机号加入邀请名单后才能进入对话",
     loading: "加载中…",
     account_info_title: "账号信息",
     usage_today_label: "账号状态",
@@ -825,6 +881,10 @@ const CONTENT_ZH = {
       expand: "展开侧边栏",
       signed_in: "已登录",
       account_center: "账号中心",
+      history_title: "对话记录",
+      history_empty: "开始提问后，这里会显示最近的问题。",
+      history_attachment: "带附件的问题",
+      history_empty_item: "空消息",
     },
     prefs: {
       aria_label: "字号与主题",
@@ -835,10 +895,10 @@ const CONTENT_ZH = {
       theme_dark: "深",
     },
     status: {
-      error: "HONE 出错了",
-      streaming: "HONE 输出中",
-      running: "HONE 执行中",
-      thinking: "HONE 思考中",
+      error: "Hone 出错了",
+      streaming: "Hone 输出中",
+      running: "Hone 执行中",
+      thinking: "Hone 思考中",
       done: "本轮已完成",
       fallback_error: "请求出错，请重试。",
       stop: "停止",
@@ -873,6 +933,7 @@ const CONTENT_ZH = {
       ],
       proactive_examples_title: "你可以这样说",
       proactive_examples: [
+        "介绍一下磷化铟产业链，推荐一些相关的光模块公司",
         "我持有 AAPL 和 NVDA，帮我开启关键事件提醒",
         "只给我推持仓相关的财报和重大新闻",
         "每周五收盘后做一次持仓复盘",
@@ -887,7 +948,7 @@ const CONTENT_ZH = {
     restoring: {
       title: "正在恢复对话",
       desc: "正在校验当前会话并恢复聊天历史",
-      retrying: "后端响应较慢，正在自动重试（第 {attempt} 次）...",
+      retrying: "后端响应较慢，正在自动重试（第 {attempt} 次）…",
       failed_title: "恢复对话失败",
       failed_desc: "当前会话暂时没有恢复成功，可以立即重新尝试。",
       retry_button: "重新恢复",
@@ -942,7 +1003,7 @@ const CONTENT_ZH = {
     login: {
       title: "登录 Hone",
       subtitle: "使用手机号和短信验证码登录。",
-      hint_sms: "目前是邀请制，请联系 bm@hone-claw.com 加入白名单。",
+      hint_sms: "目前是邀请制，请联系 bm@hone-claw.com 加入邀请名单。",
       phone_label: "手机号",
       phone_placeholder: "例如 13800138000",
       phone_aria: "手机号",
@@ -1015,7 +1076,7 @@ const CONTENT_ZH = {
             {
               kind: "p",
               parts: [
-                "您需要使用经我们登记的手机号作为账号，并通过短信验证码完成身份验证。本服务目前为邀请制，未进入白名单的手机号无法登录。",
+                "您需要使用经我们登记的手机号作为账号，并通过短信验证码完成身份验证。本服务目前为邀请制，未进入邀请名单的手机号无法登录。",
               ],
             },
             {
@@ -1036,31 +1097,38 @@ const CONTENT_ZH = {
             {
               kind: "ul",
               items: [
-                ["违反您所在地或任何其他相关司法管辖区适用的法律或法规；"],
+                [
+                  "违反美国联邦、州或地方适用法律法规，包括但不限于出口管制、OFAC 制裁、反洗钱、证券、隐私、网络安全及其他相关规定；",
+                ],
+                [
+                  "违反中国大陆法律法规、监管要求、公序良俗或社会公共利益，或生成、传播、诱导生成中国法律法规及主流平台治理规则明确禁止或不倡导的内容；",
+                ],
                 [
                   "侵犯他人合法权益，包括知识产权、隐私权、名誉权、商业秘密、肖像权或其他财产或人身权利；",
                 ],
                 ["发布或传播威胁、骚扰、仇恨、歧视性、欺诈性或诽谤性内容；"],
                 [
-                  "发布、传播或索取淫秽色情、儿童性剥削材料、毒品交易、暴力或其他非法内容；",
+                  "发布、传播或索取淫秽色情、儿童性剥削材料、赌博、毒品交易、诈骗、暴力恐怖主义、极端主义或其他非法、有害内容；",
                 ],
-                ["通过提示词或其他方式诱导本服务输出违反前述规定的内容；"],
+                [
+                  "发布、传播或诱导生成危害国家安全、煽动颠覆国家政权、分裂国家、破坏国家统一、煽动民族仇恨、反华、政治敏感违法违规、损害公共秩序或违背公序良俗的内容；",
+                ],
+                [
+                  "通过提示词注入、越狱、角色扮演、伪造系统指令、上下文污染或其他方式诱导本服务输出、协助、掩饰或放大违反前述规定的内容；",
+                ],
                 [
                   "对本服务进行反向工程、爬取、批量自动化访问、漏洞利用、规避访问控制或其他形式的滥用；",
                 ],
                 [
                   "上传、传播或部署恶意代码、垃圾信息、钓鱼链接或其他有害技术；",
                 ],
-                ["冒用他人身份、伪造账号信息或从事任何形式的欺诈行为；"],
-                [
-                  "利用本服务从事违反美国出口管制法律、OFAC 制裁、反洗钱法律或其他经济制裁规定的行为。",
-                ],
+                ["冒用他人身份、伪造账号信息或从事任何形式的欺诈行为。"],
               ],
             },
             {
               kind: "p",
               parts: [
-                "若您违反前述规定，我们有权立即暂停或终止您的账号、保留相关证据，并依法配合执法或司法机关的合法请求。由此产生的全部法律责任由您本人承担。",
+                "若您违反前述规定，我们有权立即暂停或终止您的账号、取消使用资格、保留相关证据，并依法配合执法、监管或司法机关的合法请求。由此产生的全部法律责任由您本人承担。",
               ],
             },
           ],
@@ -1240,7 +1308,7 @@ const CONTENT_ZH = {
               items: [
                 [
                   { strong: "账号信息：" },
-                  "手机号（作为账号识别与白名单判断）、短信验证码核验结果、历史邀请码用户记录（作为白名单来源）；",
+                  "手机号（作为账号识别与邀请资格判断）、短信验证码核验结果、历史邀请记录（作为邀请名单来源）；",
                 ],
                 [
                   { strong: "使用数据：" },
@@ -1456,6 +1524,7 @@ const CONTENT_ZH = {
         items: [
           { label: "首页", href: "/" },
           { label: "路线图", href: "/roadmap" },
+          { label: "Blog", href: "/blog" },
           { label: "对话", href: "/chat" },
           { label: "个人", href: "/me" },
         ],
@@ -1506,6 +1575,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
     logo_tagline: "OPEN FINANCIAL CONSOLE",
     home: "Home",
     roadmap: "Roadmap & Docs",
+    blog: "Blog",
     me: "Account",
     chat: "Chat",
     back_home: "Home",
@@ -1548,6 +1618,11 @@ const CONTENT_EN: typeof CONTENT_ZH = {
     video_demo: "VIDEO DEMO",
     view_full_roadmap: "View Full Roadmap",
     zoom_hint: "Zoom In",
+    blog_eyebrow: "Engineering Blog",
+    blog_title: "Why Hone chose Rust",
+    blog_desc:
+      "A field report on moving from Python + Node.js to Rust, and what it means for context, stability, and multi-endpoint engineering in the AI Coding era.",
+    blog_cta: "Read article",
   },
 
   trust: {
@@ -1771,7 +1846,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
       "Transparent, pragmatic, long-term. Here's what Hone does today, what's next, and how to bring it into your research workflow.",
     hero_meta: "ROADMAP · DOCS · API",
     sidebar_title: "ON THIS PAGE",
-    version: "v0.12.2",
+    version: "v0.12.4",
 
     toc: [
       { id: "quick-start", label: "Quick Start", sub: "Quick Start" },
@@ -1808,7 +1883,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
         eyebrow: "§ 04 · ARCHITECTURE",
         title: "Architecture",
         intro:
-          "Rust core · multi-engine abstraction · SolidJS frontend. The public user app, admin console, and channel processes share backend capabilities while staying separated by interface, port, and process boundary.",
+          "Rust core · multi-engine abstraction · SolidJS frontend. The public user app, admin console, and channel processes share backend capabilities while staying separated by interface, port, and process boundary; Cloud PG / OSS is taking over runtime storage in stages.",
         footnote_prefix: "Full module walkthrough in",
         footnote_link: "docs/repo-map.md ↗",
       },
@@ -1889,19 +1964,23 @@ const CONTENT_EN: typeof CONTENT_ZH = {
       },
       {
         title: "Public user app",
-        desc: "The public user app routes `/`, `/roadmap`, `/chat`, `/me`, `/portfolio`, `/terms`, and `/privacy`, with a dev-only `/__share-preview` page for share-card QA; `/chat` signs users in with Aliyun behavior captcha plus phone/SMS verification from the admin whitelist, uses a collapsible desktop left rail plus full-height conversation workspace, and supports assistant-reply copy, image sharing, contact links, and GitHub stars fallback; `/portfolio` is a read-only investment context surface for push context and company-profile entrypoints, and the public backend is scoped to `/api/public/*`.",
+        desc: "The public user app routes `/`, `/roadmap`, `/blog`, `/blog/:slug`, `/chat`, `/me`, `/portfolio`, `/terms`, and `/privacy`, with a dev-only `/__share-preview` page for share-card QA; `/blog` is a bilingual static long-form content surface, with Cloudflare Worker metadata for crawler-friendly article cards; `/chat` signs users in with Aliyun behavior captcha plus phone/SMS verification from the admin invite list, uses a collapsible desktop left rail plus full-height conversation workspace, and gathers navigation, account access, recent conversation history, contact links, and GitHub stars in that rail while supporting assistant-reply copy, image sharing, non-image generated-file downloads, and history review; `/portfolio` is a read-only investment context surface for push context and company-profile entry points, and the public backend is scoped to `/api/public/*`, including `/api/public/file` for downloadable generated artifacts and `/api/public/v1/chat/completions` for API-key-authenticated OpenAI-compatible chat.",
+      },
+      {
+        title: "Storage and cloud runtime",
+        desc: "`cloud.postgres` / `cloud.oss` are first-class config sections as of v0.12.4 and reference real credentials through env vars; once OSS is configured, public Web uploads write under `public-uploads/...` and return `oss://bucket/key`, while `/api/public/image` and `/api/public/file` can proxy managed objects; `/api/meta` reports capabilities such as `cloud_runtime`, `cloud_postgres`, `cloud_oss`, and `oss_file_proxy`. The migration is still in progress: sessions, quota, audit, portfolio, cron, notification prefs, generated artifacts, and logs keep local fallbacks, and `cloud.strict_no_local_storage=true` should only be enabled after those dependencies are gone.",
       },
       {
         title: "Admin console",
-        desc: "The admin console includes dashboard, sessions, skills, tasks, users, research, llm-audit, task-health, notifications, schedule, settings, and logs for operators.",
+        desc: "The admin console includes dashboard, sessions, skills, tasks, users, research, llm-audit, task-health, notifications, schedule, settings, and logs for operators; the users page groups holdings, company profiles, sessions, and research tasks by actor, and company profiles support actor-space listing, detail review, deletion, zip export, import preview, and conflict-aware import.",
       },
       {
         title: "Agent engine layer",
-        desc: "Recommended agent engines are Hone Cloud, Codex ACP, and OpenCode ACP; OpenAI-compatible function calling, Gemini CLI, Codex CLI, and multi-agent remain supported. `gemini_acp` is kept only as migration config, not a runtime entrypoint.",
+        desc: "Recommended agent engines are Hone Cloud, Codex ACP, and OpenCode ACP; OpenAI-compatible function calling, Gemini CLI, Codex CLI, and multi-agent remain supported. LLM credentials use `config.yaml` as the only source of truth, and both OpenRouter and generic OpenAI-compatible providers support `llm.providers.*.api_key/api_keys` key pools so the runtime can try the next key after upstream 429 / quota failures; `gemini_acp` is kept only as migration config, not a runtime entry point.",
       },
       {
         title: "Events and tasks",
-        desc: "Cron jobs, event-engine digests, `/missed` recovery, notification preferences, and channel delivery share the Rust backend, SQLite/JSON storage, and user ownership model; Feishu and other channel scheduler heartbeats now include revision-aware duplicate suppression and running-row finalization coverage.",
+        desc: "Cron jobs, event-engine digests, `/missed` recovery, notification preferences, and channel delivery share the Rust backend, SQLite/JSON storage, and user ownership model; Feishu and other channel scheduler heartbeats now include revision-aware duplicate suppression and running-row finalization coverage, and event-engine default LLM config now uses the currently available `x-ai/grok-4.3` instead of the retired Grok 4.1 Fast.",
       },
     ],
 
@@ -1917,7 +1996,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
           {
             name: "Company profiles & long memory",
             status: "stable",
-            note: "company profile skill",
+            note: "company profile skill + admin import/export",
           },
           {
             name: "Stock research / deep research",
@@ -1927,7 +2006,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
           {
             name: "Portfolio tracking & alerts",
             status: "stable",
-            note: "portfolio_management + cron",
+            note: "portfolio_management + cron + successful portfolio-view confirmation recovery",
           },
           {
             name: "Valuation / selection / position advice",
@@ -1940,9 +2019,9 @@ const CONTENT_EN: typeof CONTENT_ZH = {
             note: "chart_visualization / image_generation",
           },
           {
-            name: "Public chat image sharing",
+            name: "Public chat workbench and sharing",
             status: "stable",
-            note: "html2canvas + qrcode + markdown rendering + CJK code font",
+            note: "sidebar history + html2canvas + qrcode + markdown rendering + CJK code font + attachment download cards",
           },
           {
             name: "Vector-augmented memory",
@@ -1964,11 +2043,31 @@ const CONTENT_EN: typeof CONTENT_ZH = {
             status: "stable",
             note: "Vite · Tailwind v4 · stale asset recovery",
           },
+          {
+            name: "Public blog and docs surface",
+            status: "stable",
+            note: "bilingual Markdown posts + article routes + Cloudflare share metadata",
+          },
           { name: "Tauri desktop", status: "stable", note: "macOS released" },
           {
             name: "Multi-engine abstraction",
             status: "stable",
             note: "OpenAI-compatible · Gemini CLI · Codex CLI/ACP · OpenCode ACP · multi-agent",
+          },
+          {
+            name: "LLM provider key pools and upstream error fidelity",
+            status: "stable",
+            note: "config.yaml llm.providers.*.api_key/api_keys · OpenRouter / OpenAI-compatible fallback",
+          },
+          {
+            name: "Cloud PG / OSS runtime migration",
+            status: "beta",
+            note: "cloud.postgres / cloud.oss env refs · OSS public-upload proxy · local fallbacks remain",
+          },
+          {
+            name: "Channel finalization and side-effect confirmations",
+            status: "stable",
+            note: "response_finalizer can recover user-visible confirmations from successful cron / portfolio tool results",
           },
           {
             name: "Windows / Linux desktop",
@@ -1983,7 +2082,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
           {
             name: "Cron scheduled tasks",
             status: "stable",
-            note: "scheduled_task skill + /api/cron-jobs",
+            note: "scheduled_task skill + /api/cron-jobs + broad-market review guard regression",
           },
           {
             name: "Custom skills",
@@ -1996,14 +2095,19 @@ const CONTENT_EN: typeof CONTENT_ZH = {
             note: "hone-mcp binary can act as an MCP server",
           },
           {
-            name: "HTTP + SSE internal API",
+            name: "Admin HTTP + SSE API",
             status: "stable",
-            note: "hone-web-api fully exposed",
+            note: "hone-web-api admin surface",
           },
           {
             name: "Public SMS login with captcha gate",
             status: "stable",
-            note: "Aliyun Captcha + Aliyun SMS + admin Web whitelist",
+            note: "Aliyun Captcha + Aliyun SMS + admin Web invite list",
+          },
+          {
+            name: "Public OpenAI-compatible Chat API",
+            status: "beta",
+            note: "user API keys + /api/public/v1/chat/completions",
           },
           {
             name: "Per-user notification prefs",
@@ -2029,7 +2133,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
         name: "Web",
         icon: "⚡",
         status: "stable",
-        desc: "Whitelist chat with phone + SMS-code login",
+        desc: "Invite-only chat with phone + SMS code login",
       },
       {
         name: "iMessage",
@@ -2136,18 +2240,28 @@ const CONTENT_EN: typeof CONTENT_ZH = {
     now: {
       label: "Shipping today",
       items: [
-        "Web chat (Aliyun behavior captcha + phone/SMS verification, admitted by the admin whitelist) + public landing site",
-        "Public `/chat` desktop workbench layout: collapsible left rail, account entry, contact links, GitHub stars, and a full-height conversation area",
+        "Web chat (Aliyun behavior captcha + phone/SMS verification, admitted by the admin invite list) + public landing site",
+        "Public `/chat` desktop workbench layout: collapsible left rail, account entry, recent conversation history, contact links, GitHub stars, and a full-height conversation area",
         "Public `/chat` assistant-reply copy and sharing: select messages, export a branded long image, copy image/text, or invoke native share; share cards support CJK code-block fonts and have a dev preview route",
+        "Public `/chat` non-image generated-file cards: new runner-created CSV / XLSX / PDF-style files mentioned in the final answer are attached as downloads through `/api/public/file`",
         "Public `/chat` markdown rendering, mobile composer, keyboard focus, scroll anchoring, and jump-to-latest behavior have been stabilized",
+        "Public `/blog` and `/blog/:slug` bilingual long-form pages, with the first Rust migration retrospective checked into the repo and Cloudflare Worker metadata for share cards",
         "Tauri macOS desktop with bundled backend",
         "7 channels: Web / iMessage / Lark / Discord / Telegram / CLI / MCP",
-        "16 public skills (stocks, portfolio, valuation/screening entrypoints, charts, PDF, cron, missed-event recovery, notification prefs…)",
+        "16 public skills (stocks, portfolio, valuation/screening entry points, charts, PDF, cron, missed-event recovery, notification prefs…)",
         "Research discipline & zero-hallucination protocol",
         "Company profiles + cross-session long memory",
+        "Admin user views group holdings, profiles, sessions, and research tasks; company profiles can be inspected by actor space, deleted, exported as zip bundles, preview-imported, and imported with conflict decisions",
         "Cron-driven scheduled tasks",
+        "Scheduled-delivery safety guard: crude oil / commodity causality protection still covers commodity briefings, while broad A/H or U.S. market reviews are not fully replaced just because they contain a secondary oil-price clause",
         "Event-engine push-quality pass: digest dedupe / min-gap / topic memory / category budgets / directional price thresholds / Feishu scheduler heartbeat revision dedupe",
+        "Event-engine default models and sample config now use `x-ai/grok-4.3`, avoiding failures from the retired Grok 4.1 Fast in news classification, global digest, and mainline distillation paths",
+        "LLM provider config is consolidated into `config.yaml`; OpenRouter and generic OpenAI-compatible providers support `api_key/api_keys` rotation and preserve upstream error details for diagnosis",
+        "First Cloud PG / OSS runtime slice: `cloud.postgres` / `cloud.oss` can be configured through env references, public uploads can write to OSS, public image / file proxies can read `oss://bucket/key` managed objects, and `/api/meta` exposes cloud capability state",
+        "Cloud migration boundaries are explicit: sessions, quota, audit, portfolio, cron, notification prefs, generated artifacts, and logs still keep local fallbacks; `cloud.strict_no_local_storage=true` blocks startup while local dependencies remain",
+        "The channel response finalizer can recover user-visible confirmations from successful scheduled-task or portfolio tool results when a runner only emits a transitional planning sentence, so real side effects are not hidden behind an empty-reply fallback",
         "Frontend deploy asset recovery: the service worker and global error handlers detect stale chunks and safely reload onto the new version",
+        "Public API-key chat entry point: admins can issue API keys for Web users, and clients can call Hone through the OpenAI-compatible `/api/public/v1/chat/completions` shape",
         "ACP self-managed context with compact-leak suppression for long codex_acp / opencode_acp sessions",
         "Multi-engine setup: OpenAI-compatible / Gemini CLI / Codex CLI/ACP / OpenCode ACP / multi-agent",
         "`scripts/diagnose_llm.sh` reads OpenRouter keys from the current LLM provider config paths while keeping legacy path compatibility",
@@ -2158,7 +2272,8 @@ const CONTENT_EN: typeof CONTENT_ZH = {
       items: [
         "Windows / Linux desktop builds",
         "User-facing skill editor (frontend for skill_manager)",
-        "Data import / export tools",
+        "Broader data import / export tools (company-profile bundle transfer is live; portfolio and research-result migration surfaces still need coverage)",
+        "Continue adding PG-backed repositories so sessions, quota, audit, portfolio, cron, notification prefs, generated artifacts, and logs can gradually lose their local fallbacks",
         "Public skill documentation and example pack",
         "Vector-augmented long memory",
       ],
@@ -2168,7 +2283,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
       items: [
         "Multi-user collaborative research space",
         "Visual portfolio analytics dashboard",
-        "Open API for developers",
+        "Broader developer APIs, SDKs, and examples",
         "Community skill marketplace",
         "Multi-agent orchestration",
       ],
@@ -2205,6 +2320,16 @@ const CONTENT_EN: typeof CONTENT_ZH = {
         title: "Wiki",
         url: "https://github.com/B-M-Capital-Research/honeclaw/blob/main/docs/wiki.md",
         desc: "Install, startup, ports, configuration, verification, and troubleshooting",
+      },
+      {
+        title: "Release Notes v0.12.4",
+        url: "https://github.com/B-M-Capital-Research/honeclaw/blob/main/docs/releases/v0.12.4.md",
+        desc: "Latest release user impact, upgrade path, and known notes",
+      },
+      {
+        title: "Hone Blog",
+        url: "https://hone-claw.com/blog",
+        desc: "Public bilingual long-form posts on architecture choices, migrations, and product notes",
       },
       {
         title: "Repo Map",
@@ -2276,7 +2401,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
       },
       {
         q: "Which LLMs are supported?",
-        a: "Through the agent-engine abstraction: OpenAI-compatible protocols (including OpenRouter), Gemini CLI, Codex CLI / ACP, OpenCode ACP, and the multi-agent search-plus-answer flow. Switch at any time from the desktop settings.",
+        a: "Hone supports Hone Cloud, OpenAI-compatible protocols (including OpenRouter), Gemini CLI, Codex CLI / ACP, OpenCode ACP, and the multi-agent search-plus-answer flow through the agent-engine abstraction. Credentials live in `config.yaml` under `llm.providers.*.api_key/api_keys`, and generic OpenAI-compatible providers plus OpenRouter can try the next key in the pool.",
       },
       {
         q: "What license? Commercial use?",
@@ -2284,7 +2409,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
       },
       {
         q: "Where is data stored?",
-        a: "Sessions, company profiles, and research results default to local storage (macOS desktop's `~/.honeclaw` or your self-hosted server). Hone does not host user data.",
+        a: "Data still defaults to local storage or your self-hosted server (macOS desktop's `~/.honeclaw`). v0.12.4 adds the first Cloud PG / OSS runtime slice: OSS can host public uploads and public image / file proxy objects, but sessions, quota, audit, portfolio, cron, notification prefs, generated artifacts, and logs still keep local fallbacks. Hone does not host your data by default.",
       },
       {
         q: "How does Hone relate to Codex / RooCode and other coding agents?",
@@ -2299,7 +2424,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
     logged_out_title: "Sign in first",
     logged_out_desc: "Sign in to see your history and account info.",
     logged_out_cta: "Go to chat to sign in",
-    invite_note: "Your phone number must be whitelisted before you can enter chat",
+    invite_note: "Your phone number must be on the invite list before you can enter chat",
     loading: "Loading…",
     account_info_title: "Account info",
     usage_today_label: "Account status",
@@ -2340,6 +2465,10 @@ const CONTENT_EN: typeof CONTENT_ZH = {
       expand: "Expand sidebar",
       signed_in: "Signed in",
       account_center: "Account center",
+      history_title: "Conversation history",
+      history_empty: "Recent questions will appear here after you start chatting.",
+      history_attachment: "Question with attachments",
+      history_empty_item: "Empty message",
     },
     prefs: {
       aria_label: "Font size and theme",
@@ -2350,10 +2479,10 @@ const CONTENT_EN: typeof CONTENT_ZH = {
       theme_dark: "Dark",
     },
     status: {
-      error: "HONE hit an error",
-      streaming: "HONE is responding",
-      running: "HONE is working",
-      thinking: "HONE is thinking",
+      error: "Hone hit an error",
+      streaming: "Hone is responding",
+      running: "Hone is working",
+      thinking: "Hone is thinking",
       done: "Done",
       fallback_error: "Request failed. Please try again.",
       stop: "Stop",
@@ -2388,6 +2517,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
       ],
       proactive_examples_title: "Try saying",
       proactive_examples: [
+        "Introduce the indium phosphide industry chain and recommend related optical module companies.",
         "I hold AAPL and NVDA. Turn on key event alerts.",
         "Only push earnings and major news for my holdings.",
         "Run a portfolio review after market close every Friday.",
@@ -2402,7 +2532,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
     restoring: {
       title: "Restoring chat",
       desc: "Checking the current session and restoring chat history",
-      retrying: "The backend is taking longer than expected. Retrying automatically (attempt {attempt})...",
+      retrying: "The backend is taking longer than expected. Retrying automatically (attempt {attempt})…",
       failed_title: "Could not restore chat",
       failed_desc: "The current session could not be restored. You can try again now.",
       retry_button: "Retry restore",
@@ -2443,7 +2573,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
         error_copy_image: "Copy failed — try Save image instead",
         error_copy_text: "Text copy failed. Select the text manually.",
         error_render: "Image rendering failed. Try fewer messages.",
-        error_share: "Share cancelled",
+        error_share: "Share canceled",
         error_system_share: "System share failed. Try Save image or Copy instead.",
         role_user: "You",
         role_assistant: "Hone",
@@ -2458,7 +2588,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
       title: "Sign in to Hone",
       subtitle: "Sign in with your phone number and SMS code.",
       hint_sms:
-        "Hone is currently invite-only. Contact bm@hone-claw.com to join the whitelist.",
+        "Hone is currently invite-only. Contact bm@hone-claw.com to join the invite list.",
       phone_label: "Phone",
       phone_placeholder: "e.g. +1 555 0134",
       phone_aria: "Phone",
@@ -2535,7 +2665,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
             {
               kind: "p",
               parts: [
-                "You sign in with a phone number we have registered and verify your identity with an SMS code. Hone is currently invite-only, and phone numbers outside the whitelist cannot sign in.",
+                "You sign in with a phone number we have registered and verify your identity with an SMS code. Hone is currently invite-only, and phone numbers outside the invite list cannot sign in.",
               ],
             },
             {
@@ -2559,7 +2689,10 @@ const CONTENT_EN: typeof CONTENT_ZH = {
               kind: "ul",
               items: [
                 [
-                  "violate any law or regulation applicable in your location or any other relevant jurisdiction;",
+                  "violate any U.S. federal, state, or local law or regulation, including export-control, OFAC sanctions, anti-money-laundering, securities, privacy, cybersecurity, and other applicable rules;",
+                ],
+                [
+                  "violate mainland China laws, regulatory requirements, public-order and good-morals standards, or public interests, or generate, transmit, or induce content that mainland China laws or mainstream platform governance rules expressly prohibit or discourage;",
                 ],
                 [
                   "infringe on others' rights, including intellectual property, privacy, publicity, reputation, trade secrets, or other proprietary or personal rights;",
@@ -2568,10 +2701,13 @@ const CONTENT_EN: typeof CONTENT_ZH = {
                   "post or transmit content that is threatening, harassing, hateful, discriminatory, fraudulent, or defamatory;",
                 ],
                 [
-                  "produce, reproduce, distribute, or solicit pornographic content, child sexual abuse material, drug trafficking, violence, or other unlawful content;",
+                  "produce, reproduce, distribute, or solicit pornographic content, child sexual abuse material, gambling, drug trafficking, scams, violent terrorism, extremism, or other unlawful or harmful content;",
                 ],
                 [
-                  "use prompts or any other means to induce the service to produce content that violates the above;",
+                  "post, transmit, or induce content that harms national security, incites subversion of state power, separatism, destruction of national unity, ethnic hatred, anti-China content, unlawful politically sensitive content, disruption of public order, or violations of public morals;",
+                ],
+                [
+                  "use prompt injection, jailbreaks, role-play, forged system instructions, context pollution, or any other means to induce the service to produce, assist, conceal, or amplify content that violates the above;",
                 ],
                 [
                   "reverse-engineer, scrape, bulk-automate, exploit vulnerabilities, circumvent access controls, or otherwise abuse the service;",
@@ -2580,17 +2716,14 @@ const CONTENT_EN: typeof CONTENT_ZH = {
                   "upload, distribute, or deploy malware, spam, phishing links, or other harmful technologies;",
                 ],
                 [
-                  "impersonate others, falsify account information, or engage in any form of fraud;",
-                ],
-                [
-                  "use the service to violate U.S. export-control laws, OFAC sanctions, anti-money-laundering laws, or other economic-sanctions regulations.",
+                  "impersonate others, falsify account information, or engage in any form of fraud.",
                 ],
               ],
             },
             {
               kind: "p",
               parts: [
-                "If you violate the above, we may immediately suspend or terminate your account, preserve relevant evidence, and cooperate with lawful requests from law-enforcement or judicial authorities. You bear sole legal responsibility for any consequences.",
+                "If you violate the above, we may immediately suspend or terminate your account, revoke your eligibility to use the service, preserve relevant evidence, and cooperate with lawful requests from law-enforcement, regulatory, or judicial authorities. You bear sole legal responsibility for any consequences.",
               ],
             },
           ],
@@ -2777,7 +2910,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
               items: [
                 [
                   { strong: "Account info:" },
-                  " phone number (as account identifier and whitelist key), SMS verification result, and historical invite-user records used as the whitelist source;",
+                  " phone number (as account identifier and invite-list key), SMS verification result, and historical invite records used as the invite-list source;",
                 ],
                 [
                   { strong: "Usage data:" },
@@ -3025,6 +3158,7 @@ const CONTENT_EN: typeof CONTENT_ZH = {
         items: [
           { label: "Home", href: "/" },
           { label: "Roadmap", href: "/roadmap" },
+          { label: "Blog", href: "/blog" },
           { label: "Chat", href: "/chat" },
           { label: "Account", href: "/me" },
         ],

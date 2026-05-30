@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test"
 
 import {
   appendApiKey,
+  appendApiKeyDraftState,
   appendApiKeyVisibility,
   canSelectRunner,
   canShowSettingsTab,
@@ -21,17 +22,24 @@ import {
   normalizeApiKeys,
   optionalNumber,
   parseCsv,
+  prependWebInvite,
   removeApiKey,
   removeApiKeyVisibility,
+  replaceWebInvite,
   resolveSettingsTab,
   SETTINGS_TAB_KEYS,
   toChannelDraft,
   toggleApiKeyVisibility,
+  toggleApiKeyDraftState,
+  toApiKeyDraftState,
   updateApiKeyList,
+  updateApiKeyDraftState,
   updateLlmProfileBinding,
   updateLlmProfileEntry,
+  removeApiKeyDraftState,
 } from "./settings-model"
 import type { MetaInfo } from "@/lib/types"
+import type { WebInviteInfo } from "@/lib/types"
 
 function metaWithLanguage(language?: "zh" | "en"): MetaInfo {
   return {
@@ -65,6 +73,25 @@ function profileById(
     profiles.find((profile) => profile.id === id),
     `${id} profile`,
   )
+}
+
+function webInvite(
+  userId: string,
+  patch: Partial<WebInviteInfo> = {},
+): WebInviteInfo {
+  return {
+    user_id: userId,
+    invite_code: `${userId}-code`,
+    phone_number: "+15551234567",
+    created_at: "2026-05-23T00:00:00Z",
+    enabled: true,
+    active_session_count: 0,
+    daily_limit: 30,
+    success_count: 0,
+    in_flight: 0,
+    remaining_today: 30,
+    ...patch,
+  }
 }
 
 describe("settings-model", () => {
@@ -138,7 +165,27 @@ describe("settings-model", () => {
     )
     expect(
       profileById(mergedProfiles.profiles, "digest_strong").model,
-    ).toBe("x-ai/grok-4.1-fast")
+    ).toBe("x-ai/grok-4.3")
+  })
+
+  it("keeps default LLM profile bindings resolvable", () => {
+    const defaults = defaultLlmProfiles()
+    const bindings = [
+      defaults.defaultProfile,
+      defaults.auxiliaryProfile,
+      defaults.polishProfile,
+      defaults.newsClassifierProfile,
+      defaults.filingSummaryProfile,
+      defaults.earningsQualityProfile,
+      defaults.digestPass1Profile,
+      defaults.digestPass2Profile,
+      defaults.digestEventDedupeProfile,
+      defaults.mainlineDistillProfile,
+    ]
+
+    for (const binding of bindings) {
+      profileById(defaults.profiles, binding)
+    }
   })
 
   it("normalizes empty key lists and derives matching visibility state", () => {
@@ -207,6 +254,54 @@ describe("settings-model", () => {
     expect(removeApiKeyVisibility([false], 0)).toEqual([false])
   })
 
+  it("keeps api key draft settings and visibility together", () => {
+    const initialApiKeyDraftState = toApiKeyDraftState({
+      apiKeys: ["alpha", "beta"],
+      provider: "fmp",
+    })
+    expect(initialApiKeyDraftState).toEqual({
+      settings: { apiKeys: ["alpha", "beta"], provider: "fmp" },
+      visibility: [false, false],
+    })
+
+    const updatedApiKeyDraftState = updateApiKeyDraftState(
+      initialApiKeyDraftState,
+      1,
+      "next",
+    )
+    expect(updatedApiKeyDraftState.settings.apiKeys).toEqual(["alpha", "next"])
+    expect(updatedApiKeyDraftState.visibility).toBe(
+      initialApiKeyDraftState.visibility,
+    )
+    expect(initialApiKeyDraftState.settings.apiKeys).toEqual(["alpha", "beta"])
+
+    const toggledApiKeyDraftState = toggleApiKeyDraftState(
+      updatedApiKeyDraftState,
+      0,
+    )
+    expect(toggledApiKeyDraftState.settings).toBe(
+      updatedApiKeyDraftState.settings,
+    )
+    expect(toggledApiKeyDraftState.visibility).toEqual([true, false])
+
+    const appendedApiKeyDraftState = appendApiKeyDraftState(
+      toggledApiKeyDraftState,
+    )
+    expect(appendedApiKeyDraftState.settings.apiKeys).toEqual([
+      "alpha",
+      "next",
+      "",
+    ])
+    expect(appendedApiKeyDraftState.visibility).toEqual([true, false, false])
+
+    const draftAfterRemovingFirstKey = removeApiKeyDraftState(
+      appendedApiKeyDraftState,
+      0,
+    )
+    expect(draftAfterRemovingFirstKey.settings.apiKeys).toEqual(["next", ""])
+    expect(draftAfterRemovingFirstKey.visibility).toEqual([false, false])
+  })
+
   it("converts persisted channel settings into editable draft", () => {
     expect(
       toChannelDraft({
@@ -268,6 +363,21 @@ describe("settings-model", () => {
     expect(inviteActionKey("user-1", "api-key-reset")).toBe("user-1:api-key-reset")
     expect(isInviteActionRunning("user-1:disable", "user-1", "disable")).toBe(true)
     expect(isInviteActionRunning("user-1:disable", "user-1", "enable")).toBe(false)
+  })
+
+  it("updates web invite lists outside the settings page component", () => {
+    const first = webInvite("user-1")
+    const second = webInvite("user-2")
+    const disabledFirst = webInvite("user-1", { enabled: false })
+
+    expect(prependWebInvite(undefined, first)).toEqual([first])
+    expect(prependWebInvite([second], first)).toEqual([first, second])
+    expect(replaceWebInvite([first, second], disabledFirst)).toEqual([
+      disabledFirst,
+      second,
+    ])
+    expect(replaceWebInvite([first], second)).toEqual([first])
+    expect(replaceWebInvite(undefined, first)).toEqual([])
   })
 
   it("keeps channel scope options centralized", () => {

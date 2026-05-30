@@ -1,8 +1,8 @@
 //! `hone-cli configure` —— 按 section 驱动的交互式配置编辑器。
 //!
 //! 与 `hone-cli onboard` 的差别：
-//! - `onboard` 是首次入门的**线性流程**,所有默认 section 顺序跑一遍,
-//!   每个字段都要用户作出「现在填 / 跳过 / 禁用」三选一的决定
+//! - `onboard` 是首次入门的**线性流程**,覆盖语言、runner、渠道、管理员、
+//!   provider、通知默认说明和最终 apply,并把收集到的 mutation 留到最后写盘
 //! - `configure` 是**按需修改**：调用方可以用 `--section agent/channels/providers`
 //!   精确选择要改哪块,里面的 prompt 会把现有值作为默认提示,空值 = 保留
 //!
@@ -38,6 +38,13 @@ fn sequence_mutation(path: &str, csv: &str) -> ConfigMutation {
                 .map(Value::String)
                 .collect(),
         ),
+    }
+}
+
+fn provider_keys_prompt(lang: crate::i18n::Lang, label: &str) -> String {
+    match lang {
+        crate::i18n::Lang::Zh => format!("{label} API key（逗号分隔，可填多个）"),
+        crate::i18n::Lang::En => format!("{label} API keys (comma-separated)"),
     }
 }
 
@@ -281,9 +288,7 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                 let feishu_scope = prompt_text(
                     &theme,
                     "Feishu chat scope (DM_ONLY/GROUPCHAT_ONLY/ALL)",
-                    &CliChatScope::from_chat_scope(config.feishu.chat_scope)
-                        .label()
-                        .to_string(),
+                    CliChatScope::from_chat_scope(config.feishu.chat_scope).label(),
                 )?;
                 mutations.push(ConfigMutation::Set {
                     path: "feishu.chat_scope".to_string(),
@@ -337,9 +342,7 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                 let telegram_scope = prompt_text(
                     &theme,
                     "Telegram chat scope (DM_ONLY/GROUPCHAT_ONLY/ALL)",
-                    &CliChatScope::from_chat_scope(config.telegram.chat_scope)
-                        .label()
-                        .to_string(),
+                    CliChatScope::from_chat_scope(config.telegram.chat_scope).label(),
                 )?;
                 mutations.push(ConfigMutation::Set {
                     path: "telegram.chat_scope".to_string(),
@@ -375,9 +378,7 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                 let discord_scope = prompt_text(
                     &theme,
                     "Discord chat scope (DM_ONLY/GROUPCHAT_ONLY/ALL)",
-                    &CliChatScope::from_chat_scope(config.discord.chat_scope)
-                        .label()
-                        .to_string(),
+                    CliChatScope::from_chat_scope(config.discord.chat_scope).label(),
                 )?;
                 mutations.push(ConfigMutation::Set {
                     path: "discord.chat_scope".to_string(),
@@ -393,9 +394,12 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
             ConfigureSection::Providers => {
                 // Provider keys 走 `*.api_keys` 数组格式;一次性粘贴逗号分隔的多个 key,
                 // 顺手把老的 `*.api_key` 单 key 字段清空,防止残留值被运行时当真 key。
-                if let Some(keys) =
-                    prompt_secret(&theme, lang, "OpenRouter API keys（逗号分隔）", true)?
-                {
+                if let Some(keys) = prompt_secret(
+                    &theme,
+                    lang,
+                    &provider_keys_prompt(lang, "OpenRouter"),
+                    true,
+                )? {
                     mutations.push(provider_key_mutation(
                         "llm.providers.openrouter.api_keys",
                         parse_csv_values(&keys),
@@ -410,7 +414,8 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                         value: Value::String(String::new()),
                     });
                 }
-                if let Some(keys) = prompt_secret(&theme, lang, "FMP API keys（逗号分隔）", true)?
+                if let Some(keys) =
+                    prompt_secret(&theme, lang, &provider_keys_prompt(lang, "FMP"), true)?
                 {
                     mutations.push(provider_key_mutation(
                         "fmp.api_keys",
@@ -422,7 +427,7 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
                     });
                 }
                 if let Some(keys) =
-                    prompt_secret(&theme, lang, "Tavily API keys（逗号分隔）", true)?
+                    prompt_secret(&theme, lang, &provider_keys_prompt(lang, "Tavily"), true)?
                 {
                     mutations.push(provider_key_mutation(
                         "search.api_keys",
@@ -441,4 +446,22 @@ pub(crate) fn run_configure(config_path: Option<&Path>, args: ConfigureArgs) -> 
         paths.effective_config_path.to_string_lossy()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::Lang;
+
+    #[test]
+    fn provider_keys_prompt_matches_configured_language() {
+        assert_eq!(
+            provider_keys_prompt(Lang::Zh, "OpenRouter"),
+            "OpenRouter API key（逗号分隔，可填多个）"
+        );
+        assert_eq!(
+            provider_keys_prompt(Lang::En, "OpenRouter"),
+            "OpenRouter API keys (comma-separated)"
+        );
+    }
 }

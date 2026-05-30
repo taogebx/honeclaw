@@ -40,7 +40,8 @@ pub fn process_lock_path(runtime_dir: &Path, name: &str) -> PathBuf {
 
 pub fn acquire_process_lock(runtime_dir: &Path, name: &str) -> io::Result<ProcessLockGuard> {
     let lock_dir = runtime_lock_dir(runtime_dir);
-    fs::create_dir_all(&lock_dir)?;
+    fs::create_dir_all(&lock_dir)
+        .map_err(|err| process_lock_io_error("create process lock directory", &lock_dir, err))?;
 
     let path = process_lock_path(runtime_dir, name);
     let mut file = OpenOptions::new()
@@ -48,10 +49,13 @@ pub fn acquire_process_lock(runtime_dir: &Path, name: &str) -> io::Result<Proces
         .read(true)
         .write(true)
         .truncate(false)
-        .open(&path)?;
-    file.try_lock_exclusive()?;
+        .open(&path)
+        .map_err(|err| process_lock_io_error("open process lock", &path, err))?;
+    file.try_lock_exclusive()
+        .map_err(|err| process_lock_io_error("acquire process lock", &path, err))?;
 
-    file.set_len(0)?;
+    file.set_len(0)
+        .map_err(|err| process_lock_io_error("truncate process lock", &path, err))?;
     file.write_all(
         format!(
             "pid={}\nprocess={}\nlocked_at={}\n",
@@ -60,14 +64,20 @@ pub fn acquire_process_lock(runtime_dir: &Path, name: &str) -> io::Result<Proces
             Utc::now().to_rfc3339()
         )
         .as_bytes(),
-    )?;
-    file.sync_data()?;
+    )
+    .map_err(|err| process_lock_io_error("write process lock metadata", &path, err))?;
+    file.sync_data()
+        .map_err(|err| process_lock_io_error("sync process lock", &path, err))?;
 
     Ok(ProcessLockGuard {
         name: name.to_string(),
         path,
         file,
     })
+}
+
+fn process_lock_io_error(action: &str, path: &Path, err: io::Error) -> io::Error {
+    io::Error::new(err.kind(), format!("{action} ({}): {err}", path.display()))
 }
 
 pub fn acquire_runtime_process_lock(
@@ -138,6 +148,19 @@ pub fn format_lock_failure_message(
             path.display()
         )
     }
+}
+
+fn lock_pid_mismatch_warning(process: &str, pid: u32) -> String {
+    format!(
+        "{process} 启动锁记录的 pid={pid} 仍存在，但命令行已不匹配；为避免误杀进程，已跳过自动清理。"
+    )
+}
+
+fn lock_cleanup_attempt_warning(process: &str, pid: u32, path: &Path) -> String {
+    format!(
+        "检测到 {process} 启动锁冲突，正在尝试自动结束旧进程 pid={pid} 并清理锁文件: {}",
+        path.display()
+    )
 }
 
 fn read_lock_pid(path: &Path) -> Option<u32> {
@@ -228,18 +251,14 @@ pub fn try_cleanup_conflicting_process(
         return false;
     };
     if !pid_matches_expected_process(pid, &error.process) {
-        on_warn(&format!(
-            "startup lock conflict for {} has pid={} but command no longer matches expected process",
-            error.process, pid
-        ));
+        on_warn(&lock_pid_mismatch_warning(&error.process, pid));
         return false;
     }
 
-    on_warn(&format!(
-        "attempting automatic cleanup for startup lock conflict process={} pid={} path={}",
-        error.process,
+    on_warn(&lock_cleanup_attempt_warning(
+        &error.process,
         pid,
-        error.path.display()
+        &error.path,
     ));
 
     let stopped = terminate_pid_with_retry(pid);
@@ -318,8 +337,50 @@ mod tests {
             let err = acquire_process_lock(&runtime_dir, PROCESS_LOCK_TELEGRAM)
                 .expect_err("second lock should fail");
             assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+            assert!(err.to_string().contains("acquire process lock"));
+            assert!(
+                err.to_string().contains(
+                    &process_lock_path(&runtime_dir, PROCESS_LOCK_TELEGRAM)
+                        .display()
+                        .to_string()
+                )
+            );
         }
 
         let _ = fs::remove_dir_all(&runtime_dir);
+    }
+
+    #[test]
+    fn acquire_process_lock_reports_lock_directory_path() {
+        let runtime_dir = std::env::temp_dir().join(format!(
+            "hone-process-lock-dir-error-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::write(&runtime_dir, "plain file").expect("file as runtime dir");
+
+        let err = acquire_process_lock(&runtime_dir, PROCESS_LOCK_TELEGRAM)
+            .expect_err("file runtime dir should fail");
+
+        assert!(err.to_string().contains("create process lock directory"));
+        assert!(
+            err.to_string()
+                .contains(&runtime_lock_dir(&runtime_dir).display().to_string())
+        );
+        let _ = fs::remove_file(&runtime_dir);
+    }
+
+    #[test]
+    fn process_lock_cleanup_warnings_are_actionable() {
+        let mismatch = lock_pid_mismatch_warning(PROCESS_LOCK_DISCORD, 123);
+        assert!(mismatch.contains(PROCESS_LOCK_DISCORD));
+        assert!(mismatch.contains("pid=123"));
+        assert!(mismatch.contains("跳过自动清理"));
+
+        let cleanup =
+            lock_cleanup_attempt_warning(PROCESS_LOCK_DISCORD, 123, Path::new("/tmp/hone.lock"));
+        assert!(cleanup.contains("启动锁冲突"));
+        assert!(cleanup.contains("pid=123"));
+        assert!(cleanup.contains("/tmp/hone.lock"));
     }
 }

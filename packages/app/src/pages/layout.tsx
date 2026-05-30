@@ -16,6 +16,7 @@ import { useBackend } from "@/context/backend"
 import { TaskList } from "@/components/task-list"
 import { ResearchList } from "@/components/research-list"
 import { actorKey } from "@/lib/actors"
+import { SHARED } from "@/lib/admin-content/shared"
 import { resolveUsersTab } from "@/pages/users-model"
 
 export default function ConsoleLayout(props: ParentProps) {
@@ -31,28 +32,28 @@ export default function ConsoleLayout(props: ParentProps) {
   const research = useResearch()
 
   createEffect(() => {
-    const p = location.pathname
-    if (p.startsWith("/dashboard") || p.startsWith("/start")) {
+    const currentPath = location.pathname
+    if (currentPath.startsWith("/dashboard") || currentPath.startsWith("/start")) {
       consoleState.setModule("dashboard")
-    } else if (p.startsWith("/skills")) {
+    } else if (currentPath.startsWith("/skills")) {
       consoleState.setModule("skills")
-    } else if (p.startsWith("/tasks")) {
+    } else if (currentPath.startsWith("/tasks")) {
       consoleState.setModule("tasks")
-    } else if (p.startsWith("/users")) {
+    } else if (currentPath.startsWith("/users")) {
       consoleState.setModule("users")
-    } else if (p.startsWith("/research")) {
+    } else if (currentPath.startsWith("/research")) {
       consoleState.setModule("research")
-    } else if (p.startsWith("/llm-audit")) {
+    } else if (currentPath.startsWith("/llm-audit")) {
       consoleState.setModule("llm-audit")
-    } else if (p.startsWith("/logs")) {
+    } else if (currentPath.startsWith("/logs")) {
       consoleState.setModule("logs")
-    } else if (p.startsWith("/task-health")) {
+    } else if (currentPath.startsWith("/task-health")) {
       consoleState.setModule("task-health")
-    } else if (p.startsWith("/notifications")) {
+    } else if (currentPath.startsWith("/notifications")) {
       consoleState.setModule("notifications")
-    } else if (p.startsWith("/schedule")) {
+    } else if (currentPath.startsWith("/schedule")) {
       consoleState.setModule("schedule")
-    } else if (p.startsWith("/settings")) {
+    } else if (currentPath.startsWith("/settings")) {
       consoleState.setModule("settings")
     } else {
       consoleState.setModule("sessions")
@@ -122,7 +123,8 @@ export default function ConsoleLayout(props: ParentProps) {
           <main class="min-h-0 min-w-0 flex-1 overflow-hidden p-3 md:p-4">
             {!backend.state.connected && !backend.state.initializing ? (
               <div class="mb-3 rounded-lg border border-rose-300/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">
-                后端未连接：{backend.state.error || "请在设置页检查连接。"}
+                {SHARED.layout.not_connected_prefix}
+                {backend.state.error || SHARED.layout.not_connected_hint}
               </div>
             ) : null}
             {props.children}

@@ -1,6 +1,98 @@
 # Archive Index
 
-Last updated: 2026-05-12
+Last updated: 2026-05-27
+
+## 2026-05-27
+
+### v0.12.4 Formal Release
+
+- Status: done
+- Date: 2026-05-27
+- Plan: N/A, single-session formal release execution
+- Handoff: `docs/handoffs/2026-05-27-v0.12.4-release.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo check --workspace --all-targets --exclude hone-desktop`, `cargo test --workspace --all-targets --exclude hone-desktop`, `bun run test:web`, `bash tests/regression/run_ci.sh`, `bash scripts/prepare_release_notes.sh v0.12.4 /tmp/release-notes-v0.12.4.md`
+- Current conclusion: `v0.12.4` ships the Cloud PG / OSS runtime config slice, public upload OSS proxy path, scheduler commodity guard false-positive fix, Feishu/external error diagnostics, guarded live smoke wrappers, refreshed architecture SVG, and release notes.
+- Next entry point: `docs/releases/v0.12.4.md`, then `docs/current-plans/cloud-pg-oss-runtime-migration.md` for remaining cloud storage follow-up.
+
+## 2026-05-23
+
+### Heartbeat Structured Status Hardening
+
+- Status: done
+- Date: 2026-05-23
+- Plan: `docs/current-plans/active-bug-burn-down-2026-04-28.md`
+- Handoff: `docs/handoffs/2026-05-23-heartbeat-structured-status-hardening.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `rustfmt --edition 2024 --config skip_children=true --check crates/hone-channels/src/scheduler.rs`, `cargo test -p hone-channels heartbeat_ --lib -- --nocapture`, `cargo check -p hone-channels --tests`
+- Current conclusion: heartbeat status parsing now tolerates common nonstandard noop/triggered status aliases and complete internal-only no-op reasoning, while the prompt blocks tool/task/profile configuration fragments as final output.
+- Next entry point: `docs/bugs/scheduler_heartbeat_unknown_status_silent_skip.md`
+
+### Heartbeat Context Overflow Status Boundary
+
+- Status: done
+- Date: 2026-05-23
+- Plan: `docs/current-plans/active-bug-burn-down-2026-04-28.md`
+- Handoff: `docs/handoffs/2026-05-23-heartbeat-context-overflow-status.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-channels heartbeat_context_overflow_error_is_not_classified_as_noop --lib -- --nocapture`, `cargo test -p hone-channels heartbeat_ --lib -- --nocapture`, `cargo check -p hone-channels --tests`
+- Current conclusion: heartbeat context-window overflow is no longer treated as a legitimate noop; it is classified as `context_window_overflow` and lands as `execution_failed + skipped_error` for auditability.
+- Next entry point: `docs/bugs/scheduler_heartbeat_context_window_limit_no_recovery.md`
+
+### Heartbeat Max-Iterations Budget
+
+- Status: done
+- Date: 2026-05-23
+- Plan: N/A, single active-bug fix did not need dynamic plan tracking
+- Handoff: `docs/handoffs/2026-05-23-heartbeat-max-iterations-budget.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `cargo test -p hone-channels heartbeat_prompt_requires_noop_json_for_contract_conflicts --lib -- --nocapture`, `cargo test -p hone-channels heartbeat_runner_uses_capped_completion_budget --lib -- --nocapture`, `cargo test -p hone-channels heartbeat_ --lib -- --nocapture`, `cargo check -p hone-channels --tests`
+- Current conclusion: heartbeat auxiliary function-calling now gets 18 iterations instead of 10, and the heartbeat prompt explicitly requires minimal tool use so sector/multi-symbol heartbeat jobs are less likely to burn their whole budget confirming noop.
+- Next entry point: `docs/bugs/scheduler_heartbeat_iteration_exhaustion_skips_alert.md`
+
+## 2026-05-21
+
+### Public Blog Module
+
+- Status: done
+- Date: 2026-05-21
+- Plan: `docs/archive/plans/public-blog-module.md`
+- Handoff: `docs/handoffs/2026-05-21-public-blog-module.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `bun --filter @hone-financial/app test`, `bun --filter @hone-financial/app typecheck`, `HONE_APP_OUT_DIR=dist-public HONE_APP_SURFACE=public bun --filter @hone-financial/app build`
+- Current conclusion: hone-claw.com public surface now has a bilingual static Blog index and Rust article route, with navigation/homepage entry points and local Chinese/English article images copied from the provided source links.
+- Next entry point: `packages/app/src/lib/public-blog.ts`, `packages/app/src/pages/public-blog.tsx`, and `packages/app/src/pages/public-blog-post.tsx`
+
+### Public Blog Share Metadata
+
+- Status: done
+- Date: 2026-05-21
+- Plan: `docs/archive/plans/public-blog-share-metadata.md`
+- Handoff: `docs/handoffs/2026-05-21-public-blog-module.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `bun --filter @hone-financial/app test`, `bun --filter @hone-financial/app typecheck`, `HONE_APP_OUT_DIR=dist-public HONE_APP_SURFACE=public bun --filter @hone-financial/app build`
+- Current conclusion: Blog article pages now show both Chinese and English titles, include a card to switch language versions, inject article-specific metadata at runtime, and use Cloudflare Worker HTML metadata injection for crawlers that do not execute the SPA. README top navigation and Rust-stack sections now link to the Blog with matching language labels.
+- Next entry point: `packages/app/public/_worker.js`, `packages/app/src/pages/public-blog-post.tsx`, and `README_ZH.md`
+
+## 2026-05-20
+
+### Heartbeat Mimo 429 Key-Pool Fallback
+
+- Status: done
+- Date: 2026-05-20
+- Plan: `docs/current-plans/active-bug-burn-down-2026-04-28.md`
+- Handoff: `docs/handoffs/2026-05-20-heartbeat-mimo-429-key-pool.md`
+- Decision / ADR: N/A
+- Related PRs / commits: GitHub Issue [#44](https://github.com/B-M-Capital-Research/honeclaw/issues/44)
+- Related runbooks / regressions: `cargo test -p hone-llm chat_with_tools_falls_back_to_next_key_after_http_429 -- --nocapture`, `cargo test -p hone-channels heartbeat_provider_429_quota_error_is_classified --lib -- --nocapture`
+- Current conclusion: OpenAI-compatible non-streaming routes now honor provider key pools for non-OpenRouter profiles, so a single exhausted mimo key no longer drops the whole heartbeat batch when fallback keys are configured.
+- Next entry point: `docs/bugs/scheduler_heartbeat_mimo_429_quota_exhausted.md`
 
 ## 2026-05-12
 
@@ -1093,3 +1185,15 @@ Use this file as the historical entry point for completed or paused work that sh
 - Related runbooks / regressions: `cargo test -p hone-channels sandbox --lib -- --nocapture`, `cargo test -p hone-channels prepare_ignores_repo_internal_sandbox_override --lib -- --nocapture`, `HONE_SKIP_BUNDLED_RESOURCE_CHECK=1 cargo test -p hone-desktop runtime_env -- --nocapture`, `cargo check -p hone-channels --tests`, `HONE_SKIP_BUNDLED_RESOURCE_CHECK=1 cargo check -p hone-desktop`
 - Current conclusion: Actor sandboxes no longer default to repo `data/agent-sandboxes`; repo-internal sandbox roots now fall back to a repo-external temp directory, desktop sidecar propagates that explicit sandbox root, and sandbox initialization removes legacy portfolio files before native-file runners can read them.
 - Next entry point: `docs/handoffs/2026-05-14-web-direct-sandbox-isolation-hotfix.md`
+
+### Public Login ToS Runtime Mismatch
+
+- Status: done
+- Date: 2026-05-20
+- Plan: N/A
+- Handoff: `docs/handoffs/2026-05-20-public-login-tos-runtime-mismatch.md`
+- Decision / ADR: N/A
+- Related PRs / commits: N/A
+- Related runbooks / regressions: `docs/runbooks/desktop-release-app-runtime.md`, `bun run build:web:public`, `cargo build --release -p hone-console-page`, `bun --filter @hone-financial/app test -- public-sms-login`
+- Current conclusion: Public login failure came from runtime artifact skew: the public bundle and `hone-console-page` binary did not agree on `TOS_VERSION`. Port 8088 now serves the rebuilt public bundle with ToS `2.1`, and the rebuilt backend accepts `2.1` while rejecting stale `2.0`.
+- Next entry point: `docs/handoffs/2026-05-20-public-login-tos-runtime-mismatch.md`

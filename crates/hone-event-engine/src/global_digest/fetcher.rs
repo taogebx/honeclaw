@@ -28,7 +28,7 @@ const PAYWALL_DOMAINS: &[&str] = &[
     "economist.com",
 ];
 /// 截断阈值 —— Pass 2 prompt 经济性。15 篇 × 6000 字 ≈ 90K chars ≈ 30K tokens,
-/// 加 prompt 与 system 大约 100K input,仍远低于 grok-4.1-fast 的 2M context。
+/// 加 prompt 与 system 后仍应落在当前 grok 级强模型的可控上下文内。
 pub const MAX_ARTICLE_CHARS: usize = 6000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,7 +238,7 @@ pub fn parse_jina_markdown(body: &str, max_chars: usize) -> Option<String> {
     }
     let after_anchor = body
         .find("Markdown Content:")
-        .map(|i| &body[i + "Markdown Content:".len()..])
+        .map(|marker_index| &body[marker_index + "Markdown Content:".len()..])
         .unwrap_or(body);
 
     // 找第二个 H1。如果存在,从那里截 —— 第一个常常是带 "| Reuters" / "- WSJ" 站名后缀
@@ -253,37 +253,37 @@ pub fn parse_jina_markdown(body: &str, max_chars: usize) -> Option<String> {
     }
 }
 
-fn skip_to_article_h1(s: &str) -> &str {
+fn skip_to_article_h1(markdown: &str) -> &str {
     // 搜第一个 "\n# " 之后,再看后续是否还有第二个 "\n# ";若有,从第二个开始
-    let bytes = s.as_bytes();
+    let bytes = markdown.as_bytes();
     let mut count = 0usize;
     let mut second_h1_idx: Option<usize> = None;
-    let mut i = 0usize;
-    while i + 2 < bytes.len() {
-        let line_start = i == 0
+    let mut byte_index = 0usize;
+    while byte_index + 2 < bytes.len() {
+        let line_start = byte_index == 0
             || bytes
-                .get(i.wrapping_sub(1))
+                .get(byte_index.wrapping_sub(1))
                 .map(|b| *b == b'\n')
                 .unwrap_or(false);
-        if line_start && bytes[i] == b'#' && bytes[i + 1] == b' ' {
+        if line_start && bytes[byte_index] == b'#' && bytes[byte_index + 1] == b' ' {
             count += 1;
             if count == 2 {
-                second_h1_idx = Some(i);
+                second_h1_idx = Some(byte_index);
                 break;
             }
         }
-        i += 1;
+        byte_index += 1;
     }
     match second_h1_idx {
-        Some(idx) => &s[idx..],
-        None => s,
+        Some(article_h1_index) => &markdown[article_h1_index..],
+        None => markdown,
     }
 }
 
-fn strip_jina_noise(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+fn strip_jina_noise(markdown: &str) -> String {
+    let mut cleaned_markdown = String::with_capacity(markdown.len());
     let mut blank_run = 0u8;
-    for line in s.lines() {
+    for line in markdown.lines() {
         let trimmed = line.trim();
         // 跳 `![Image N](...)` 像素行(可能整行只有图片,也可能多个图片连排)
         if is_image_only_line(trimmed) {
@@ -292,15 +292,15 @@ fn strip_jina_noise(s: &str) -> String {
         if trimmed.is_empty() {
             blank_run += 1;
             if blank_run <= 1 {
-                out.push('\n');
+                cleaned_markdown.push('\n');
             }
             continue;
         }
         blank_run = 0;
-        out.push_str(line);
-        out.push('\n');
+        cleaned_markdown.push_str(line);
+        cleaned_markdown.push('\n');
     }
-    out.trim().to_string()
+    cleaned_markdown.trim().to_string()
 }
 
 fn is_image_only_line(line: &str) -> bool {
@@ -390,30 +390,30 @@ fn has_blacklisted_ancestor(el: &scraper::ElementRef, blacklist: &[&str]) -> boo
     false
 }
 
-fn collapse_whitespace(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+fn collapse_whitespace(text: &str) -> String {
+    let mut collapsed = String::with_capacity(text.len());
     let mut prev_space = true;
-    for ch in s.chars() {
+    for ch in text.chars() {
         if ch.is_whitespace() {
             if !prev_space {
-                out.push(' ');
+                collapsed.push(' ');
             }
             prev_space = true;
         } else {
-            out.push(ch);
+            collapsed.push(ch);
             prev_space = false;
         }
     }
-    out.trim().to_string()
+    collapsed.trim().to_string()
 }
 
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
     }
-    let mut out: String = s.chars().take(max).collect();
-    out.push('…');
-    out
+    let mut truncated: String = text.chars().take(max_chars).collect();
+    truncated.push('…');
+    truncated
 }
 
 #[cfg(test)]
@@ -627,7 +627,7 @@ mod tests {
 
     #[test]
     fn paywall_domain_detection() {
-        for u in [
+        for url in [
             "https://www.reuters.com/foo",
             "https://reuters.com/foo",
             "https://www.wsj.com/x",
@@ -637,27 +637,30 @@ mod tests {
             "https://www.ft.com/x",
             "https://www.economist.com/x",
         ] {
-            assert!(is_paywall_domain(u), "{u} should be paywall");
+            assert!(is_paywall_domain(url), "{url} should be paywall");
         }
-        for u in [
+        for url in [
             "https://www.cnbc.com/x",
             "https://seekingalpha.com/x",
             "https://example.com/wsj.com",
         ] {
-            assert!(!is_paywall_domain(u), "{u} should NOT be paywall");
+            assert!(!is_paywall_domain(url), "{url} should NOT be paywall");
         }
     }
 
     #[test]
     fn fetcher_constructors_normalize_empty_key_to_none() {
-        let f1 = ArticleFetcher::with_jina_api_key(None);
-        assert!(f1.jina_api_key.is_none());
-        let f2 = ArticleFetcher::with_jina_api_key(Some("".into()));
-        assert!(f2.jina_api_key.is_none());
-        let f3 = ArticleFetcher::with_jina_api_key(Some("   ".into()));
-        assert!(f3.jina_api_key.is_none());
-        let f4 = ArticleFetcher::with_jina_api_key(Some("jina_xyz".into()));
-        assert_eq!(f4.jina_api_key.as_deref(), Some("jina_xyz"));
+        let missing_key_fetcher = ArticleFetcher::with_jina_api_key(None);
+        assert!(missing_key_fetcher.jina_api_key.is_none());
+        let empty_key_fetcher = ArticleFetcher::with_jina_api_key(Some("".into()));
+        assert!(empty_key_fetcher.jina_api_key.is_none());
+        let blank_key_fetcher = ArticleFetcher::with_jina_api_key(Some("   ".into()));
+        assert!(blank_key_fetcher.jina_api_key.is_none());
+        let configured_key_fetcher = ArticleFetcher::with_jina_api_key(Some("jina_xyz".into()));
+        assert_eq!(
+            configured_key_fetcher.jina_api_key.as_deref(),
+            Some("jina_xyz")
+        );
     }
 
     #[test]

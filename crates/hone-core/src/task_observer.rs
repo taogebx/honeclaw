@@ -97,24 +97,44 @@ pub fn task_runs_path(runtime_dir: &Path, date: chrono::NaiveDate) -> PathBuf {
 /// tick 开始时的 `Utc::now()`,`ended_at` 取写入前的 `Utc::now()`。
 pub fn record_task_run(runtime_dir: &Path, record: &TaskRunRecord) {
     if let Err(e) = record_task_run_inner(runtime_dir, record) {
+        let path = task_runs_path(runtime_dir, record.started_at.date_naive());
         warn!(
             task = %record.task,
             outcome = record.outcome.as_str(),
+            file = %path.display(),
             "failed to write task_runs jsonl: {e:#}"
         );
     }
 }
 
 fn record_task_run_inner(runtime_dir: &Path, record: &TaskRunRecord) -> std::io::Result<()> {
-    fs::create_dir_all(runtime_dir)?;
+    fs::create_dir_all(runtime_dir)
+        .map_err(|err| task_runs_io_error("create task_runs directory", runtime_dir, err))?;
     let path = task_runs_path(runtime_dir, record.started_at.date_naive());
     let line = serde_json::to_string(record)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        .map_err(|err| task_runs_data_error("serialize task_runs record", &path, err))?;
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
-    f.write_all(line.as_bytes())?;
-    f.write_all(b"\n")?;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|err| task_runs_io_error("open task_runs jsonl", &path, err))?;
+    f.write_all(line.as_bytes())
+        .map_err(|err| task_runs_io_error("write task_runs jsonl", &path, err))?;
+    f.write_all(b"\n")
+        .map_err(|err| task_runs_io_error("write task_runs newline", &path, err))?;
     Ok(())
+}
+
+fn task_runs_io_error(action: &str, path: &Path, err: std::io::Error) -> std::io::Error {
+    std::io::Error::new(err.kind(), format!("{action} ({}): {err}", path.display()))
+}
+
+fn task_runs_data_error(action: &str, path: &Path, err: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("{action} ({}): {err}", path.display()),
+    )
 }
 
 /// 删除 `runtime_dir` 下早于 `retention_days` 的 task_runs.*.jsonl 文件。
@@ -125,9 +145,12 @@ pub fn purge_old_task_runs(runtime_dir: &Path, retention_days: i64) {
     }
     let cutoff = Utc::now().date_naive() - chrono::Duration::days(retention_days);
     let read = match fs::read_dir(runtime_dir) {
-        Ok(r) => r,
+        Ok(entries) => entries,
         Err(e) => {
-            warn!("task_runs purge: read_dir failed: {e:#}");
+            warn!(
+                dir = %runtime_dir.display(),
+                "task_runs purge: read_dir failed: {e:#}"
+            );
             return;
         }
     };
@@ -261,56 +284,79 @@ fn truncate_task_error(error: &str) -> String {
 }
 
 fn redact_common_secret_details(text: &str) -> String {
-    let mut output = redact_bearer_tokens(text);
-    for key in [
-        "access_token",
-        "accessToken",
-        "api_key",
-        "apiKey",
-        "apikey",
-        "token",
-        "app_secret",
-        "appSecret",
-        "password",
-    ] {
-        output = redact_query_value(&output, key);
+    let mut output = redact_auth_scheme_tokens(text);
+    for key in SENSITIVE_TASK_ERROR_KEYS {
+        output = redact_delimited_secret_value(&output, &format!("{key}="));
+        output = redact_delimited_secret_value(&output, &format!("{key}:"));
     }
     output
 }
 
-fn redact_bearer_tokens(text: &str) -> String {
-    const MARKER: &str = "Bearer ";
+const SENSITIVE_TASK_ERROR_KEYS: &[&str] = &[
+    "access_token",
+    "accessToken",
+    "api_key",
+    "apiKey",
+    "apikey",
+    "app_secret",
+    "appSecret",
+    "client_secret",
+    "clientSecret",
+    "refresh_token",
+    "refreshToken",
+    "id_token",
+    "idToken",
+    "session_token",
+    "sessionToken",
+    "bot_token",
+    "botToken",
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "TAVILY_API_KEY",
+    "FMP_API_KEY",
+    "HONE_CLOUD_API_KEY",
+    "token",
+    "secret",
+    "password",
+    "X-API-Key",
+    "x-api-key",
+];
+
+fn redact_auth_scheme_tokens(text: &str) -> String {
+    let output = redact_delimited_secret_value(text, "Bearer ");
+    redact_delimited_secret_value(&output, "Basic ")
+}
+
+fn redact_delimited_secret_value(text: &str, marker: &str) -> String {
     let mut remaining = text;
     let mut output = String::with_capacity(text.len());
-    while let Some(index) = remaining.find(MARKER) {
-        let value_start = index + MARKER.len();
+    while let Some(index) = remaining.find(marker) {
+        let value_start = index + marker.len();
         output.push_str(&remaining[..value_start]);
+        let leading_whitespace = remaining[value_start..]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        output.push_str(&remaining[value_start..value_start + leading_whitespace]);
         output.push_str(REDACTED_SECRET);
-        let value_tail = remaining[value_start..]
+        let value_tail = remaining[value_start + leading_whitespace..]
             .char_indices()
             .find_map(|(idx, ch)| {
-                (ch.is_whitespace() || matches!(ch, ')' | ',' | '"')).then_some(idx)
+                (ch == '&'
+                    || ch == ')'
+                    || ch == ','
+                    || ch == '"'
+                    || ch == '\''
+                    || ch == '}'
+                    || ch == ']'
+                    || ch.is_whitespace())
+                .then_some(idx)
             })
-            .unwrap_or(remaining[value_start..].len());
-        remaining = &remaining[value_start + value_tail..];
-    }
-    output.push_str(remaining);
-    output
-}
-
-fn redact_query_value(text: &str, key: &str) -> String {
-    let needle = format!("{key}=");
-    let mut remaining = text;
-    let mut output = String::with_capacity(text.len());
-    while let Some(index) = remaining.find(&needle) {
-        let value_start = index + needle.len();
-        output.push_str(&remaining[..value_start]);
-        output.push_str(REDACTED_SECRET);
-        let value_tail = remaining[value_start..]
-            .char_indices()
-            .find_map(|(idx, ch)| (ch == '&' || ch == ')' || ch.is_whitespace()).then_some(idx))
-            .unwrap_or(remaining[value_start..].len());
-        remaining = &remaining[value_start + value_tail..];
+            .unwrap_or(remaining[value_start + leading_whitespace..].len());
+        remaining = &remaining[value_start + leading_whitespace + value_tail..];
     }
     output.push_str(remaining);
     output
@@ -358,6 +404,35 @@ mod tests {
         assert_eq!(parsed[1].outcome, TaskOutcome::Skipped);
         assert_eq!(parsed[2].outcome, TaskOutcome::Failed);
         assert_eq!(parsed[2].error.as_deref(), Some("disk full"));
+    }
+
+    #[test]
+    fn record_task_run_inner_reports_runtime_dir_path() {
+        let temp_dir = tempdir().unwrap();
+        let runtime_dir = temp_dir.path().join("not-a-dir");
+        std::fs::write(&runtime_dir, "plain file").unwrap();
+        let now = Utc::now();
+        let record = TaskRunRecord {
+            task: "poller.test".into(),
+            started_at: now,
+            ended_at: now,
+            outcome: TaskOutcome::Failed,
+            items: 0,
+            error: Some("disk full".into()),
+        };
+
+        let error = record_task_run_inner(&runtime_dir, &record)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("create task_runs directory"),
+            "error={error}"
+        );
+        assert!(
+            error.contains(&runtime_dir.display().to_string()),
+            "error={error}"
+        );
     }
 
     #[test]
@@ -426,13 +501,13 @@ mod tests {
             temp_dir.path(),
             "poller.secret",
             Utc::now(),
-            "request failed https://api.test/path?access_token=abc&apiKey=def auth=Bearer bearer-secret",
+            "request failed https://api.test/path?access_token=abc&apiKey=def auth=Bearer bearer-secret OPENROUTER_API_KEY=env-secret X-API-Key: header-secret Authorization: Basic basic-secret",
         );
         let recent = read_recent_task_runs(temp_dir.path(), 0, 1);
         let err = recent[0].error.as_deref().unwrap();
         assert_eq!(
             err,
-            "request failed https://api.test/path?access_token=<redacted>&apiKey=<redacted> auth=Bearer <redacted>"
+            "request failed https://api.test/path?access_token=<redacted>&apiKey=<redacted> auth=Bearer <redacted> OPENROUTER_API_KEY=<redacted> X-API-Key: <redacted> Authorization: Basic <redacted>"
         );
     }
 }

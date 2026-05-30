@@ -18,6 +18,8 @@ const GENERIC_USER_ERROR_MESSAGE: &str = "抱歉，这次处理失败了。请�
 const TIMEOUT_USER_ERROR_MESSAGE: &str = "抱歉，处理超时了。请稍后再试。";
 const RUNNER_USAGE_LIMIT_USER_ERROR_MESSAGE: &str =
     "当前执行额度已用尽，暂时无法继续处理。请稍后再试。";
+const RUNNER_RESOURCE_UNAVAILABLE_USER_ERROR_MESSAGE: &str =
+    "当前本机执行环境暂时不可用，请稍后再试。";
 
 /// 流式处理结果
 #[derive(Debug, Clone)]
@@ -406,6 +408,9 @@ pub fn user_visible_error_message(raw: Option<&str>) -> String {
     if looks_timeout_error_lowered(&lowered) {
         return TIMEOUT_USER_ERROR_MESSAGE.to_string();
     }
+    if looks_sensitive_error_detail(&lowered) {
+        return GENERIC_USER_ERROR_MESSAGE.to_string();
+    }
     if looks_internal_error_detail(&sanitized, &lowered) {
         return GENERIC_USER_ERROR_MESSAGE.to_string();
     }
@@ -422,6 +427,9 @@ pub fn user_visible_error_message_or_none(raw: Option<&str>) -> Option<String> {
     if looks_internal_error_detail(&sanitized, &lowered) {
         return None;
     }
+    if looks_sensitive_error_detail(&lowered) {
+        return None;
+    }
     if looks_timeout_error_lowered(&lowered) {
         return Some(TIMEOUT_USER_ERROR_MESSAGE.to_string());
     }
@@ -435,10 +443,15 @@ fn sanitized_non_empty_user_visible(raw: Option<&str>) -> Option<String> {
 }
 
 fn user_actionable_error_message(sanitized: &str, lowered: &str) -> Option<String> {
-    quota_rejection_user_message(sanitized).or_else(|| {
-        looks_runner_usage_limit_error_lowered(lowered)
-            .then(|| RUNNER_USAGE_LIMIT_USER_ERROR_MESSAGE.to_string())
-    })
+    quota_rejection_user_message(sanitized)
+        .or_else(|| {
+            looks_runner_usage_limit_error_lowered(lowered)
+                .then(|| RUNNER_USAGE_LIMIT_USER_ERROR_MESSAGE.to_string())
+        })
+        .or_else(|| {
+            looks_runner_resource_unavailable_error_lowered(lowered)
+                .then(|| RUNNER_RESOURCE_UNAVAILABLE_USER_ERROR_MESSAGE.to_string())
+        })
 }
 
 fn quota_rejection_user_message(sanitized: &str) -> Option<String> {
@@ -463,8 +476,55 @@ fn looks_runner_usage_limit_error_lowered(lowered: &str) -> bool {
             || lowered.contains("try again later"))
 }
 
+fn looks_runner_resource_unavailable_error_lowered(lowered: &str) -> bool {
+    (lowered.contains("codex")
+        || lowered.contains("codex-acp")
+        || lowered.contains("runner")
+        || lowered.contains("acp"))
+        && (lowered.contains("resource temporarily unavailable")
+            || lowered.contains("os error 35")
+            || lowered.contains("would block")
+            || lowered.contains("failed to probe")
+            || lowered.contains("version probe")
+            || lowered.contains("failed to spawn"))
+}
+
 fn looks_timeout_error_lowered(lowered: &str) -> bool {
     lowered.contains("timeout") || lowered.contains("timed out")
+}
+
+fn looks_sensitive_error_detail(lowered: &str) -> bool {
+    [
+        "api_key=",
+        "api_key:",
+        "apikey=",
+        "apikey:",
+        "x-api-key=",
+        "x-api-key:",
+        "openrouter_api_key=",
+        "anthropic_api_key=",
+        "gemini_api_key=",
+        "google_api_key=",
+        "tavily_api_key=",
+        "fmp_api_key=",
+        "hone_cloud_api_key=",
+        "client_secret=",
+        "client_secret:",
+        "refresh_token=",
+        "refresh_token:",
+        "id_token=",
+        "id_token:",
+        "session_token=",
+        "session_token:",
+        "bot_token=",
+        "bot_token:",
+        "authorization=",
+        "authorization:",
+        "bearer ",
+        "basic ",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
 }
 
 fn looks_internal_error_detail(sanitized: &str, lowered: &str) -> bool {
@@ -982,6 +1042,26 @@ mod tests {
     }
 
     #[test]
+    fn user_visible_error_message_maps_codex_probe_resource_errors() {
+        let err = user_visible_error_message(Some(
+            "failed to probe codex version via `codex`: Resource temporarily unavailable (os error 35)",
+        ));
+        assert_eq!(err, RUNNER_RESOURCE_UNAVAILABLE_USER_ERROR_MESSAGE);
+        assert!(!err.contains("Resource temporarily unavailable"));
+        assert!(!err.contains("os error 35"));
+    }
+
+    #[test]
+    fn user_visible_error_message_hides_sensitive_error_details() {
+        let err = user_visible_error_message(Some(
+            "upstream failed OPENROUTER_API_KEY=sk-secret Authorization: Basic basic-secret",
+        ));
+        assert_eq!(err, GENERIC_USER_ERROR_MESSAGE);
+        assert!(!err.contains("sk-secret"));
+        assert!(!err.contains("basic-secret"));
+    }
+
+    #[test]
     fn user_visible_error_message_or_none_suppresses_internal_acp_errors() {
         let err = user_visible_error_message_or_none(Some(
             "codex acp prompt ended before tool completion: Searching the Web",
@@ -1009,6 +1089,17 @@ mod tests {
     }
 
     #[test]
+    fn user_visible_error_message_or_none_keeps_codex_probe_resource_errors_sanitized() {
+        let err = user_visible_error_message_or_none(Some(
+            "failed to probe codex version via `codex`: Resource temporarily unavailable (os error 35)",
+        ));
+        assert_eq!(
+            err.as_deref(),
+            Some(RUNNER_RESOURCE_UNAVAILABLE_USER_ERROR_MESSAGE)
+        );
+    }
+
+    #[test]
     fn user_visible_error_message_or_none_suppresses_internal_idle_timeout() {
         let err = user_visible_error_message_or_none(Some(
             "codex acp session/prompt idle timeout (180s)",
@@ -1022,6 +1113,14 @@ mod tests {
             "request timed out while waiting for upstream response",
         ));
         assert_eq!(err.as_deref(), Some(TIMEOUT_USER_ERROR_MESSAGE));
+    }
+
+    #[test]
+    fn user_visible_error_message_or_none_drops_sensitive_error_details() {
+        let err = user_visible_error_message_or_none(Some(
+            "gateway rejected x-api-key: header-secret refresh_token=json-refresh",
+        ));
+        assert!(err.is_none());
     }
 
     #[test]

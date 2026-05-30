@@ -5,6 +5,7 @@
 
 mod aliyun_captcha;
 mod aliyun_sms;
+mod cloud_oss;
 pub mod logging;
 mod public_auth;
 pub mod routes;
@@ -22,15 +23,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use hone_core::cloud_runtime::{CloudPgRuntime, RuntimeRole, local_durable_dependencies};
 use hone_core::config::{EventEngineConfig, HoneConfig};
 use hone_event_engine::{
     BodyPolisher, DiscordSink, FeishuSink, IMessageSink, LlmPolisher, LogSink, MultiChannelSink,
     OutboundSink, TelegramSink, parse_polish_levels,
 };
 use hone_llm::{CreatedLlmProvider, LlmResolver};
-use hone_memory::{ChannelTargetRecord, CronJobStorage};
+use hone_memory::session::{Session, SessionRuntimeBackend, SessionStorageOptions};
+use hone_memory::{ChannelTargetRecord, CronJobStorage, SessionStorage};
 use tokio::sync::broadcast;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::prelude::*;
 
 use crate::routes::events::handle_scheduler_events;
@@ -71,7 +74,7 @@ fn build_event_engine_polisher(
     }
 }
 
-const DEFAULT_EVENT_ENGINE_NEWS_CLASSIFIER_MODEL: &str = "x-ai/grok-4.1-fast";
+const DEFAULT_EVENT_ENGINE_NEWS_CLASSIFIER_MODEL: &str = "x-ai/grok-4.3";
 const DEFAULT_MAINLINE_DISTILL_MAX_TOKENS: u16 = 1200;
 
 /// 装配"不确定来源 NewsCritical → LLM 仲裁"分类器。
@@ -346,13 +349,75 @@ fn feishu_direct_actor_contact_targets(core_cfg: &HoneConfig) -> Vec<(String, St
         &core_cfg.storage.cron_jobs_dir,
         &core_cfg.storage.session_sqlite_db_path,
     );
-    feishu_direct_actor_contact_targets_from_records(storage.list_channel_targets())
+    let session_storage = if core_cfg.cloud.effective_mode().is_cloud_authoritative()
+        && core_cfg.cloud.postgres.is_configured()
+    {
+        CloudPgRuntime::from_cloud_config(&core_cfg.cloud)
+            .and_then(|pg| SessionStorage::new_cloud(pg).ok())
+            .unwrap_or_else(|| SessionStorage::from_storage_config(&core_cfg.storage))
+    } else {
+        SessionStorage::from_storage_config(&core_cfg.storage)
+    };
+    let sessions = sessions_with_json_fallback(session_storage.list_sessions(), || {
+        SessionStorage::with_options(
+            &core_cfg.storage.sessions_dir,
+            SessionStorageOptions {
+                shadow_sqlite_db_path: None,
+                shadow_sqlite_enabled: false,
+                runtime_backend: SessionRuntimeBackend::Json,
+            },
+        )
+        .list_sessions()
+    });
+    feishu_direct_actor_contact_targets_from_sources(storage.list_channel_targets(), sessions)
 }
 
-fn feishu_direct_actor_contact_targets_from_records(
+fn sessions_with_json_fallback<F>(
+    primary: hone_core::HoneResult<Vec<Session>>,
+    fallback: F,
+) -> Vec<Session>
+where
+    F: FnOnce() -> hone_core::HoneResult<Vec<Session>>,
+{
+    match primary {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to list sessions for Feishu direct actor contacts; falling back to JSON sessions"
+            );
+            fallback().unwrap_or_else(|fallback_err| {
+                warn!(
+                    error = %fallback_err,
+                    "failed to list fallback JSON sessions for Feishu direct actor contacts"
+                );
+                Vec::new()
+            })
+        }
+    }
+}
+
+fn feishu_direct_actor_contact_targets_from_sources(
     records: Vec<ChannelTargetRecord>,
+    sessions: Vec<Session>,
 ) -> Vec<(String, String)> {
     let mut targets_by_actor: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    collect_feishu_direct_actor_contact_targets_from_records(&mut targets_by_actor, records);
+    collect_feishu_direct_actor_contact_targets_from_sessions(&mut targets_by_actor, sessions);
+    targets_by_actor
+        .into_iter()
+        .flat_map(|(actor_user_id, targets)| {
+            targets
+                .into_iter()
+                .map(move |target| (actor_user_id.clone(), target))
+        })
+        .collect()
+}
+
+fn collect_feishu_direct_actor_contact_targets_from_records(
+    targets_by_actor: &mut BTreeMap<String, BTreeSet<String>>,
+    records: Vec<ChannelTargetRecord>,
+) {
     for record in records {
         if record.channel.trim() != "feishu" {
             continue;
@@ -375,19 +440,46 @@ fn feishu_direct_actor_contact_targets_from_records(
                 .insert(target.to_string());
         }
     }
-    targets_by_actor
-        .into_iter()
-        .filter_map(|(actor_user_id, targets)| {
-            if targets.len() == 1 {
-                targets
-                    .into_iter()
-                    .next()
-                    .map(|target| (actor_user_id, target))
-            } else {
-                None
+}
+
+fn collect_feishu_direct_actor_contact_targets_from_sessions(
+    targets_by_actor: &mut BTreeMap<String, BTreeSet<String>>,
+    sessions: Vec<Session>,
+) {
+    for session in sessions {
+        let Some(actor) = session.actor.as_ref() else {
+            continue;
+        };
+        if actor.channel.trim() != "feishu" {
+            continue;
+        }
+        if matches!(actor.channel_scope.as_deref(), Some(scope) if scope != "direct") {
+            continue;
+        }
+        let actor_user_id = actor.user_id.trim();
+        if actor_user_id.is_empty() {
+            continue;
+        }
+        for key in ["mobile", "email"] {
+            let Some(target) = session.metadata.get(key).and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let target = target.trim();
+            if !looks_like_contact_target(target) {
+                continue;
             }
-        })
-        .collect()
+            targets_by_actor
+                .entry(actor_user_id.to_string())
+                .or_default()
+                .insert(target.to_string());
+        }
+    }
+}
+
+fn feishu_direct_actor_contact_targets_from_records(
+    records: Vec<ChannelTargetRecord>,
+) -> Vec<(String, String)> {
+    feishu_direct_actor_contact_targets_from_sources(records, Vec::new())
 }
 
 fn looks_like_contact_target(target: &str) -> bool {
@@ -530,6 +622,7 @@ pub async fn start_server(
     skills_dir: Option<&Path>,
     deployment_mode: &str,
 ) -> Result<StartedServer, String> {
+    hone_core::cloud_runtime::load_dotenv_if_present();
     let mut task_handles = Vec::new();
     let mut config =
         HoneConfig::from_file(config_path).map_err(|e| format!("配置加载失败: {e}"))?;
@@ -549,6 +642,7 @@ pub async fn start_server(
     let log_buffer = global_log_buffer().clone();
     let log_level = core.config.logging.level.clone();
     init_logging(&log_buffer, &log_level);
+    report_cloud_runtime_storage_state(&core.config, data_dir)?;
 
     // ── 文件日志（仅首次 start_server 时启动写入任务）────────────────
     // web.log:走 tracing-appender DAILY rolling,保留最近 15 天,文件名形如
@@ -628,6 +722,7 @@ pub async fn start_server(
         },
         heartbeat_registry: Default::default(),
     });
+    let runtime_role = RuntimeRole::from_env();
 
     // ── UDP 日志接收（收集各 channel sidecar 的日志）────────────────
     let udp_port = state.core.config.logging.udp_port.unwrap_or(18118);
@@ -648,7 +743,7 @@ pub async fn start_server(
     }));
 
     // ── 事件引擎（主动消息 feed，默认 enabled=false；config 开启后启动）──
-    {
+    if runtime_role.runs_worker_tasks() {
         let mut engine_cfg = state.core.config.event_engine.clone();
         let fmp_cfg = state.core.config.fmp.clone();
         let portfolio_dir = state.core.config.storage.portfolio_dir.clone();
@@ -699,7 +794,7 @@ pub async fn start_server(
             engine_cfg.global_digest.event_dedupe_model = event_dedupe.model.clone();
         }
 
-        // ── 投资主线蒸馏 cron(每 7 天扫一次,独立 task,挂掉不影响 digest)──
+        // ── 投资主线蒸馏 cron(每小时 tick,由 staleness 策略决定是否执行)──
         if let Some(created) = mainline_distill {
             let p = created.provider;
             let distill_model = created.model;
@@ -779,16 +874,20 @@ pub async fn start_server(
     }
 
     // ── 调度器 ─────────────────────────────────────────────────────
-    let mut scheduler_channels = vec!["web".to_string()];
-    if state.core.config.imessage.enabled {
-        scheduler_channels.insert(0, "imessage".to_string());
+    if runtime_role.runs_worker_tasks() {
+        let mut scheduler_channels = vec!["web".to_string()];
+        if state.core.config.imessage.enabled {
+            scheduler_channels.insert(0, "imessage".to_string());
+        }
+        let (scheduler, event_rx) = state.core.create_scheduler(scheduler_channels);
+        task_handles.push(tokio::spawn(async move { scheduler.start().await }));
+        let state_for_scheduler = state.clone();
+        task_handles.push(tokio::spawn(async move {
+            handle_scheduler_events(state_for_scheduler, event_rx).await
+        }));
+    } else {
+        info!("runtime_role=web: scheduler/event-engine/channel worker tasks disabled");
     }
-    let (scheduler, event_rx) = state.core.create_scheduler(scheduler_channels);
-    task_handles.push(tokio::spawn(async move { scheduler.start().await }));
-    let state_for_scheduler = state.clone();
-    task_handles.push(tokio::spawn(async move {
-        handle_scheduler_events(state_for_scheduler, event_rx).await
-    }));
 
     // ── 绑定管理端口（默认 8077，可通过 HONE_WEB_PORT 覆盖）─────────────
     let bind_addr = format!("127.0.0.1:{}", runtime_port());
@@ -854,41 +953,93 @@ pub async fn start_server(
     })
 }
 
+fn report_cloud_runtime_storage_state(
+    config: &HoneConfig,
+    _data_dir: Option<&Path>,
+) -> Result<(), String> {
+    if !config.cloud.effective_enabled() {
+        return Ok(());
+    }
+
+    let local_dependencies = local_durable_dependencies(config);
+    info!(
+        cloud_postgres = config.cloud.postgres.is_configured(),
+        cloud_oss = config.cloud.oss.is_configured(),
+        local_dependency_count = local_dependencies.len(),
+        "cloud runtime config detected"
+    );
+
+    if local_dependencies.is_empty() {
+        info!("cloud runtime has no declared local storage dependencies");
+        return Ok(());
+    }
+
+    let summary = local_dependencies
+        .iter()
+        .map(|path| path.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if config.cloud.effective_strict_no_local_storage() {
+        return Err(format!(
+            "cloud.strict_no_local_storage=true 但仍存在本地存储依赖: {summary}"
+        ));
+    }
+
+    tracing::warn!("cloud runtime still has local storage dependencies: {summary}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hone_core::ActorIdentity;
+    use hone_memory::session::{Session, SessionRuntimeState};
+    use serde_json::Value;
 
     #[test]
     fn sec_filings_enrichment_max_tokens_uses_configured_cap() {
-        let mut cfg = HoneConfig::default();
-        cfg.event_engine.sec_filings.enrichment.max_summary_tokens = 800;
+        let mut config = HoneConfig::default();
+        config
+            .event_engine
+            .sec_filings
+            .enrichment
+            .max_summary_tokens = 800;
 
-        assert_eq!(sec_filings_enrichment_max_tokens(&cfg), 800);
+        assert_eq!(sec_filings_enrichment_max_tokens(&config), 800);
     }
 
     #[test]
     fn sec_filings_enrichment_max_tokens_clamps_to_valid_u16_range() {
-        let mut cfg = HoneConfig::default();
+        let mut config = HoneConfig::default();
 
-        cfg.event_engine.sec_filings.enrichment.max_summary_tokens = 0;
-        assert_eq!(sec_filings_enrichment_max_tokens(&cfg), 1);
+        config
+            .event_engine
+            .sec_filings
+            .enrichment
+            .max_summary_tokens = 0;
+        assert_eq!(sec_filings_enrichment_max_tokens(&config), 1);
 
-        cfg.event_engine.sec_filings.enrichment.max_summary_tokens = 70_000;
-        assert_eq!(sec_filings_enrichment_max_tokens(&cfg), u16::MAX);
+        config
+            .event_engine
+            .sec_filings
+            .enrichment
+            .max_summary_tokens = 70_000;
+        assert_eq!(sec_filings_enrichment_max_tokens(&config), u16::MAX);
     }
 
     #[test]
     fn mainline_distill_uses_short_completion_budget() {
-        let mut cfg = HoneConfig::default();
-        cfg.llm.openrouter.max_tokens = 30_000;
+        let mut config = HoneConfig::default();
+        config.llm.openrouter.max_tokens = 30_000;
 
-        assert_eq!(mainline_distill_max_tokens(&cfg), 1200);
+        assert_eq!(mainline_distill_max_tokens(&config), 1200);
     }
 
     #[test]
     fn feishu_direct_actor_targets_use_unambiguous_contact_targets() {
         let targets = feishu_direct_actor_contact_targets_from_records(vec![
             channel_target_record("feishu", None, "+8613800138000", vec!["ou_old"]),
+            channel_target_record("feishu", None, "alice@example.com", vec!["ou_old"]),
             channel_target_record("telegram", None, "+8613800138000", vec!["tg_user"]),
             channel_target_record(
                 "feishu",
@@ -905,18 +1056,92 @@ mod tests {
             vec![
                 ("ou_email".to_string(), "alice@example.com".to_string()),
                 ("ou_old".to_string(), "+8613800138000".to_string()),
+                ("ou_old".to_string(), "alice@example.com".to_string()),
             ]
         );
     }
 
     #[test]
-    fn feishu_direct_actor_targets_skip_ambiguous_actor_targets() {
+    fn feishu_direct_actor_targets_keep_multiple_stable_contacts_per_actor() {
         let targets = feishu_direct_actor_contact_targets_from_records(vec![
             channel_target_record("feishu", None, "+8613800138000", vec!["ou_old"]),
             channel_target_record("feishu", None, "+8613800138001", vec!["ou_old"]),
         ]);
 
-        assert!(targets.is_empty());
+        assert_eq!(
+            targets,
+            vec![
+                ("ou_old".to_string(), "+8613800138000".to_string()),
+                ("ou_old".to_string(), "+8613800138001".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn feishu_direct_actor_targets_include_session_metadata_contacts() {
+        let targets = feishu_direct_actor_contact_targets_from_sources(
+            Vec::new(),
+            vec![
+                feishu_direct_session("ou_event_only", Some("+8619106838169"), None),
+                feishu_direct_session("ou_email_only", None, Some("alice@example.com")),
+                non_direct_session("ou_group", Some("+8613800138000")),
+            ],
+        );
+
+        assert_eq!(
+            targets,
+            vec![
+                ("ou_email_only".to_string(), "alice@example.com".to_string()),
+                ("ou_event_only".to_string(), "+8619106838169".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn feishu_direct_actor_targets_merge_cron_and_session_contacts() {
+        let targets = feishu_direct_actor_contact_targets_from_sources(
+            vec![channel_target_record(
+                "feishu",
+                None,
+                "+8613800138000",
+                vec!["ou_old"],
+            )],
+            vec![feishu_direct_session(
+                "ou_old",
+                Some("+8613800138000"),
+                Some("alice@example.com"),
+            )],
+        );
+
+        assert_eq!(
+            targets,
+            vec![
+                ("ou_old".to_string(), "+8613800138000".to_string()),
+                ("ou_old".to_string(), "alice@example.com".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn feishu_direct_actor_targets_fall_back_to_json_sessions_on_primary_error() {
+        let sessions = sessions_with_json_fallback(
+            Err(hone_core::HoneError::Storage(
+                "database is locked".to_string(),
+            )),
+            || {
+                Ok(vec![feishu_direct_session(
+                    "ou_event_only",
+                    Some("+8619106838169"),
+                    None,
+                )])
+            },
+        );
+        let targets = feishu_direct_actor_contact_targets_from_sources(Vec::new(), sessions);
+
+        assert_eq!(
+            targets,
+            vec![("ou_event_only".to_string(), "+8619106838169".to_string())]
+        );
     }
 
     fn channel_target_record(
@@ -934,6 +1159,48 @@ mod tests {
             scheduled_jobs: 1,
             enabled_jobs: 1,
             last_seen_at: None,
+        }
+    }
+
+    fn feishu_direct_session(
+        actor_user_id: &str,
+        mobile: Option<&str>,
+        email: Option<&str>,
+    ) -> Session {
+        session_with_actor("feishu", actor_user_id, None, mobile, email)
+    }
+
+    fn non_direct_session(actor_user_id: &str, mobile: Option<&str>) -> Session {
+        session_with_actor("feishu", actor_user_id, Some("chat_oc_1"), mobile, None)
+    }
+
+    fn session_with_actor(
+        channel: &str,
+        actor_user_id: &str,
+        channel_scope: Option<&str>,
+        mobile: Option<&str>,
+        email: Option<&str>,
+    ) -> Session {
+        let actor =
+            ActorIdentity::new(channel, actor_user_id, channel_scope.map(str::to_string)).unwrap();
+        let mut metadata = HashMap::new();
+        if let Some(mobile) = mobile {
+            metadata.insert("mobile".to_string(), Value::String(mobile.to_string()));
+        }
+        if let Some(email) = email {
+            metadata.insert("email".to_string(), Value::String(email.to_string()));
+        }
+        Session {
+            version: 4,
+            id: actor.session_id(),
+            actor: Some(actor),
+            session_identity: None,
+            created_at: "2026-05-29T03:00:00+08:00".to_string(),
+            updated_at: "2026-05-29T03:00:00+08:00".to_string(),
+            messages: Vec::new(),
+            metadata,
+            runtime: SessionRuntimeState::default(),
+            summary: None,
         }
     }
 }

@@ -2,12 +2,12 @@ import { makeContentProxy } from "../i18n"
 
 const ZH = {
   capability: {
-    unavailable: "当前后端未开放日志能力。",
+    unavailable: "当前后端未提供日志能力。",
   },
   toolbar: {
     title: "日志",
     search_placeholder: "搜索日志…",
-    user_filter_placeholder: "按用户 ID 筛选…",
+    user_filter_placeholder: "按账号筛选…",
     user_filter_title: "只显示与该用户相关的日志（匹配结构化用户主体或消息文本）",
     pause_button: "暂停",
     resume_button: "继续",
@@ -24,12 +24,12 @@ const ZH = {
 
 const EN: typeof ZH = {
   capability: {
-    unavailable: "The current backend does not expose the logs capability.",
+    unavailable: "Logs are not available from this backend.",
   },
   toolbar: {
     title: "Logs",
     search_placeholder: "Search logs…",
-    user_filter_placeholder: "Filter by user ID…",
+    user_filter_placeholder: "Filter by account…",
     user_filter_title: "Only show logs related to this user (matches structured user identity or message text).",
     pause_button: "Pause",
     resume_button: "Resume",
@@ -39,7 +39,7 @@ const EN: typeof ZH = {
     status_disconnected: "Disconnected",
   },
   list: {
-    empty: "No matching logs",
+    empty: "No matching logs yet",
     msg_id_prefix: "MSG_ID: {id}",
   },
 }

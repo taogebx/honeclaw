@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 
+use hone_core::cloud_runtime::CloudPgRuntime;
 use hone_core::config::{AgentRunnerKind, HoneConfig};
 use hone_core::{ActorIdentity, LlmAuditSink};
 use hone_llm::{LlmProvider, LlmResolver};
@@ -67,10 +68,29 @@ pub struct HoneBotCore {
 impl HoneBotCore {
     /// 从配置创建
     pub fn new(config: HoneConfig) -> Self {
-        let session_storage = SessionStorage::from_storage_config(&config.storage);
-        let conversation_quota_storage =
+        let cloud_pg_runtime = if config.cloud.effective_mode().is_cloud_authoritative()
+            && config.cloud.postgres.is_configured()
+        {
+            CloudPgRuntime::from_cloud_config(&config.cloud)
+        } else {
+            None
+        };
+        let session_storage = if let Some(pg) = cloud_pg_runtime.clone() {
+            SessionStorage::new_cloud(pg).expect("failed to initialize cloud session storage")
+        } else {
+            SessionStorage::from_storage_config(&config.storage)
+        };
+        let conversation_quota_storage = if config.cloud.effective_mode().is_cloud_authoritative()
+            && config.cloud.postgres.is_configured()
+        {
+            ConversationQuotaStorage::new_cloud(
+                cloud_pg_runtime.clone().expect("cloud postgres configured"),
+            )
+            .expect("failed to initialize cloud conversation quota storage")
+        } else {
             ConversationQuotaStorage::new(&config.storage.conversation_quota_dir)
-                .expect("failed to initialize conversation quota storage");
+                .expect("failed to initialize conversation quota storage")
+        };
         let company_profile_storage = CompanyProfileStorage::new(sandbox_base_dir());
         let llm = Self::create_llm_provider(&config);
         let auxiliary_llm = Self::create_auxiliary_llm_provider(&config);
@@ -362,22 +382,48 @@ impl HoneBotCore {
 
         if let Some(actor) = actor.cloned() {
             let sandbox_base = sandbox_base_dir();
-            registry.register(Box::new(hone_tools::LocalListFilesTool::new(
-                sandbox_base.clone(),
-                actor.clone(),
-            )));
-            registry.register(Box::new(hone_tools::LocalSearchFilesTool::new(
-                sandbox_base.clone(),
-                actor.clone(),
-            )));
-            registry.register(Box::new(hone_tools::LocalReadFileTool::new(
-                sandbox_base.clone(),
-                actor.clone(),
-            )));
-            registry.register(Box::new(hone_tools::LocalWriteFileTool::new(
-                sandbox_base,
-                actor.clone(),
-            )));
+            if self.config.cloud.effective_mode().is_cloud_authoritative()
+                && let Some(oss) =
+                    hone_core::cloud_runtime::OssObjectStore::from_config(&self.config.cloud.oss)
+            {
+                registry.register(Box::new(hone_tools::LocalListFilesTool::new_cloud(
+                    sandbox_base.clone(),
+                    actor.clone(),
+                    oss.clone(),
+                )));
+                registry.register(Box::new(hone_tools::LocalSearchFilesTool::new_cloud(
+                    sandbox_base.clone(),
+                    actor.clone(),
+                    oss.clone(),
+                )));
+                registry.register(Box::new(hone_tools::LocalReadFileTool::new_cloud(
+                    sandbox_base.clone(),
+                    actor.clone(),
+                    oss,
+                )));
+                // local_write_file 暂无 cloud 变体, 写入仍走本地 sandbox.
+                registry.register(Box::new(hone_tools::LocalWriteFileTool::new(
+                    sandbox_base,
+                    actor.clone(),
+                )));
+            } else {
+                registry.register(Box::new(hone_tools::LocalListFilesTool::new(
+                    sandbox_base.clone(),
+                    actor.clone(),
+                )));
+                registry.register(Box::new(hone_tools::LocalSearchFilesTool::new(
+                    sandbox_base.clone(),
+                    actor.clone(),
+                )));
+                registry.register(Box::new(hone_tools::LocalReadFileTool::new(
+                    sandbox_base.clone(),
+                    actor.clone(),
+                )));
+                registry.register(Box::new(hone_tools::LocalWriteFileTool::new(
+                    sandbox_base,
+                    actor.clone(),
+                )));
+            }
 
             // image_gen 必须有 actor 才能正确落到 actor sandbox 下的 gen_images
             if self.config.nano_banana.enabled {

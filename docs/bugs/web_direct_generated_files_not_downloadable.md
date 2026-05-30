@@ -1,0 +1,80 @@
+# Bug: Web 直聊生成 Excel/CSV 只回文件名，手机端无法下载或打开
+
+- **发现时间**: 2026-05-21 15:02 CST
+- **Bug Type**: System Error
+- **严重等级**: P2
+- **状态**: Fixed
+- **GitHub Issue**: 无；本单不是 P1，暂不创建。
+
+## 证据来源
+
+- `data/sessions.sqlite3` -> `session_messages`
+  - `session_id=Actor_web__direct__web-user-f40ae1caa720`
+  - `2026-05-21 19:03 CST` 复核：同一会话在 `2026-05-21T16:17:43+08:00` 用户改为要求“你整理成CSV文本”，`2026-05-21T16:18:35+08:00` assistant 已给出可直接复制到 Excel / Numbers 的 CSV 文本。该结果解决了用户侧临时复制需求，但没有证明 Web direct 生成的 `.xlsx` / `.csv` 文件已能以附件、下载 URL 或可点击 artifact 交付，因此本缺陷仍保持 `P2 / New`。
+  - `2026-05-21T14:20:48+08:00`，用户要求把投资策略整理成 Excel 表格，字段包括类型、标的、代码、金额、投入金额时间等。
+  - `2026-05-21T14:23:53+08:00`，assistant final 回复“已整理成 Excel，共三页”，但用户可见正文只给出文件名 `A股三年投资策略表.xlsx`，没有可下载附件或链接。
+  - `2026-05-21T14:27:17+08:00`，用户反馈“我看不到文件”。
+  - `2026-05-21T14:32:38+08:00`，assistant 再次声称已生成 Excel 和 CSV，并只列出 `A股三年投资策略表.xlsx` 与 `A股三年投资策略表.csv`。
+  - `2026-05-21T14:33:15+08:00`，用户仍然看不到，要求改成纯文本表格。
+  - `2026-05-21T14:36:16+08:00` 到 `14:49:24+08:00`，用户尝试询问文件中转站和 Google Drive 连接入口；assistant 继续建议启用连接器或换电脑端，但未能把本轮生成文件交付成手机端可打开的附件。
+- 同窗会话质量对照：
+  - 最近四小时共有 `20` 个 user turn 与 `20` 个 assistant final，Feishu / Web 直聊均有收口。
+  - assistant final 污染扫描未命中空回复、通用失败、绝对路径、工具轨迹、原始 ACP `session/update`、compact marker、`Param Incorrect`、`Resource temporarily unavailable`、`reasoning_content` 或 provider 原始 `quota exhausted`。
+  - 因此本单不是全局直聊失败，而是 Web direct 生成文件后的 artifact / 下载交付链路缺陷。
+- 去重检查：
+  - `web_scheduler_mobile_push_not_delivered.md` 覆盖 Web scheduler 手机系统通知承诺与真实投递能力不一致。
+  - `feishu_company_profile_absolute_path_leak.md` 覆盖本机路径外泄。
+  - 现有台账未覆盖 Web direct 生成 Excel/CSV 后无法以用户可下载文件交付的链路。
+
+## 端到端链路
+
+1. Web direct 用户要求生成 Excel 或 CSV 表格。
+2. agent 在 Web actor sandbox 内尝试生成或查找文件。
+3. 最终回复只把本地文件名写入文本，没有绑定为 Web 前端可见附件、下载 URL 或可点击 artifact。
+4. 用户在手机端只能看到文件名，无法打开或下载。
+5. 后续对话退化为让用户找 Google Drive / Connectors 入口或改用纯文本复制，原本的文件交付目标没有完成。
+
+## 期望效果
+
+- 当 assistant 声称生成 Excel / CSV / PDF / 图片等文件时，Web 用户应能在当前页面直接看到可下载附件、可点击 artifact、或明确的“当前 Web 端不支持文件交付，以下改用纯文本/CSV 文本”的替代输出。
+- 如果当前 Web direct 不具备上传网盘或外部中转能力，assistant 不应反复声称“文件已生成/重新发送”但只给文件名。
+- 移动端和桌面端都应有一致、可验证的文件交付反馈。
+
+## 当前实现效果
+
+- assistant final 多次只返回文件名，未形成手机端可点击下载入口。
+- 用户连续反馈看不到文件，说明从用户视角任务未完成。
+- assistant 后续建议连接 Google Drive，但用户当前 Web 手机端没有可见连接器入口；这仍不能交付已经生成的文件。
+
+## 用户影响
+
+- 这是功能性 bug，不是单纯表达质量问题。
+- 用户要求的是可打开的 Excel/CSV 文件，最终只能拿到文件名或纯文本替代方案，核心交付物不可用。
+- 定级为 `P2`：它会阻断 Web direct 的文件产出交付链路，影响用户完成任务；但不涉及跨用户错投、数据破坏、系统级未回复或批量消息投递失败，因此不定为 P1。
+
+## 根因判断
+
+- 初步判断是 Web direct 的 agent sandbox 文件与用户可见 artifact / 附件系统之间没有稳定桥接。
+- 回复层缺少“文件已生成但无法投递”的能力边界判断，导致 assistant 把本地文件名当成交付结果。
+- Google Drive / 外部中转能力也没有在当前 Web 手机端形成可用入口，不能作为默认兜底。
+
+## 修复记录
+
+- `2026-05-21 20:09 CST` 已修复：
+  - Web direct 成功回复在落库前会扫描本轮新生成、且 final 正文提到文件名的 actor sandbox 文件，并追加 `[附件: <path>]` marker。
+  - public history 既有附件抽取逻辑会把 marker 转成附件 metadata，前端可渲染文件卡片。
+  - 前端非图片附件卡片现在使用 `/api/public/file?path=...` 下载链接，移动端和桌面端都能从当前聊天页打开或下载文件。
+  - 扫描只接受本轮新近生成的白名单扩展名文件，并限制数量 / 深度，避免把 sandbox 旧文件或无关文件误挂到新回复。
+
+## 验证
+
+- `cargo test -p hone-channels web_generated_file_is_attached -- --nocapture`
+- `cargo test -p hone-channels stale_sandbox_files_are_not_attached -- --nocapture`
+- `cargo check -p hone-channels --tests`
+- `rustfmt --edition 2024 --config skip_children=true --check crates/hone-channels/src/agent_session/artifacts.rs crates/hone-channels/src/agent_session/core.rs crates/hone-channels/src/agent_session/mod.rs`
+- 前端 `bun` 当前机器不可用，未能执行 `bun run test:web` / `bun run typecheck:web`；本轮已做 TSX 静态复核，下载链接改动局限于 `FileCard` 非图片附件渲染。
+
+## 下一步建议
+
+- 后续可在 SSE `run_finished` 事件中同步携带附件 metadata，减少等待 history restore 才出现文件卡片的延迟。
+- 如未来支持外部网盘 / connector 上传，可在当前附件 marker 之外增加外部 URL metadata，但不应把 Google Drive 作为默认兜底。

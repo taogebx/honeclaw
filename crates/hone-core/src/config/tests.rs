@@ -25,6 +25,7 @@ fn assert_config_example_roots(root: &serde_yaml::Mapping) {
     let expected_roots = [
         "admins",
         "agent",
+        "cloud",
         "discord",
         "event_engine",
         "feishu",
@@ -140,6 +141,170 @@ fn assert_config_example_multi_agent_fallback_docs(example: &str) {
     );
 }
 
+fn assert_openrouter_provider_key_pool_docs(label: &str, doc: &str) {
+    assert!(
+        doc.contains("llm.providers.openrouter.api_key/api_keys"),
+        "{label} should document the OpenRouter provider key pool as api_key/api_keys"
+    );
+    assert!(
+        doc.contains("legacy single-key") || doc.contains("legacy `llm.openrouter.*`"),
+        "{label} should document the legacy OpenRouter single-key fallback"
+    );
+}
+
+fn assert_profile_exists(config: &HoneConfig, field: &str, profile_name: &str) {
+    let trimmed = profile_name.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    assert!(
+        config.llm.profiles.contains_key(trimmed),
+        "{field} references missing llm.profiles.{trimmed}"
+    );
+}
+
+fn assert_config_example_profile_refs(config: &HoneConfig) {
+    assert_profile_exists(config, "llm.default_profile", &config.llm.default_profile);
+    assert_profile_exists(
+        config,
+        "llm.auxiliary_profile",
+        &config.llm.auxiliary_profile,
+    );
+    assert_profile_exists(
+        config,
+        "event_engine.news_classifier_llm",
+        &config.event_engine.news_classifier_llm,
+    );
+    assert_profile_exists(
+        config,
+        "event_engine.renderer.polish_llm",
+        &config.event_engine.renderer.polish_llm,
+    );
+    assert_profile_exists(
+        config,
+        "event_engine.earnings.quality_review.llm",
+        &config.event_engine.earnings.quality_review.llm,
+    );
+    assert_profile_exists(
+        config,
+        "event_engine.sec_filings.enrichment.llm",
+        &config.event_engine.sec_filings.enrichment.llm,
+    );
+    assert_profile_exists(
+        config,
+        "event_engine.global_digest.pass1_llm",
+        &config.event_engine.global_digest.pass1_llm,
+    );
+    assert_profile_exists(
+        config,
+        "event_engine.global_digest.pass2_llm",
+        &config.event_engine.global_digest.pass2_llm,
+    );
+    assert_profile_exists(
+        config,
+        "event_engine.global_digest.event_dedupe_llm",
+        &config.event_engine.global_digest.event_dedupe_llm,
+    );
+    assert_profile_exists(
+        config,
+        "event_engine.global_digest.mainline_distill_llm",
+        &config.event_engine.global_digest.mainline_distill_llm,
+    );
+}
+
+fn assert_config_example_profile_providers_exist(config: &HoneConfig) {
+    for (profile_name, profile) in &config.llm.profiles {
+        let provider_name = profile.provider.trim();
+        assert!(
+            !provider_name.is_empty(),
+            "llm.profiles.{profile_name}.provider should not be empty in config.example.yaml"
+        );
+        assert!(
+            config.llm.providers.contains_key(provider_name),
+            "llm.profiles.{profile_name}.provider references missing llm.providers.{provider_name}"
+        );
+    }
+}
+
+fn assert_config_example_agent_defaults(config: &HoneConfig) {
+    assert_eq!(config.agent.runner, "hone_cloud");
+    assert_eq!(config.agent.hone_cloud.base_url, "https://hone-claw.com");
+    assert_eq!(config.agent.hone_cloud.model, "hone-cloud");
+    assert!(config.agent.hone_cloud.api_key.is_empty());
+    assert!(config.agent.opencode.model.is_empty());
+    assert!(config.agent.opencode.api_base_url.is_empty());
+    assert!(config.agent.opencode.api_key.is_empty());
+}
+
+fn assert_config_example_storage_defaults(config: &HoneConfig) {
+    assert_eq!(config.storage.sessions_dir, "./data/sessions");
+    assert_eq!(
+        config.storage.session_sqlite_db_path,
+        "./data/sessions.sqlite3"
+    );
+    assert!(config.storage.session_sqlite_shadow_write_enabled);
+    assert_eq!(config.storage.session_runtime_backend, "json");
+    assert_eq!(
+        config.storage.conversation_quota_dir,
+        "./data/conversation_quota"
+    );
+}
+
+fn assert_config_example_llm_profiles(config: &HoneConfig) {
+    assert_eq!(config.llm.default_profile, "main");
+    assert_eq!(config.llm.auxiliary_profile, "aux");
+    for profile_name in ["main", "aux", "digest_fast", "digest_strong"] {
+        assert!(
+            config.llm.profiles.contains_key(profile_name),
+            "config.example.yaml should include llm.profiles.{profile_name}"
+        );
+    }
+    assert_config_example_profile_refs(config);
+    assert_config_example_profile_providers_exist(config);
+}
+
+fn assert_config_example_event_engine_defaults(config: &HoneConfig, raw: &str) {
+    assert!(
+        !raw.contains("x-ai/grok-4.1-fast"),
+        "config.example.yaml must not point event-engine defaults at the deprecated Grok 4.1 Fast model"
+    );
+    assert_eq!(config.event_engine.news_classifier_model, "x-ai/grok-4.3");
+    assert_eq!(
+        config.event_engine.earnings.quality_review.model,
+        "x-ai/grok-4.3"
+    );
+    assert_eq!(
+        config.event_engine.sec_filings.enrichment.model,
+        "x-ai/grok-4.3"
+    );
+    assert_eq!(
+        config.event_engine.global_digest.pass1_model,
+        "x-ai/grok-4.3"
+    );
+    assert_eq!(
+        config.event_engine.global_digest.pass2_model,
+        "x-ai/grok-4.3"
+    );
+    assert_eq!(
+        config.event_engine.global_digest.event_dedupe_model,
+        "x-ai/grok-4.3"
+    );
+    assert_eq!(
+        config
+            .llm
+            .profiles
+            .get("mainline_short")
+            .expect("mainline_short profile")
+            .model,
+        "x-ai/grok-4.3"
+    );
+    assert_eq!(
+        config.event_engine.news_importance_prompt,
+        "公司或潜在影响公司长期逻辑和宏观叙事的重大事件"
+    );
+    assert_eq!(config.event_engine.sources.rss_feeds.len(), 3);
+}
+
 fn assert_config_example_storage_and_logging(root: &serde_yaml::Mapping) {
     let storage = yaml_key(root, "storage").unwrap().as_mapping().unwrap();
     assert!(!yaml_has_key(storage, "base_path"));
@@ -176,6 +341,14 @@ fn assert_config_example_public_auth_env_docs(example: &str) {
         "config.example.yaml should not claim every token is config-owned"
     );
     assert!(
+        !example.contains("public login whitelist"),
+        "config.example.yaml should describe public-login admission as an invite list"
+    );
+    assert!(
+        example.contains("public-login invite list"),
+        "config.example.yaml should document that admin invite users are the public-login invite list"
+    );
+    assert!(
         example.contains("public SMS/Captcha"),
         "config.example.yaml should call out public auth runtime env"
     );
@@ -200,6 +373,215 @@ fn assert_config_example_public_auth_env_docs(example: &str) {
         assert!(
             example.contains(env_name),
             "config.example.yaml should document public auth env {env_name}"
+        );
+    }
+
+    assert!(
+        example.contains("HONE_PUBLIC_SECURE_COOKIE=true/1/yes or false/0/no"),
+        "config.example.yaml should document accepted secure-cookie override values"
+    );
+    assert!(
+        example.contains("invalid values keep Secure=true"),
+        "config.example.yaml should document secure-cookie safety fallback"
+    );
+}
+
+fn assert_public_auth_runbook_env_docs(runbook: &str) {
+    assert!(
+        runbook.contains("Public Auth Runtime Env"),
+        "backend deployment runbook should keep a public auth env section"
+    );
+    assert!(
+        runbook.contains("public-login invite-list admission source"),
+        "backend deployment runbook should document the invite-list admission source"
+    );
+    for env_name in [
+        "ALIBABA_CLOUD_ACCESS_KEY_ID",
+        "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
+        "HONE_ALIYUN_SMS_ENDPOINT",
+        "HONE_ALIYUN_SMS_COUNTRY_CODE",
+        "HONE_ALIYUN_SMS_SIGN_NAME",
+        "HONE_ALIYUN_SMS_TEMPLATE_CODE",
+        "HONE_ALIYUN_SMS_TEMPLATE_PARAM",
+        "HONE_ALIYUN_CAPTCHA_PREFIX",
+        "HONE_ALIYUN_CAPTCHA_SCENE_ID",
+        "HONE_ALIYUN_CAPTCHA_REGION",
+        "HONE_ALIYUN_CAPTCHA_ENDPOINT",
+        "HONE_ALIYUN_CAPTCHA_ENABLED",
+        "HONE_PUBLIC_SECURE_COOKIE",
+    ] {
+        assert!(
+            runbook.contains(env_name),
+            "backend deployment runbook should document public auth env {env_name}"
+        );
+    }
+    for accepted_value in ["true", "1", "yes", "false", "0", "no"] {
+        assert!(
+            runbook.contains(accepted_value),
+            "backend deployment runbook should document secure-cookie value {accepted_value}"
+        );
+    }
+    assert!(
+        runbook.contains("Invalid non-empty values intentionally keep `Secure=true`"),
+        "backend deployment runbook should document secure-cookie safety fallback"
+    );
+}
+
+fn assert_session_sqlite_runbook_runtime_docs(runbook: &str) {
+    assert!(
+        runbook.contains("`storage.session_runtime_backend` 决定"),
+        "session SQLite runbook should describe the runtime backend switch"
+    );
+    assert!(
+        runbook.contains("`json`：运行时读取 `data/sessions/*.json`"),
+        "session SQLite runbook should document the JSON runtime read path"
+    );
+    assert!(
+        runbook.contains("`sqlite`：运行时读取 `storage.session_sqlite_db_path`"),
+        "session SQLite runbook should document the SQLite runtime read path"
+    );
+    assert!(
+        !runbook.contains("SQLite 只是额外镜像，不参与线上请求"),
+        "session SQLite runbook should not claim SQLite is never in the online request path"
+    );
+    assert!(
+        !runbook.contains("Web/API 读路径改造"),
+        "session SQLite runbook should not claim Web/API read path work is still pending"
+    );
+    assert!(
+        runbook.contains("当 `session_runtime_backend: \"json\"` 时，SQLite 影子库不是线上真相源"),
+        "session SQLite runbook should scope shadow-store risk to JSON runtime"
+    );
+    assert!(
+        runbook.contains("当 `session_runtime_backend: \"sqlite\"` 时，SQLite 是运行时读路径"),
+        "session SQLite runbook should document SQLite runtime risk"
+    );
+}
+
+fn assert_opencode_runbook_config_file_docs(runbook: &str) {
+    assert!(
+        runbook.contains("~/.config/opencode/opencode.json"),
+        "OpenCode setup runbook should document the JSON config file path"
+    );
+    assert!(
+        runbook.contains("opencode.jsonc"),
+        "OpenCode setup runbook should document the JSONC config file path"
+    );
+}
+
+fn assert_wiki_config_overview_matches_current_schema(wiki: &str) {
+    for expected in [
+        "`daily_conversation_limit`",
+        "`conversation_quota_dir`",
+        "`llm_audit_db_path`",
+        "`notif_prefs_dir`",
+        "`event_engine.*`",
+        "`cloud.strict_no_local_storage`",
+        "`HONE_CLOUD_STRICT_NO_LOCAL_STORAGE`",
+        "`language`",
+    ] {
+        assert!(
+            wiki.contains(expected),
+            "docs/wiki.md config overview should mention {expected}"
+        );
+    }
+    assert!(
+        wiki.contains("public-login invite-list admission source"),
+        "docs/wiki.md should align public auth config notes with the invite-list admission source"
+    );
+}
+
+fn assert_cloud_config_runtime_docs(label: &str, doc: &str) {
+    assert!(
+        doc.contains("cloud.enabled") && doc.contains("HONE_CLOUD_ENABLED"),
+        "{label} should document effective cloud enablement"
+    );
+    assert!(
+        doc.contains("cloud.strict_no_local_storage")
+            && doc.contains("HONE_CLOUD_STRICT_NO_LOCAL_STORAGE"),
+        "{label} should document strict local-storage enforcement"
+    );
+}
+
+fn assert_search_config_runtime_docs(label: &str, doc: &str) {
+    assert!(
+        doc.contains("search.api_keys") && doc.contains("search.max_results"),
+        "{label} should document active Tavily search config fields"
+    );
+    assert!(
+        doc.contains("search.search_depth") && doc.contains("not wired"),
+        "{label} should mark search depth/topic/provider as schema fields until runtime wiring exists"
+    );
+}
+
+fn assert_logging_udp_docs_match_runtime(label: &str, doc: &str) {
+    assert!(
+        doc.contains("logging.udp_port") || doc.contains("udp_port"),
+        "{label} should document the UDP logging config field"
+    );
+    assert!(
+        doc.contains("18118") && doc.contains("no config-level disable"),
+        "{label} should document that null uses the default UDP logging port today"
+    );
+}
+
+fn assert_logging_sink_docs_match_runtime(label: &str, doc: &str) {
+    assert!(
+        doc.contains("logging.console") || doc.contains("console"),
+        "{label} should document the logging console field"
+    );
+    assert!(
+        doc.contains("logging.file") || doc.contains("file"),
+        "{label} should document the logging file field"
+    );
+    assert!(
+        doc.contains("parsed compatibility fields") || doc.contains("Parsed for compatibility"),
+        "{label} should not imply logging.console/logging.file are active sinks today"
+    );
+}
+
+fn assert_technical_spec_config_sections_match_roots(technical_spec: &str) {
+    for expected in [
+        "- `llm`",
+        "- `agent`",
+        "- `imessage`",
+        "- `feishu`",
+        "- `telegram`",
+        "- `discord`",
+        "- `group_context`",
+        "- `nano_banana`",
+        "- `fmp`",
+        "- `search`",
+        "- `storage`",
+        "- `cloud`",
+        "- `logging`",
+        "- `admins`",
+        "- `web`",
+        "- `security`",
+        "- `event_engine`",
+        "- `language`",
+    ] {
+        assert!(
+            technical_spec.contains(expected),
+            "docs/technical-spec.md key config sections should mention {expected}"
+        );
+    }
+}
+
+fn assert_technical_spec_storage_keys_match_schema(technical_spec: &str) {
+    for expected in [
+        "`sessions_dir`: `./data/sessions`",
+        "`session_sqlite_db_path`: `./data/sessions.sqlite3`",
+        "`portfolio_dir`: `./data/portfolio`",
+        "`cron_jobs_dir`: `./data/cron_jobs`",
+        "`gen_images_dir`: `./data/gen_images`",
+        "`notif_prefs_dir`: `./data/notif_prefs`",
+        "`conversation_quota_dir`: `./data/conversation_quota`",
+        "`llm_audit_db_path`: `./data/llm_audit.sqlite3`",
+    ] {
+        assert!(
+            technical_spec.contains(expected),
+            "docs/technical-spec.md storage overview should mention {expected}"
         );
     }
 }
@@ -350,6 +732,14 @@ fn assert_legacy_agent_migration_config(config: &HoneConfig) {
     assert_eq!(config.discord.chat_scope, ChatScope::All);
 }
 
+fn repo_file(path: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("hone-core crate lives under crates/")
+        .join(path)
+}
+
 #[test]
 fn default_config_sets_current_llm_defaults() {
     let config = HoneConfig::default();
@@ -379,42 +769,32 @@ llm:
 
 #[test]
 fn config_example_yaml_matches_current_schema() {
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("hone-core crate lives under crates/");
-    let raw = std::fs::read_to_string(repo_root.join("config.example.yaml")).unwrap();
+    let raw = std::fs::read_to_string(repo_file("config.example.yaml")).unwrap();
     let config: HoneConfig = serde_yaml::from_str(&raw).unwrap();
 
-    assert_eq!(config.agent.runner, "hone_cloud");
-    assert_eq!(config.agent.hone_cloud.base_url, "https://hone-claw.com");
-    assert_eq!(config.agent.hone_cloud.model, "hone-cloud");
-    assert!(config.agent.hone_cloud.api_key.is_empty());
-    assert!(config.agent.opencode.model.is_empty());
-    assert!(config.agent.opencode.api_base_url.is_empty());
-    assert!(config.agent.opencode.api_key.is_empty());
-    assert_eq!(config.storage.sessions_dir, "./data/sessions");
-    assert_eq!(
-        config.storage.session_sqlite_db_path,
-        "./data/sessions.sqlite3"
+    assert_config_example_agent_defaults(&config);
+    assert_config_example_storage_defaults(&config);
+    assert_config_example_llm_profiles(&config);
+    assert_config_example_event_engine_defaults(&config, &raw);
+}
+
+#[test]
+fn event_engine_default_models_avoid_deprecated_grok41_fast() {
+    let config = HoneConfig::default();
+    let deprecated = "x-ai/grok-4.1-fast";
+
+    assert_ne!(config.event_engine.news_classifier_model, deprecated);
+    assert_ne!(
+        config.event_engine.earnings.quality_review.model,
+        deprecated
     );
-    assert!(config.storage.session_sqlite_shadow_write_enabled);
-    assert_eq!(config.storage.session_runtime_backend, "json");
-    assert_eq!(
-        config.storage.conversation_quota_dir,
-        "./data/conversation_quota"
+    assert_ne!(config.event_engine.sec_filings.enrichment.model, deprecated);
+    assert_ne!(config.event_engine.global_digest.pass1_model, deprecated);
+    assert_ne!(config.event_engine.global_digest.pass2_model, deprecated);
+    assert_ne!(
+        config.event_engine.global_digest.event_dedupe_model,
+        deprecated
     );
-    assert_eq!(config.llm.default_profile, "main");
-    assert_eq!(config.llm.auxiliary_profile, "aux");
-    assert!(config.llm.profiles.contains_key("main"));
-    assert!(config.llm.profiles.contains_key("aux"));
-    assert!(config.llm.profiles.contains_key("digest_fast"));
-    assert!(config.llm.profiles.contains_key("digest_strong"));
-    assert_eq!(
-        config.event_engine.news_importance_prompt,
-        "公司或潜在影响公司长期逻辑和宏观叙事的重大事件"
-    );
-    assert_eq!(config.event_engine.sources.rss_feeds.len(), 3);
 }
 
 #[test]
@@ -433,7 +813,7 @@ llm:
   profiles:
     digest_strong:
       provider: openrouter
-      model: x-ai/grok-4.1-fast
+      model: x-ai/grok-4.3
       params:
         max_tokens: 1200
         temperature: 0.2
@@ -461,7 +841,7 @@ llm:
 
     let profile = config.llm.profiles.get("digest_strong").unwrap();
     assert_eq!(profile.provider, "openrouter");
-    assert_eq!(profile.model, "x-ai/grok-4.1-fast");
+    assert_eq!(profile.model, "x-ai/grok-4.3");
     assert_eq!(profile.params.max_tokens, Some(1200));
     assert_eq!(profile.params.temperature, Some(0.2));
     assert_eq!(
@@ -648,6 +1028,54 @@ custom_section:
             .and_then(|m| m.get(Value::String("keep".to_string())))
             .and_then(|v| v.as_str()),
         Some("overlay")
+    );
+}
+
+#[test]
+fn read_yaml_value_reports_path_for_missing_file() {
+    let dir = temp_test_dir("missing-file");
+    let config_path = dir.join("missing-config.yaml");
+
+    let error = read_yaml_value(&config_path).unwrap_err().to_string();
+
+    assert!(error.contains("无法读取配置文件"), "error={error}");
+    assert!(
+        error.contains(&config_path.display().to_string()),
+        "error={error}"
+    );
+}
+
+#[test]
+fn read_yaml_value_reports_path_for_parse_error() {
+    let dir = temp_test_dir("parse-error");
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, "agent:\n  runner: [").unwrap();
+
+    let error = read_yaml_value(&config_path).unwrap_err().to_string();
+
+    assert!(error.contains("配置文件解析失败"), "error={error}");
+    assert!(
+        error.contains(&config_path.display().to_string()),
+        "error={error}"
+    );
+}
+
+#[test]
+fn write_overlay_patch_reports_path_for_directory_errors() {
+    let dir = temp_test_dir("overlay-dir-error");
+    let file_as_parent = dir.join("not-a-dir");
+    std::fs::write(&file_as_parent, "plain file").unwrap();
+    let overlay_path = file_as_parent.join("config.overrides.yaml");
+    let patch: Value = serde_yaml::from_str("agent:\n  runner: codex_cli\n").unwrap();
+
+    let error = write_overlay_patch(&overlay_path, Some(patch))
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("创建配置目录失败"), "error={error}");
+    assert!(
+        error.contains(&file_as_parent.display().to_string()),
+        "error={error}"
     );
 }
 
@@ -1164,8 +1592,8 @@ fn apply_overlay_mutations_unset_removes_from_overlay() {
     assert!(!overlay_path.exists());
 
     // effective 回到 base 值
-    let cfg = HoneConfig::from_file(&config_path).unwrap();
-    assert!(!cfg.event_engine.global_digest.enabled);
+    let config = HoneConfig::from_file(&config_path).unwrap();
+    assert!(!config.event_engine.global_digest.enabled);
 }
 
 #[test]
@@ -1247,6 +1675,29 @@ agent:
     assert_eq!(
         std::fs::read_to_string(runtime_dir.join("soul.md")).unwrap(),
         "prompt"
+    );
+}
+
+#[test]
+fn seed_canonical_config_reports_path_for_directory_errors() {
+    let dir = temp_test_dir("seed-dir-error");
+    let source = dir.join("source.yaml");
+    let file_as_parent = dir.join("not-a-dir");
+    let canonical = file_as_parent.join("config.yaml");
+    std::fs::write(&source, "agent:\n  runner: codex_cli\n").unwrap();
+    std::fs::write(&file_as_parent, "plain file").unwrap();
+
+    let error = seed_canonical_config_from_source(&canonical, &source)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains("创建 canonical 配置目录失败"),
+        "error={error}"
+    );
+    assert!(
+        error.contains(&file_as_parent.display().to_string()),
+        "error={error}"
     );
 }
 
@@ -1544,8 +1995,7 @@ fn language_mutation_round_trip() {
 
 #[test]
 fn config_example_avoids_stale_config_knobs() {
-    let example_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config.example.yaml");
-    let example = std::fs::read_to_string(example_path).unwrap();
+    let example = std::fs::read_to_string(repo_file("config.example.yaml")).unwrap();
     let root_value: Value = serde_yaml::from_str(&example).unwrap();
     HoneConfig::from_merged_value(root_value.clone()).unwrap();
     let root = root_value.as_mapping().unwrap();
@@ -1561,6 +2011,51 @@ fn config_example_avoids_stale_config_knobs() {
     assert_config_example_event_sections(root);
     assert_config_example_agent_section(root);
     assert_config_example_multi_agent_fallback_docs(&example);
+    assert_openrouter_provider_key_pool_docs("config.example.yaml", &example);
     assert_config_example_storage_and_logging(root);
     assert_config_example_public_auth_env_docs(&example);
+    assert_search_config_runtime_docs("config.example.yaml", &example);
+    assert_cloud_config_runtime_docs("config.example.yaml", &example);
+    assert_logging_udp_docs_match_runtime("config.example.yaml", &example);
+    assert_logging_sink_docs_match_runtime("config.example.yaml", &example);
+
+    let wiki = std::fs::read_to_string(repo_file("docs/wiki.md")).unwrap();
+    assert_openrouter_provider_key_pool_docs("docs/wiki.md", &wiki);
+    assert_wiki_config_overview_matches_current_schema(&wiki);
+    assert_search_config_runtime_docs("docs/wiki.md", &wiki);
+    assert_logging_udp_docs_match_runtime("docs/wiki.md", &wiki);
+    assert_logging_sink_docs_match_runtime("docs/wiki.md", &wiki);
+    assert_cloud_config_runtime_docs("docs/wiki.md", &wiki);
+
+    let readme_en = std::fs::read_to_string(repo_file("README_EN.md")).unwrap();
+    assert_openrouter_provider_key_pool_docs("README_EN.md", &readme_en);
+
+    let technical_spec = std::fs::read_to_string(repo_file("docs/technical-spec.md")).unwrap();
+    assert_openrouter_provider_key_pool_docs("docs/technical-spec.md", &technical_spec);
+    assert_technical_spec_config_sections_match_roots(&technical_spec);
+    assert_search_config_runtime_docs("docs/technical-spec.md", &technical_spec);
+    assert_cloud_config_runtime_docs("docs/technical-spec.md", &technical_spec);
+    assert_logging_udp_docs_match_runtime("docs/technical-spec.md", &technical_spec);
+    assert_logging_sink_docs_match_runtime("docs/technical-spec.md", &technical_spec);
+    assert_technical_spec_storage_keys_match_schema(&technical_spec);
+
+    let backend_runbook =
+        std::fs::read_to_string(repo_file("docs/runbooks/backend-deployment.md")).unwrap();
+    assert_public_auth_runbook_env_docs(&backend_runbook);
+
+    let session_sqlite_runbook =
+        std::fs::read_to_string(repo_file("docs/runbooks/session-sqlite-shadow-backfill.md"))
+            .unwrap();
+    assert_session_sqlite_runbook_runtime_docs(&session_sqlite_runbook);
+
+    let opencode_runbook =
+        std::fs::read_to_string(repo_file("docs/runbooks/opencode-setup.md")).unwrap();
+    assert_opencode_runbook_config_file_docs(&opencode_runbook);
+
+    let install_runbook =
+        std::fs::read_to_string(repo_file("docs/runbooks/hone-cli-install-and-start.md")).unwrap();
+    assert_openrouter_provider_key_pool_docs(
+        "docs/runbooks/hone-cli-install-and-start.md",
+        &install_runbook,
+    );
 }

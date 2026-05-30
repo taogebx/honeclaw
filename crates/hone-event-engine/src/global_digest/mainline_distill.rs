@@ -5,8 +5,7 @@
 //! 设计要点:
 //! - **read-only on profile.md**:本模块只读用户画像,不改;写出方向只到 prefs。
 //! - **per-actor**:每个有 portfolio 的 actor 跑一次,扫他的 sandbox profile 目录。
-//! - **失败降级**:任一 ticker 蒸馏失败 → 跳过该 ticker(保留旧主线不变),
-//!   不让一个失败影响其他 ticker。
+//! - **失败降级**:任一 ticker 蒸馏失败 → 标入 skipped,继续处理其他 ticker。
 //! - **整文喂 LLM**:不靠 section header 切分(framework 允许 agent 把用户视角
 //!   合并到主线主文 / 单列 用户视角 / 日期 update log,各种写法都常见),
 //!   POC 验证整文喂 grok 1-2k tokens 完全 OK。
@@ -56,7 +55,7 @@ pub trait MainlineDistiller: Send + Sync {
     async fn distill_style(&self, all_profiles: &[ProfileSource]) -> anyhow::Result<String>;
 }
 
-/// LLM 实现 —— 默认走 grok-4.1-fast(POC 验证质量好,速度可接受)。
+/// LLM 实现 —— 默认走当前 OpenRouter 可用的 grok 级模型。
 pub struct LlmMainlineDistiller {
     provider: Arc<dyn LlmProvider>,
     model: String,
@@ -300,7 +299,7 @@ fn is_plausible_ticker(raw_ticker: &str) -> bool {
 /// 行为:
 /// 1. scan_profiles(sandbox_root, Some(holdings)) → ProfileSource 列表
 /// 2. 并发蒸馏每只 ticker 的主线(任一失败 → 加入 skipped,继续)
-/// 3. 用全部 profile 蒸馏一条整体风格(失败 → None,不影响主线)
+/// 3. 用全部 profile 蒸馏一条整体风格(失败 → None,merge 时保留旧 style)
 /// 4. 返回 DistilledMainlines(可序列化,调用方 merge 进 prefs JSON)
 pub async fn distill_for_actor(
     distiller: &dyn MainlineDistiller,
@@ -319,36 +318,39 @@ pub async fn distill_for_actor(
 
     // 并发蒸主线(每个独立 LLM call)
     use futures::stream::{self, StreamExt};
-    let results: Vec<(String, anyhow::Result<String>)> = stream::iter(profiles.iter().cloned())
-        .map(|profile| async move {
-            let distill_result = distiller
-                .distill_mainline(&profile.ticker, &profile.markdown)
-                .await;
-            (profile.ticker, distill_result)
-        })
-        .buffer_unordered(6)
-        .collect()
-        .await;
+    let ticker_distill_results: Vec<(String, anyhow::Result<String>)> =
+        stream::iter(profiles.iter().cloned())
+            .map(|profile| async move {
+                let distill_result = distiller
+                    .distill_mainline(&profile.ticker, &profile.markdown)
+                    .await;
+                (profile.ticker, distill_result)
+            })
+            .buffer_unordered(6)
+            .collect()
+            .await;
 
     let mut by_ticker: HashMap<String, String> = HashMap::new();
-    let mut skipped: Vec<String> = Vec::new();
-    for (ticker, distill_result) in results {
+    let mut skipped_tickers: Vec<String> = Vec::new();
+    for (ticker, distill_result) in ticker_distill_results {
         match distill_result {
             Ok(mainline) => {
                 by_ticker.insert(ticker, mainline);
             }
             Err(e) => {
                 tracing::warn!(ticker = %ticker, "mainline distill failed: {e}");
-                skipped.push(ticker);
+                skipped_tickers.push(ticker);
             }
         }
     }
     // holdings 里没有 profile 的 ticker 也算 skipped
-    let covered: std::collections::HashSet<String> = by_ticker.keys().cloned().collect();
+    let distilled_tickers: std::collections::HashSet<String> = by_ticker.keys().cloned().collect();
     for holding_ticker in holdings {
         let normalized_ticker = holding_ticker.to_uppercase();
-        if !covered.contains(&normalized_ticker) && !skipped.contains(&normalized_ticker) {
-            skipped.push(normalized_ticker);
+        if !distilled_tickers.contains(&normalized_ticker)
+            && !skipped_tickers.contains(&normalized_ticker)
+        {
+            skipped_tickers.push(normalized_ticker);
         }
     }
 
@@ -364,7 +366,7 @@ pub async fn distill_for_actor(
         by_ticker,
         style,
         last_distilled_at: Some(Utc::now()),
-        skipped_tickers: skipped,
+        skipped_tickers,
     }
 }
 
@@ -393,11 +395,12 @@ pub async fn distill_and_persist_one(
 /// 把蒸馏结果合并写回 actor 的 NotificationPrefs 文件。
 ///
 /// 行为:
-/// - 如果 `by_ticker` 非空 → 覆盖整个 `mainline_by_ticker` 字段(系统全权管)
-/// - 如果 `by_ticker` 为空(扫不到任何画像) → **不覆盖** 现有主线,只更新 last_distilled_at
-///   和 skipped 列表。这样用户单次画像目录被误删不会立刻丢历史主线。
-/// - `style` 同样:有就覆盖,无就保留旧的
-/// - 总是更新 `last_mainline_distilled_at` 和 `mainline_distill_skipped`
+/// - 如果 `by_ticker` 非空 → 覆盖整个 `mainline_by_ticker` 字段(系统全权管)。
+/// - 如果 `by_ticker` 为空(没有可写入的新主线) → **不覆盖** 现有主线,只更新
+///   distill 时间和 skipped 列表。这样用户单次画像目录被误删不会立刻丢历史主线。
+/// - `style` 同样:有就覆盖,无就保留旧的。
+/// - `last_mainline_distilled_at` 只在结果携带时间戳时更新;`mainline_distill_skipped`
+///   每次 merge 都替换为本轮 skipped 列表。
 ///
 /// 返回写入后的 prefs 副本。
 pub fn merge_into_prefs(
@@ -577,12 +580,12 @@ mod tests {
             fail_for_ticker: None,
         };
         let holdings = vec!["MU".to_string(), "RKLB".to_string()];
-        let result = distill_for_actor(&distiller, dir.path(), &holdings).await;
-        assert_eq!(result.by_ticker.len(), 2);
-        assert_eq!(result.by_ticker["MU"], "mainline for MU");
-        assert!(result.style.is_some());
-        assert!(result.last_distilled_at.is_some());
-        assert!(result.skipped_tickers.is_empty());
+        let distilled = distill_for_actor(&distiller, dir.path(), &holdings).await;
+        assert_eq!(distilled.by_ticker.len(), 2);
+        assert_eq!(distilled.by_ticker["MU"], "mainline for MU");
+        assert!(distilled.style.is_some());
+        assert!(distilled.last_distilled_at.is_some());
+        assert!(distilled.skipped_tickers.is_empty());
         assert_eq!(distiller.mainline_calls.load(Ordering::SeqCst), 2);
         assert_eq!(distiller.style_calls.load(Ordering::SeqCst), 1);
     }
@@ -603,10 +606,10 @@ mod tests {
             fail_for_ticker: Some("MU".into()),
         };
         let holdings = vec!["MU".to_string(), "RKLB".to_string()];
-        let result = distill_for_actor(&distiller, dir.path(), &holdings).await;
-        assert_eq!(result.by_ticker.len(), 1);
-        assert_eq!(result.by_ticker["RKLB"], "mainline for RKLB");
-        assert!(result.skipped_tickers.contains(&"MU".to_string()));
+        let distilled = distill_for_actor(&distiller, dir.path(), &holdings).await;
+        assert_eq!(distilled.by_ticker.len(), 1);
+        assert_eq!(distilled.by_ticker["RKLB"], "mainline for RKLB");
+        assert!(distilled.skipped_tickers.contains(&"MU".to_string()));
     }
 
     #[tokio::test]
@@ -624,9 +627,9 @@ mod tests {
             fail_for_ticker: None,
         };
         let holdings = vec!["MU".to_string(), "AAPL".to_string()];
-        let result = distill_for_actor(&distiller, dir.path(), &holdings).await;
-        assert_eq!(result.by_ticker.len(), 1);
-        assert!(result.skipped_tickers.contains(&"AAPL".to_string()));
+        let distilled = distill_for_actor(&distiller, dir.path(), &holdings).await;
+        assert_eq!(distilled.by_ticker.len(), 1);
+        assert!(distilled.skipped_tickers.contains(&"AAPL".to_string()));
     }
 
     #[tokio::test]
@@ -638,10 +641,10 @@ mod tests {
             fail_for_ticker: None,
         };
         let holdings = vec!["MU".to_string()];
-        let result = distill_for_actor(&distiller, dir.path(), &holdings).await;
-        assert!(result.by_ticker.is_empty());
-        assert!(result.style.is_none());
-        assert!(result.skipped_tickers.contains(&"MU".to_string()));
+        let distilled = distill_for_actor(&distiller, dir.path(), &holdings).await;
+        assert!(distilled.by_ticker.is_empty());
+        assert!(distilled.style.is_none());
+        assert!(distilled.skipped_tickers.contains(&"MU".to_string()));
         assert_eq!(distiller.mainline_calls.load(Ordering::SeqCst), 0);
         assert_eq!(distiller.style_calls.load(Ordering::SeqCst), 0);
     }
@@ -745,11 +748,11 @@ mod tests {
             captured_prompt: std::sync::Mutex::new(None),
         });
         let distiller = LlmMainlineDistiller::new(provider.clone(), "test-model");
-        let result = distiller
+        let distilled_mainline = distiller
             .distill_mainline("RKLB", "long profile content")
             .await
             .unwrap();
-        assert_eq!(result, "蒸馏出的 mainline");
+        assert_eq!(distilled_mainline, "蒸馏出的 mainline");
         let prompt = provider.captured_prompt.lock().unwrap().clone().unwrap();
         assert!(prompt.contains("RKLB"));
         assert!(prompt.contains("long profile content"));
