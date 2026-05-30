@@ -862,6 +862,8 @@ impl Tool for LocalWriteFileTool {
             "created": !exists,
         }))
     }
+}
+
 fn normalize_oss_relative_path(raw: &str) -> HoneResult<String> {
     let trimmed = raw.trim();
     let input = if trimmed.is_empty() { "." } else { trimmed };
