@@ -173,6 +173,11 @@ impl DataFetchTool {
     }
 
     async fn fetch_data_type(&self, data_type: &str, ticker: &str) -> Result<Value, String> {
+        // history 类型直接走 Yahoo v8 chart (FMP/Finnhub Free 都不给, Yahoo 免费可用)
+        if data_type == "history" {
+            return self.fetch_yahoo_chart(ticker).await;
+        }
+
         let url = self.build_url(data_type, ticker)?;
         let mut last_err = String::new();
 
@@ -277,6 +282,56 @@ impl DataFetchTool {
         if let Some(err_msg) = json.get("error").and_then(|v| v.as_str()) {
             return Err(format!("Finnhub: {}", err_msg));
         }
+        Ok(json)
+    }
+
+    /// Yahoo Finance v8 chart endpoint — 拿历史日 K + 52 周高低 + 当前价
+    /// 2026-06-09 加, 因为 Finnhub Free 不给 stock-candle, FMP v3 也废了.
+    /// 非官方 endpoint, 需要 User-Agent header, Yahoo 没承诺稳定性.
+    async fn fetch_yahoo_chart(&self, ticker: &str) -> Result<Value, String> {
+        let url = format!(
+            "https://query1.finance.yahoo.com/v8/finance/chart/{}?range=3mo&interval=1d",
+            ticker
+        );
+
+        tracing::info!("data_fetch history → Yahoo v8 chart for {}", ticker);
+
+        let response = self
+            .http
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+            .timeout(std::time::Duration::from_secs(self.timeout))
+            .send()
+            .await
+            .map_err(|e| format!("Yahoo chart 请求失败: {}", e))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("Yahoo chart 响应读取失败: {}", e))?;
+
+        if !status.is_success() {
+            return Err(format!(
+                "Yahoo chart HTTP {} (非官方端点可能被限流/封禁)",
+                status
+            ));
+        }
+
+        let json: Value = serde_json::from_str(&body).map_err(|e| {
+            let prefix = body.chars().take(200).collect::<String>();
+            format!("Yahoo chart JSON 解析失败: {e}; body_prefix={prefix}")
+        })?;
+
+        // Yahoo 错误格式: {chart: {error: {code: "...", description: "..."}}}
+        if let Some(err) = json
+            .get("chart")
+            .and_then(|c| c.get("error"))
+            .filter(|e| !e.is_null())
+        {
+            return Err(format!("Yahoo chart 错误: {}", err));
+        }
+
         Ok(json)
     }
 
@@ -491,7 +546,7 @@ impl Tool for DataFetchTool {
     }
 
     fn description(&self) -> &str {
-        "获取金融数据（股票/ETF/加密货币的行情、基本面、新闻等）。支持的数据类型：quote（实时行情）、profile（公司概况）、snapshot（聚合快照：quote + profile + news）、financials（财务数据）、news（新闻）、gainers_losers（涨跌榜）、sector_performance（板块表现）、crypto_quote（加密货币行情）、etf_holdings（ETF 持仓）、earnings_calendar（财报日历，默认查询当前北京时间起未来 14 天，也支持 from/to 覆盖窗口）。"
+        "获取金融数据（股票/ETF/加密货币的行情、基本面、新闻等）。支持的数据类型：quote（实时行情）、profile（公司概况）、snapshot（聚合快照：quote + profile + news）、financials（财务数据）、news（新闻）、history（历史日 K 线，含近 3 个月每日 OHLC + 成交量 + 52 周高低，分析历史走势/确认高低点必用）、gainers_losers（涨跌榜）、sector_performance（板块表现）、crypto_quote（加密货币行情）、etf_holdings（ETF 持仓）、earnings_calendar（财报日历，默认查询当前北京时间起未来 14 天，也支持 from/to 覆盖窗口）。"
     }
 
     fn parameters(&self) -> Vec<ToolParameter> {
@@ -507,6 +562,7 @@ impl Tool for DataFetchTool {
                     "snapshot".into(),
                     "financials".into(),
                     "news".into(),
+                    "history".into(),
                     "gainers_losers".into(),
                     "sector_performance".into(),
                     "crypto_quote".into(),
