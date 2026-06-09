@@ -24,12 +24,13 @@ use hone_core::{ActorIdentity, LlmAuditSink};
 use hone_llm::{LlmProvider, LlmResolver};
 use hone_memory::{
     CompanyProfileStorage, ConversationQuotaStorage, CronJobStorage, LlmAuditStorage,
-    SessionStorage,
+    SessionStorage, configure_cloud_company_profile_storage, configure_cloud_llm_audit_storage,
+    configure_cloud_portfolio_storage,
 };
 use hone_scheduler::{HoneScheduler, SchedulerEvent};
 use hone_tools::{
     CronJobTool, DeepResearchTool, DiscoverSkillsTool, LoadSkillTool, ToolExecutionGuard,
-    ToolRegistry,
+    ToolRegistry, configure_cloud_notification_prefs, configure_cloud_skill_registry,
 };
 use tokio::sync::mpsc;
 
@@ -91,6 +92,11 @@ impl HoneBotCore {
             ConversationQuotaStorage::new(&config.storage.conversation_quota_dir)
                 .expect("failed to initialize conversation quota storage")
         };
+        configure_cloud_skill_registry(cloud_pg_runtime.clone());
+        configure_cloud_notification_prefs(cloud_pg_runtime.clone());
+        configure_cloud_portfolio_storage(cloud_pg_runtime.clone());
+        configure_cloud_llm_audit_storage(cloud_pg_runtime.clone());
+        configure_cloud_company_profile_storage(cloud_pg_runtime.clone());
         let company_profile_storage = CompanyProfileStorage::new(sandbox_base_dir());
         let llm = Self::create_llm_provider(&config);
         let auxiliary_llm = Self::create_auxiliary_llm_provider(&config);
@@ -324,12 +330,27 @@ impl HoneBotCore {
             let admin_bypass = actor
                 .map(|actor| self.is_admin_actor(actor))
                 .unwrap_or(false);
-            registry.register(Box::new(CronJobTool::new(
-                &self.config.storage.cron_jobs_dir,
-                actor.cloned(),
-                channel_target,
-                admin_bypass,
-            )));
+            let cron_tool: Box<dyn hone_tools::Tool> =
+                if self.config.cloud.effective_mode().is_cloud_authoritative()
+                    && self.config.cloud.postgres.is_configured()
+                    && let Some(postgres) = CloudPgRuntime::from_cloud_config(&self.config.cloud)
+                {
+                    Box::new(CronJobTool::new_cloud(
+                        &self.config.storage.cron_jobs_dir,
+                        actor.cloned(),
+                        channel_target,
+                        admin_bypass,
+                        postgres,
+                    ))
+                } else {
+                    Box::new(CronJobTool::new(
+                        &self.config.storage.cron_jobs_dir,
+                        actor.cloned(),
+                        channel_target,
+                        admin_bypass,
+                    ))
+                };
+            registry.register(cron_tool);
         } else {
             tracing::info!(
                 "[HoneBotCore] cron_job disabled for channel_target={}",
@@ -364,12 +385,25 @@ impl HoneBotCore {
                 })
                 .collect(),
         };
-        registry.register(Box::new(hone_tools::NotificationPrefsTool::new(
-            &self.config.storage.notif_prefs_dir,
-            actor.cloned(),
-            &self.config.storage.cron_jobs_dir,
-            overview_digest_defaults,
-        )));
+        if self.config.cloud.effective_mode().is_cloud_authoritative()
+            && self.config.cloud.postgres.is_configured()
+            && let Some(postgres) = CloudPgRuntime::from_cloud_config(&self.config.cloud)
+        {
+            registry.register(Box::new(hone_tools::NotificationPrefsTool::new_cloud(
+                &self.config.storage.notif_prefs_dir,
+                actor.cloned(),
+                &self.config.storage.cron_jobs_dir,
+                overview_digest_defaults,
+                postgres,
+            )));
+        } else {
+            registry.register(Box::new(hone_tools::NotificationPrefsTool::new(
+                &self.config.storage.notif_prefs_dir,
+                actor.cloned(),
+                &self.config.storage.cron_jobs_dir,
+                overview_digest_defaults,
+            )));
+        }
 
         // 让用户通过 `/missed` 或自然语言查回 digest/router 主动筛掉的事件。
         // event store 路径与 web-api `bootstrap_event_engine` 约定一致:
@@ -513,6 +547,13 @@ impl HoneBotCore {
     }
 
     pub fn cron_job_storage(&self) -> CronJobStorage {
+        if self.config.cloud.effective_mode().is_cloud_authoritative()
+            && self.config.cloud.postgres.is_configured()
+            && let Some(postgres) = CloudPgRuntime::from_cloud_config(&self.config.cloud)
+            && let Ok(storage) = CronJobStorage::new_cloud(postgres)
+        {
+            return storage;
+        }
         CronJobStorage::with_sqlite(
             &self.config.storage.cron_jobs_dir,
             &self.config.storage.session_sqlite_db_path,

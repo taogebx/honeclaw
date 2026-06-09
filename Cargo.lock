@@ -2877,6 +2877,7 @@ name = "hone-cli"
 version = "0.12.4"
 dependencies = [
  "async-trait",
+ "chrono",
  "clap",
  "console",
  "dialoguer",
@@ -2885,6 +2886,7 @@ dependencies = [
  "hone-core",
  "hone-memory",
  "reqwest 0.12.28",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2997,6 +2999,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "feishu-sdk",
+ "futures",
  "hone-channels",
  "hone-core",
  "hone-memory",
@@ -3139,6 +3142,7 @@ dependencies = [
 name = "hone-web-api"
 version = "0.12.4"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum",
  "base64 0.22.1",

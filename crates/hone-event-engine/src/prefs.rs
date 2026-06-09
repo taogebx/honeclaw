@@ -27,14 +27,31 @@
 //! ```
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
-use hone_core::ActorIdentity;
+use hone_core::cloud_runtime::CloudPgRuntime;
+use hone_core::{ActorIdentity, HoneError, HoneResult};
 use serde::{Deserialize, Serialize};
 
 use crate::event::{EventKind, MarketEvent, Severity};
 use crate::unified_digest::DigestSlot;
+static CLOUD_NOTIFICATION_PREFS: OnceLock<RwLock<Option<CloudPgRuntime>>> = OnceLock::new();
+
+pub fn configure_cloud_notification_prefs(postgres: Option<CloudPgRuntime>) {
+    let lock = CLOUD_NOTIFICATION_PREFS.get_or_init(|| RwLock::new(None));
+    match lock.write() {
+        Ok(mut guard) => *guard = postgres,
+        Err(error) => tracing::warn!("notification prefs cloud runtime lock poisoned: {error}"),
+    }
+}
+
+fn cloud_notification_prefs() -> Option<CloudPgRuntime> {
+    CLOUD_NOTIFICATION_PREFS
+        .get()
+        .and_then(|lock| lock.read().ok().and_then(|guard| guard.clone()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -262,13 +279,17 @@ impl PrefsProvider for AllowAllPrefs {
 /// 目录 = 根，每 actor 一个 JSON 文件。每次 `load` 重读；真正的运行时配置。
 pub struct FilePrefsStorage {
     dir: PathBuf,
+    cloud: Option<CloudPgRuntime>,
 }
 
 impl FilePrefsStorage {
     pub fn new(dir: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let dir = dir.into();
-        std::fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        let cloud = cloud_notification_prefs();
+        if cloud.is_none() {
+            std::fs::create_dir_all(&dir)?;
+        }
+        Ok(Self { dir, cloud })
     }
 
     pub fn dir(&self) -> &Path {
@@ -278,10 +299,77 @@ impl FilePrefsStorage {
     pub fn path_for(&self, actor: &ActorIdentity) -> PathBuf {
         self.dir.join(format!("{}.json", actor_slug(actor)))
     }
+
+    pub fn load_many(&self, actors: &[ActorIdentity]) -> Vec<NotificationPrefs> {
+        if let Some(postgres) = self.cloud.clone() {
+            let actor_storage_keys = actors.iter().map(actor_slug).collect::<Vec<_>>();
+            let query_keys = actor_storage_keys.clone();
+            match run_cloud_notification_prefs(async move {
+                postgres
+                    .get_notification_prefs_many_cached(&query_keys)
+                    .await
+            }) {
+                Ok(records) => {
+                    return actor_storage_keys
+                        .iter()
+                        .map(|key| {
+                            records
+                                .get(key)
+                                .cloned()
+                                .and_then(|value| {
+                                    serde_json::from_value::<NotificationPrefs>(value)
+                                        .map_err(|err| {
+                                            tracing::warn!(
+                                                actor_storage_key = %key,
+                                                "cloud notif prefs parse failed in batch: {err}"
+                                            );
+                                            err
+                                        })
+                                        .ok()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "cloud notif prefs batch load failed: {err}; falling back to per-actor load"
+                    );
+                }
+            }
+        }
+
+        actors.iter().map(|actor| self.load(actor)).collect()
+    }
 }
 
 impl PrefsProvider for FilePrefsStorage {
     fn load(&self, actor: &ActorIdentity) -> NotificationPrefs {
+        if let Some(postgres) = self.cloud.clone() {
+            let actor_storage_key = actor_slug(actor);
+            match run_cloud_notification_prefs(async move {
+                postgres.get_notification_prefs(&actor_storage_key).await
+            }) {
+                Ok(Some(value)) => match serde_json::from_value::<NotificationPrefs>(value) {
+                    Ok(prefs) => return prefs,
+                    Err(err) => {
+                        tracing::warn!(
+                            "cloud notif prefs parse failed actor_storage_key={}: {err}; falling back to default",
+                            actor_slug(actor)
+                        );
+                    }
+                },
+                Ok(None) => return NotificationPrefs::default(),
+                Err(err) => {
+                    tracing::warn!(
+                        "cloud notif prefs load failed actor_storage_key={}: {err}; falling back to default",
+                        actor_slug(actor)
+                    );
+                }
+            }
+            return NotificationPrefs::default();
+        }
+
         let path = self.path_for(actor);
         match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<NotificationPrefs>(&text) {
@@ -299,6 +387,17 @@ impl PrefsProvider for FilePrefsStorage {
     }
 
     fn save(&self, actor: &ActorIdentity, prefs: &NotificationPrefs) -> anyhow::Result<()> {
+        if let Some(postgres) = self.cloud.clone() {
+            let actor_storage_key = actor_slug(actor);
+            let value = serde_json::to_value(prefs)?;
+            return run_cloud_notification_prefs(async move {
+                postgres
+                    .upsert_notification_prefs(&actor_storage_key, value)
+                    .await
+            })
+            .map_err(anyhow::Error::from);
+        }
+
         let path = self.path_for(actor);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -307,6 +406,25 @@ impl PrefsProvider for FilePrefsStorage {
         std::fs::write(&path, text)?;
         Ok(())
     }
+}
+
+fn run_cloud_notification_prefs<T, F>(future: F) -> HoneResult<T>
+where
+    T: Send + 'static,
+    F: Future<Output = HoneResult<T>> + Send + 'static,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::spawn(move || {
+            let runtime =
+                tokio::runtime::Runtime::new().map_err(|err| HoneError::Config(err.to_string()))?;
+            runtime.block_on(future)
+        })
+        .join()
+        .map_err(|_| HoneError::Storage("cloud notification prefs worker panicked".to_string()))?;
+    }
+    let runtime =
+        tokio::runtime::Runtime::new().map_err(|err| HoneError::Config(err.to_string()))?;
+    runtime.block_on(future)
 }
 
 fn actor_slug(a: &ActorIdentity) -> String {

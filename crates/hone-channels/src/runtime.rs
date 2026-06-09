@@ -238,6 +238,56 @@ static RE_ABSOLUTE_PATH: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"(?P<prefix>^|[\s\(\[\{<"'`])(?P<path>(?:[A-Za-z]:[\\/]|/)[^\s<>"'`]+)"#)
         .expect("valid regex")
 });
+static RE_INTERNAL_RELATIVE_PROFILE_PATH: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?P<prefix>^|[\s\(\[\{<"'`])(?P<path>(?:company_profiles/[^\s<>"'`，。；、）\)\]\}]+|events/[^\s<>"'`，。；、）\)\]\}]+\.md))"#,
+    )
+    .expect("valid regex")
+});
+static RE_ENABLED_BOOLEAN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?i)`?enabled\s*=\s*(?P<value>true|false)`?"#).expect("valid regex")
+});
+static RE_ENABLED_BOOLEAN_COPY: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?P<prefix>这\s*\d+\s*个任务目前)(?:都|全部都|都是)\s*已(?P<state>启用|停用)"#,
+    )
+    .expect("valid regex")
+});
+static RE_INTERNAL_SKILL_COPY_SENTENCE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)[^\n。！？]*(?:stock_research|deep_stock_research|skill)[^\n。！？]*(?:未激活|没有激活|未加载|未成功加载)[^\n。！？]*[。！？]?"#,
+    )
+    .expect("valid regex")
+});
+static RE_INTERNAL_FRAMEWORK_COPY_SENTENCE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"[^\n。！？]*(?:改用|改为|转而使用)[^\n。！？]*(?:技能框架|skill|tool)[^\n。！？]*[。！？]?"#)
+        .expect("valid regex")
+});
+static RE_INTERNAL_STORAGE_COPY_SENTENCE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"[^\n。！？]*(?:账本文件已定位到|本地\s*data/|data/portfolio|本地json文件|本地 json 文件|本地json|本地 json|本地文件仍只显示|json文件仍只显示)[^\n。！？]*[。！？]?"#,
+    )
+    .expect("valid regex")
+});
+static RE_INTERNAL_TOOLING_COPY_SENTENCE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"[^\n。！？]*(?:返回了?全市场列表|全市场列表而不是按标的过滤|工具过滤异常)[^\n。！？]*[。！？]?"#,
+    )
+    .expect("valid regex")
+});
+static RE_COMPANY_PROFILE_COPY_GLITCH: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?:路径是[:：]?\s*公司画像(?:公司画像)?|本地画像[:：]?\s*公司画像|本地公司画像[:：]?\s*公司画像)"#,
+    )
+    .expect("valid regex")
+});
+static RE_COMPANY_PROFILE_UPDATE_COPY: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?:我已|并)?把本轮更新补进本地画像[:：]?\s*公司画像"#)
+        .expect("valid regex")
+});
+static RE_COMPANY_PROFILE_WRITE_COPY: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"沉淀到本地公司画像[:：]?\s*公司画像"#).expect("valid regex")
+});
 
 // ── skip-buffer 检测正则 ──────────────────────────────────────────────────────
 static RE_ONLY_PUNCT: LazyLock<regex::Regex> =
@@ -321,6 +371,9 @@ pub fn sanitize_user_visible_output(text: &str) -> SanitizedUserVisibleOutput {
     let (path_sanitized, removed_paths) = redact_user_visible_local_paths(&sanitized);
     sanitized = path_sanitized;
     removed_internal |= removed_paths;
+    let (copy_rewritten, removed_copy) = rewrite_user_visible_internal_copy(&sanitized);
+    sanitized = copy_rewritten;
+    removed_internal |= removed_copy;
     sanitized = RE_WS.replace_all(&sanitized, " ").to_string();
     sanitized = RE_NL.replace_all(&sanitized, "\n\n").to_string();
     sanitized = sanitized.trim().to_string();
@@ -330,6 +383,12 @@ pub fn sanitize_user_visible_output(text: &str) -> SanitizedUserVisibleOutput {
         removed_internal,
         content: sanitized,
     }
+}
+
+fn is_hone_mcp_binary_missing_error(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    normalized.contains("hone-mcp binary not found")
+        || (normalized.contains("hone_mcp_bin") && normalized.contains("not found"))
 }
 
 fn strip_internal_protocol_blocks(mut value: String) -> (String, bool) {
@@ -392,8 +451,73 @@ fn redact_user_visible_local_paths(text: &str) -> (String, bool) {
         let (path, suffix) = split_trailing_path_punctuation(raw);
         format!("{prefix}{}{suffix}", mask_absolute_path(path))
     });
+    sanitized = absolute_stripped.into_owned();
 
-    (absolute_stripped.into_owned(), removed)
+    let internal_relative_stripped =
+        RE_INTERNAL_RELATIVE_PROFILE_PATH.replace_all(&sanitized, |caps: &regex::Captures| {
+            removed = true;
+            let prefix = caps.name("prefix").map(|m| m.as_str()).unwrap_or_default();
+            let display_prefix = if prefix.chars().all(char::is_whitespace) {
+                ""
+            } else {
+                prefix
+            };
+            format!("{display_prefix}公司画像")
+        });
+
+    (internal_relative_stripped.into_owned(), removed)
+}
+
+fn rewrite_user_visible_internal_copy(text: &str) -> (String, bool) {
+    let mut removed = false;
+
+    let enabled_rewritten = RE_ENABLED_BOOLEAN.replace_all(text, |caps: &regex::Captures| {
+        removed = true;
+        match caps
+            .name("value")
+            .map(|value| value.as_str().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("true") => "已启用".to_string(),
+            Some("false") => "已停用".to_string(),
+            _ => caps[0].to_string(),
+        }
+    });
+    let mut rewritten = enabled_rewritten.into_owned();
+
+    let normalized_enabled =
+        RE_ENABLED_BOOLEAN_COPY.replace_all(&rewritten, "${prefix}均已${state}");
+    if normalized_enabled != rewritten {
+        removed = true;
+        rewritten = normalized_enabled.into_owned();
+    }
+
+    for re in [
+        &RE_INTERNAL_SKILL_COPY_SENTENCE,
+        &RE_INTERNAL_FRAMEWORK_COPY_SENTENCE,
+        &RE_INTERNAL_STORAGE_COPY_SENTENCE,
+        &RE_INTERNAL_TOOLING_COPY_SENTENCE,
+    ] {
+        let next = re.replace_all(&rewritten, "");
+        if next != rewritten {
+            removed = true;
+            rewritten = next.into_owned();
+        }
+    }
+
+    for (re, replacement) in [
+        (&RE_COMPANY_PROFILE_UPDATE_COPY, "把本轮更新补进公司画像"),
+        (&RE_COMPANY_PROFILE_WRITE_COPY, "沉淀到公司画像"),
+        (&RE_COMPANY_PROFILE_COPY_GLITCH, "已沉淀为公司画像"),
+    ] {
+        let next = re.replace_all(&rewritten, replacement);
+        if next != rewritten {
+            removed = true;
+            rewritten = next.into_owned();
+        }
+    }
+
+    (rewritten, removed)
 }
 
 pub fn user_visible_error_message(raw: Option<&str>) -> String {
@@ -402,6 +526,12 @@ pub fn user_visible_error_message(raw: Option<&str>) -> String {
     };
 
     let lowered = sanitized.to_ascii_lowercase();
+    if is_hone_mcp_binary_missing_error(&sanitized) {
+        return RUNNER_RESOURCE_UNAVAILABLE_USER_ERROR_MESSAGE.to_string();
+    }
+    if looks_runner_transport_disconnect_error_lowered(&lowered) {
+        return RUNNER_RESOURCE_UNAVAILABLE_USER_ERROR_MESSAGE.to_string();
+    }
     if let Some(message) = user_actionable_error_message(&sanitized, &lowered) {
         return message;
     }
@@ -479,6 +609,7 @@ fn looks_runner_usage_limit_error_lowered(lowered: &str) -> bool {
 fn looks_runner_resource_unavailable_error_lowered(lowered: &str) -> bool {
     (lowered.contains("codex")
         || lowered.contains("codex-acp")
+        || lowered.contains("hone-mcp")
         || lowered.contains("runner")
         || lowered.contains("acp"))
         && (lowered.contains("resource temporarily unavailable")
@@ -486,7 +617,17 @@ fn looks_runner_resource_unavailable_error_lowered(lowered: &str) -> bool {
             || lowered.contains("would block")
             || lowered.contains("failed to probe")
             || lowered.contains("version probe")
-            || lowered.contains("failed to spawn"))
+            || lowered.contains("failed to spawn")
+            || lowered.contains("binary not found")
+            || lowered.contains("not found near current executable"))
+}
+
+fn looks_runner_transport_disconnect_error_lowered(lowered: &str) -> bool {
+    (lowered.contains("codex") || lowered.contains("runner") || lowered.contains("acp"))
+        && (lowered.contains("stream disconnected before completion")
+            || lowered.contains("stream closed before response")
+            || lowered.contains("acp stream disconnected")
+            || lowered.contains("transport disconnected"))
 }
 
 fn looks_timeout_error_lowered(lowered: &str) -> bool {
@@ -543,6 +684,7 @@ fn looks_internal_error_detail(sanitized: &str, lowered: &str) -> bool {
         || lowered.contains("provider")
         || lowered.contains("session/prompt")
         || lowered.contains("codex acp")
+        || lowered.contains("stream disconnected before completion")
         || lowered.contains("stream closed before response")
         || lowered.contains("acp stream")
 }
@@ -596,6 +738,15 @@ fn looks_like_internal_workflow_prelude(text: &str) -> bool {
             "工作流",
             "检查本地是否已有相关公司画像",
             "检查本地公司画像",
+            "技能未加载",
+            "技能没有成功加载",
+            "技能没成功加载",
+            "当前运行器",
+            "tool unavailable",
+            "tool is unavailable",
+            "skill unavailable",
+            "skill is unavailable",
+            "failed to load skill",
         ],
     ) {
         return true;
@@ -1005,6 +1156,54 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_user_visible_output_redacts_internal_relative_company_profile_paths() {
+        let raw =
+            "我已把 AVGO 财报前框架沉淀到 company_profiles/AVGO.md，后续财报出来可以直接对照更新。";
+        let sanitized = sanitize_user_visible_output(raw);
+        assert!(sanitized.removed_internal);
+        assert_eq!(
+            sanitized.content,
+            "我已把 AVGO 财报前框架沉淀到公司画像，后续财报出来可以直接对照更新。"
+        );
+        assert!(!sanitized.content.contains("company_profiles/"));
+    }
+
+    #[test]
+    fn sanitize_user_visible_output_rewrites_enabled_boolean_copy() {
+        let raw = "这 3 个任务目前都是 `enabled=true`。";
+        let sanitized = sanitize_user_visible_output(raw);
+        assert!(sanitized.removed_internal);
+        assert_eq!(sanitized.content, "这 3 个任务目前均已启用。");
+        assert!(!sanitized.content.contains("enabled=true"));
+    }
+
+    #[test]
+    fn sanitize_user_visible_output_strips_internal_skill_and_storage_copy() {
+        let raw = "Hone 的 stock_research 技能名当前没有激活，所以我改用其它技能框架。账本文件已定位到本地 data/portfolio 下，本地 json 文件仍只显示旧仓位。以下以 Hone 持仓工具为准，并补充过去 24 小时的新闻和风险。";
+        let sanitized = sanitize_user_visible_output(raw);
+        assert!(sanitized.removed_internal);
+        assert_eq!(
+            sanitized.content,
+            "以下以 Hone 持仓工具为准，并补充过去 24 小时的新闻和风险。"
+        );
+        assert!(!sanitized.content.contains("stock_research"));
+        assert!(!sanitized.content.contains("data/portfolio"));
+        assert!(!sanitized.content.contains("本地 json"));
+    }
+
+    #[test]
+    fn sanitize_user_visible_output_rewrites_company_profile_copy_glitches() {
+        let raw = "我已为腾讯控股建立长期画像，路径是：\n公司画像公司画像。并把本轮更新补进本地画像：公司画像。";
+        let sanitized = sanitize_user_visible_output(raw);
+        assert!(sanitized.removed_internal);
+        assert_eq!(
+            sanitized.content,
+            "我已为腾讯控股建立长期画像，已沉淀为公司画像。把本轮更新补进公司画像。"
+        );
+        assert!(!sanitized.content.contains("公司画像公司画像"));
+    }
+
+    #[test]
     fn user_visible_error_message_rewrites_provider_protocol_errors() {
         let err = user_visible_error_message(Some(
             "LLM 错误: bad_request_error: invalid params, tool call result does not follow tool call (2013), tool_call_id: call_123",
@@ -1019,6 +1218,14 @@ mod tests {
         let err =
             user_visible_error_message(Some("opencode acp session/prompt idle timeout (180s)"));
         assert_eq!(err, TIMEOUT_USER_ERROR_MESSAGE);
+    }
+
+    #[test]
+    fn user_visible_error_message_rewrites_missing_hone_mcp_binary_errors() {
+        let err = user_visible_error_message(Some(
+            "hone-mcp binary not found near current executable; tried: /tmp/hone-mcp, /tmp/hone-mcp-aarch64-apple-darwin (set HONE_MCP_BIN to override)",
+        ));
+        assert_eq!(err, RUNNER_RESOURCE_UNAVAILABLE_USER_ERROR_MESSAGE);
     }
 
     #[test]
@@ -1052,6 +1259,27 @@ mod tests {
     }
 
     #[test]
+    fn user_visible_error_message_maps_acp_transport_disconnect_errors() {
+        let err = user_visible_error_message(Some(
+            "codex acp error: stream disconnected before completion",
+        ));
+        assert_eq!(err, RUNNER_RESOURCE_UNAVAILABLE_USER_ERROR_MESSAGE);
+        assert!(!err.contains("stream disconnected"));
+        assert!(!err.contains("codex acp"));
+    }
+
+    #[test]
+    fn user_visible_error_message_maps_hone_mcp_startup_errors() {
+        let err = user_visible_error_message(Some(
+            "hone-mcp binary not found near current executable; tried: /private/app/hone-mcp, /private/app/hone-mcp-aarch64-apple-darwin (set HONE_MCP_BIN to override)",
+        ));
+        assert_eq!(err, RUNNER_RESOURCE_UNAVAILABLE_USER_ERROR_MESSAGE);
+        assert!(!err.contains("hone-mcp binary"));
+        assert!(!err.contains("/private/app"));
+        assert!(!err.contains("HONE_MCP_BIN"));
+    }
+
+    #[test]
     fn user_visible_error_message_hides_sensitive_error_details() {
         let err = user_visible_error_message(Some(
             "upstream failed OPENROUTER_API_KEY=sk-secret Authorization: Basic basic-secret",
@@ -1065,6 +1293,14 @@ mod tests {
     fn user_visible_error_message_or_none_suppresses_internal_acp_errors() {
         let err = user_visible_error_message_or_none(Some(
             "codex acp prompt ended before tool completion: Searching the Web",
+        ));
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn user_visible_error_message_or_none_suppresses_acp_transport_disconnect_errors() {
+        let err = user_visible_error_message_or_none(Some(
+            "codex acp error: stream disconnected before completion",
         ));
         assert!(err.is_none());
     }
@@ -1092,6 +1328,17 @@ mod tests {
     fn user_visible_error_message_or_none_keeps_codex_probe_resource_errors_sanitized() {
         let err = user_visible_error_message_or_none(Some(
             "failed to probe codex version via `codex`: Resource temporarily unavailable (os error 35)",
+        ));
+        assert_eq!(
+            err.as_deref(),
+            Some(RUNNER_RESOURCE_UNAVAILABLE_USER_ERROR_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn user_visible_error_message_or_none_keeps_hone_mcp_startup_errors_sanitized() {
+        let err = user_visible_error_message_or_none(Some(
+            "hone-mcp binary not found near current executable; tried: /private/app/hone-mcp (set HONE_MCP_BIN to override)",
         ));
         assert_eq!(
             err.as_deref(),

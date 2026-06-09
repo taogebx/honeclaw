@@ -6,6 +6,64 @@
 - **状态**: Fixed
 - **GitHub Issue**: 无，当前不是 P1。
 
+## 状态同步（2026-06-01 bug-2）
+
+- 本轮复核 `docs/bugs/README.md`、当前 HEAD 修复记录与本文件，确认 2026-05-31 14:05 CST 已补齐 `Greed` / `贪婪` broad-market 锚点与 `USO/WTI/Brent + 明确价格数字` commodity 主体回归，导航表已列为 `Fixed`。
+- 本文件头部仍停留在修复前 `New`，本轮仅同步为 `Fixed`；未发现关联 GitHub Issue，也未做业务代码改动。
+- 验证沿用既有修复记录：`cargo test -p hone-channels commodity_guard_ --lib -- --nocapture`、`cargo test -p hone-channels commodity_ --lib -- --nocapture`、`cargo check -p hone-channels --tests`。
+
+## 复发记录（2026-05-31 11:03 CST）
+
+- 最近四小时真实窗口继续确认同一 scheduler 出站 guard false positive 活跃：`2026-05-31 07:03-11:03 CST` 普通 scheduler 共有 12 条 `completed + sent + delivered=1`，其中 1 条命中 `detail_json.scheduler.commodity_causality_guarded=true`。
+- 本窗口命中样本不是专门原油 / 大宗商品任务，而是 Discord `每日美股降息概率推送`；原始完整降息概率与宏观口径分析被全量替换成“本轮原油/大宗商品播报包含未完成同窗来源核验...”安全提示并仍记已送达。
+- `data/sessions.sqlite3` -> `cron_job_runs` 关键样本：
+  - `run_id=38062`，`job_name=每日美股降息概率推送`，`executed_at=2026-05-31T09:31:37.418674+08:00`，`actor_channel=discord`，`completed + sent + delivered=1`，`detail_json.scheduler.commodity_causality_guarded=true`。
+  - `detail_json.scheduler.raw_preview` 开头为“当前时间：2026年5月31日09:30（北京时间）。今天是周日，美股休市，最新有效市场口径来自5月29日美股收盘；当前降息预期仍偏冷，但4月核心PCE低于预期后，加息尾部风险较前一周有所缓和。”，主体是 FedWatch / PCE / CPI / 科技盈利与降息预期分析，不是原油或大宗商品播报。
+  - `response_preview` / `detail_json.scheduler.deliver_preview` 被替换为“本轮未保留原正文中的价格或归因句；请等待下一轮核验或手动查询交易所/官方数据。”，导致用户收到的不是降息概率主体内容。
+- 会话质量对照：同窗按消息时间共有 27 个 user turn 与 27 个 assistant final，最近活跃 Feishu / Web / Discord 会话均已 assistant final 收口；assistant final 污染扫描未命中空回复、本机绝对路径、工具轨迹、原始 provider / runner 错误、`HTTP 400 Bad Request`、`open_id cross app`、`failed to probe codex` 或 `Resource temporarily unavailable`；最近四小时无非文档代码提交。
+- 这是 04:07 修复记录之后的最新真实窗口复发，仍属既有缺陷的同一根因 / 同一出站 guard 链路，不新建重复文档；严重等级仍为 P2，状态从 `Fixed` 回退为 `New`。修复侧需要继续把 `每日美股降息概率推送` 作为非商品主任务回归样本，尤其覆盖“宏观降息概率正文中局部提到油价回落”的场景。
+
+## 修复记录（2026-05-31 04:07 CST）
+
+- 本轮修复 2026-05-30 23:02 复发的周末美股大盘 / 风控 / 温度检查形态：非商品 scheduler 的正文如果具备明显 broad-market review 锚点，且 broad-market 锚点显著多于商品锚点，不再仅因局部出现“油价压制缓和”“利率和油价风险变量”等措辞被判定为商品主体并整篇 rewrite。
+- `broad_market_review_anchor_hits(...)` 补充 `大盘`、`风控`、`温度`、`休市`、`交易日`、`情绪`、`Greed`、`追涨`、`赔率`、`高位`、`低波动`、`偏热`、`盈利兑现`、`硬件` 等周末/温度/风险简报常见市场锚点，覆盖 `每日20点美股大盘风控简报`、`每日美股大盘温度检查`、`每日美股大盘风险简报` 这类非商品主任务。
+- 专门原油 / WTI / Brent / 大宗商品任务仍保留 commodity guard；非商品 job 里若正文实际是单条 WTI / Brent / USO 价格归因，仍会被 `commodity_guard_covers_non_heartbeat_market_scheduler_output` 覆盖并 rewrite。
+- 新增回归：
+  - `commodity_guard_skips_weekend_us_market_temperature_review`
+  - `commodity_guard_skips_weekend_us_market_risk_brief_with_oil_risk_variable`
+- 验证：
+  - `cargo test -p hone-channels commodity_guard_skips_weekend_us_market_ --lib -- --nocapture`
+  - `cargo test -p hone-channels commodity_guard_covers_non_heartbeat_market_scheduler_output --lib -- --nocapture`
+  - `cargo test -p hone-channels commodity_guard_ --lib -- --nocapture`
+  - `cargo test -p hone-channels commodity_ --lib -- --nocapture`
+  - `cargo check -p hone-channels --tests`
+  - `rustfmt --edition 2024 --config skip_children=true --check crates/hone-channels/src/scheduler.rs`
+- 状态更新为 `Fixed`。本轮不重启服务、不使用当前机器旧运行态作为线上恢复证据；后续若包含本修复的运行态仍在非商品大盘 / 温度 / 风控任务上出现 `commodity_causality_guarded=true` 且送达正文被整篇替换，应以新样本重新打开本单。
+
+## 复发记录（2026-05-30 23:02 CST）
+
+- 最近四小时真实窗口继续确认同一 scheduler 出站 guard false positive 活跃：`2026-05-30 19:02-23:02 CST` 普通 scheduler 共有 18 条 `completed + sent + delivered=1`，其中 3 条命中 `detail_json.scheduler.commodity_causality_guarded=true`。
+- 3 条 guard 命中均不是专门原油 / 大宗商品任务，而是周末美股大盘 / 风控 / 温度检查类任务；原始完整市场风险复盘被全量替换成“本轮原油/大宗商品播报包含未完成同窗来源核验...”安全提示并仍记已送达。
+- `data/sessions.sqlite3` -> `cron_job_runs` 关键样本：
+  - `run_id=37476`，`job_name=每日20点美股大盘风控简报`，`executed_at=2026-05-30T20:01:01.549493+08:00`，`actor_channel=feishu`，`completed + sent + delivered=1`，`detail_json.scheduler.commodity_causality_guarded=true`。`raw_preview` 开头为“当前北京时间2026年5月30日20:00，美东时间周六08:00，美股现货与期货均处于周末休市阶段。结论：风险偏好仍偏强...”，主体是美股高位、低波动、贪婪情绪和追涨风险，不是原油或大宗商品播报。
+  - `run_id=37484`，`job_name=每日美股大盘温度检查`，`executed_at=2026-05-30T20:01:01.759838+08:00`，同样被替换。`raw_preview` 是周六按最近完整美股交易日收盘口径做的大盘温度检查，包含 Nasdaq / S&P 500 / Greed 情绪与追涨赔率分析。
+  - `run_id=37483`，`job_name=每日美股大盘风险简报`，`executed_at=2026-05-30T20:01:13.720433+08:00`，同样被替换。`raw_preview` 是周末按 2026-05-29 收盘口径做的大盘风险简报，包含 AI 硬件盈利兑现、利率 / 油价压制缓和与高位偏热风险。
+- `response_preview` 长度均只有 111，且被替换为“本轮未保留原正文中的价格或归因句；请等待下一轮核验或手动查询交易所/官方数据。”，导致用户收到的不是大盘风控 / 温度 / 风险主体内容。
+- `data/runtime/logs/hone-feishu.runtime-recovery.log` 在 `2026-05-30T12:00:57Z` / `12:00:58Z` / `12:01:10Z` 记录 `[SchedulerDiag] commodity_causality_guarded`，覆盖上述 3 个 job。
+- 会话质量对照：同窗按消息时间共有 36 个 user turn 与 36 个 assistant final，最近活跃会话均已 assistant final 收口；assistant final 污染扫描未命中空回复、本机绝对路径、工具轨迹、原始 provider 错误、`HTTP 400 Bad Request`、`open_id cross app`、`failed to probe codex` 或 `Resource temporarily unavailable`；最近四小时无非文档代码提交。
+- 这是既有缺陷的同一根因 / 同一出站 guard 链路，不新建重复文档；严重等级仍为 P2，状态保持 `New`。修复侧需要把 20:00 周末美股大盘风控、温度检查和风险简报加入非商品主任务回归，尤其覆盖“市场风险正文中局部提到油价”的场景。
+
+## 复发记录（2026-05-30 19:03 CST）
+
+- 最近四小时真实窗口再次确认同一 scheduler 出站 guard false positive 在 00:09 CST 修复后仍复发：`2026-05-30 15:02-19:02 CST` 普通 scheduler 仅 1 条 `completed + sent + delivered=1`，该条命中 `detail_json.scheduler.commodity_causality_guarded=true`。
+- 本窗口命中样本不是专门原油 / 大宗商品任务，原始完整 A/H 收盘复盘被全量替换成“本轮原油/大宗商品播报包含未完成同窗来源核验...”安全提示并仍记已送达。
+- `data/sessions.sqlite3` -> `cron_job_runs` 关键样本：
+  - `run_id=37387`，`job_name=A股港股收盘后跨市场复盘`，`executed_at=2026-05-30T17:32:28.902888+08:00`，`actor_channel=feishu`，`completed + sent + delivered=1`，`detail_json.scheduler.commodity_causality_guarded=true`。
+  - `detail_json.scheduler.raw_preview` 开头为“北京时间2026-05-30 17:30，今天是周六，A股和港股均非正常交易日；本轮只复盘最近一个交易日 2026-05-29，不编造周六盘面。”，主体是 2026-05-29 A/H 收盘复盘、AI 硬件 / 港股科技 / 美股映射与风险提示，不是原油或大宗商品播报。
+  - `response_preview` / `detail_json.scheduler.deliver_preview` 被替换为“本轮未保留原正文中的价格或归因句；请等待下一轮核验或手动查询交易所/官方数据。”，导致用户收到的不是 A/H 收盘复盘主体内容。
+- 会话质量对照：同窗按消息时间共有 7 个 user turn 与 7 个 assistant final，最新直聊会话均已 assistant final 收口；assistant final 污染扫描未命中空回复、本机绝对路径、工具轨迹、原始 provider 错误、`HTTP 400 Bad Request` 或 `open_id cross app`；最近四小时无非文档代码提交。
+- 这是既有缺陷的同一根因 / 同一出站 guard 链路，不新建重复文档；严重等级仍为 P2，状态从 `Fixed` 回退为 `New`。修复侧需要验证 00:09 CST 的 low-segmentation broad-market 判断仍未覆盖“周六复盘最近交易日”的 A/H 收盘复盘形态，或确认当前运行态是否未部署到包含该修复的二进制。
+
 ## 修复记录（2026-05-30 00:09 CST）
 
 - 本轮修复 2026-05-29 19:03 复发样本的低分段长正文形态：`A股港股收盘后跨市场复盘` 这类 A/H broad-market review 如果正文里同时出现 `WTI`、`Brent`、油价与风险提示，但 A 股 / 港股 / 美股 / AI / 科技 / 风险提示等 broad-market 锚点更多，不再被当作商品主体整篇 rewrite。

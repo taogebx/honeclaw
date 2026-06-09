@@ -1,4 +1,4 @@
-//! 定时任务存储 — JSON 文件 + SQLite 执行记录
+//! 定时任务存储 — 本地 JSON/SQLite 或 cloud PG 执行记录
 //!
 //! 管理按 actor（channel + user_id + channel_scope）隔离的定时任务持久化存储。
 //!
@@ -8,8 +8,12 @@
 //! - [`storage`] —— `CronJobStorage` 的 JSON CRUD 与 `get_due_jobs`
 //! - [`history`] —— `CronJobStorage` 的 SQLite 执行历史读写
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
+use hone_core::cloud_runtime::CloudPgRuntime;
 use tracing::warn;
 
 pub mod history;
@@ -28,7 +32,10 @@ pub use types::{
 pub struct CronJobStorage {
     pub(super) data_dir: PathBuf,
     pub(super) sqlite_path: Option<PathBuf>,
+    pub(super) postgres: Option<CloudPgRuntime>,
 }
+
+const DEFAULT_CLOUD_CRON_TIMEOUT_SECS: u64 = 15;
 
 impl CronJobStorage {
     pub fn new(data_dir: impl AsRef<Path>) -> Self {
@@ -37,6 +44,7 @@ impl CronJobStorage {
         Self {
             data_dir,
             sqlite_path: None,
+            postgres: None,
         }
     }
 
@@ -46,12 +54,75 @@ impl CronJobStorage {
         let storage = Self {
             data_dir,
             sqlite_path: Some(sqlite_path.as_ref().to_path_buf()),
+            postgres: None,
         };
         if let Err(err) = storage.init_execution_schema() {
             warn!("failed to initialize cron execution sqlite schema: {err}");
         }
         storage
     }
+
+    pub fn new_cloud(postgres: CloudPgRuntime) -> hone_core::HoneResult<Self> {
+        let schema_postgres = postgres.clone();
+        run_cloud_cron(async move { schema_postgres.ensure_schema().await })?;
+        Ok(Self {
+            data_dir: PathBuf::new(),
+            sqlite_path: None,
+            postgres: Some(postgres),
+        })
+    }
+
+    pub(super) fn cloud_postgres(&self) -> Option<CloudPgRuntime> {
+        self.postgres.clone()
+    }
+}
+
+pub(super) fn run_cloud_cron<T, F>(future: F) -> hone_core::HoneResult<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = hone_core::HoneResult<T>> + Send + 'static,
+{
+    run_cloud_cron_with_timeout(future, cloud_cron_operation_timeout())
+}
+
+fn cloud_cron_operation_timeout() -> Duration {
+    std::env::var("HONE_CLOUD_CRON_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_CLOUD_CRON_TIMEOUT_SECS))
+}
+
+fn run_cloud_cron_with_timeout<T, F>(
+    future: F,
+    operation_timeout: Duration,
+) -> hone_core::HoneResult<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = hone_core::HoneResult<T>> + Send + 'static,
+{
+    let execute = move || {
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|err| hone_core::HoneError::Config(err.to_string()))?;
+        runtime.block_on(async move {
+            match tokio::time::timeout(operation_timeout, future).await {
+                Ok(result) => result,
+                Err(_) => Err(hone_core::HoneError::Storage(format!(
+                    "cloud cron operation timed out after {}ms",
+                    operation_timeout.as_millis()
+                ))),
+            }
+        })
+    };
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::spawn(execute).join().map_err(|_| {
+            hone_core::HoneError::Storage("cloud cron worker panicked".to_string())
+        })?;
+    }
+
+    execute()
 }
 
 #[cfg(test)]
@@ -59,9 +130,9 @@ mod tests {
     use super::schedule::beijing_slot_time;
     use super::*;
     use chrono::{Datelike, Timelike};
-    use hone_core::{ActorIdentity, beijing_offset};
+    use hone_core::{ActorIdentity, HoneError, beijing_offset};
     use serde_json::Value;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn make_temp_dir(prefix: &str) -> std::path::PathBuf {
         let ts = SystemTime::now()
@@ -71,6 +142,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{prefix}_{}_{}", std::process::id(), ts));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn cloud_cron_timeout_returns_storage_error_instead_of_blocking() {
+        let started = Instant::now();
+        let err = run_cloud_cron_with_timeout(
+            async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok::<(), HoneError>(())
+            },
+            Duration::from_millis(20),
+        )
+        .expect_err("cloud cron bridge should time out");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "timeout should bound a stuck cloud cron operation"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("cloud cron operation timed out"),
+            "unexpected error: {message}"
+        );
     }
 
     fn actor(channel: &str, user_id: &str, channel_scope: Option<&str>) -> ActorIdentity {
@@ -874,6 +968,49 @@ mod tests {
     }
 
     #[test]
+    fn discord_send_failed_without_error_is_classified_by_storage_backstop() {
+        let dir = make_temp_dir("hone_cron_storage_discord_send_failed_backstop");
+        let sqlite_path = dir.join("sessions.sqlite3");
+        let storage = CronJobStorage::with_sqlite(&dir, &sqlite_path);
+        let actor = actor("discord", "g_exec", Some("channel-1"));
+
+        storage
+            .record_execution_event(
+                &actor,
+                "j_discord",
+                "daily report",
+                "channel-1",
+                false,
+                CronJobExecutionInput {
+                    execution_status: "completed".to_string(),
+                    message_send_status: "send_failed".to_string(),
+                    should_deliver: true,
+                    delivered: false,
+                    response_preview: Some("final report".to_string()),
+                    error_message: None,
+                    detail: serde_json::json!({
+                        "scheduler": null,
+                        "sent_segments": 0,
+                        "total_segments": 2,
+                    }),
+                },
+            )
+            .expect("record execution");
+
+        let records = storage
+            .list_execution_records("j_discord", 10)
+            .expect("list execution records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].error_message.as_deref(),
+            Some("Discord 定时任务发送失败")
+        );
+        assert_eq!(records[0].detail["failure_kind"], "discord_send_failed");
+        assert_eq!(records[0].detail["sent_segments"], 0);
+        assert_eq!(records[0].detail["total_segments"], 2);
+    }
+
+    #[test]
     fn execution_terminal_event_updates_matching_pending_row() {
         let dir = make_temp_dir("hone_cron_storage_exec_update_pending");
         let sqlite_path = dir.join("sessions.sqlite3");
@@ -944,6 +1081,104 @@ mod tests {
         assert!(records[0].delivered);
         assert_eq!(records[0].response_preview.as_deref(), Some("final report"));
         assert_eq!(records[0].detail["phase"], "terminal");
+    }
+
+    #[test]
+    fn started_execution_can_be_failed_by_exact_delivery_key_watchdog() {
+        let dir = make_temp_dir("hone_cron_storage_watchdog_pending");
+        let sqlite_path = dir.join("sessions.sqlite3");
+        let storage = CronJobStorage::with_sqlite(&dir, &sqlite_path);
+        let target_actor = actor("feishu", "ou_watchdog", None);
+        let other_actor = actor("feishu", "ou_watchdog_other", None);
+
+        for (actor, job_id, delivery_key) in [
+            (&target_actor, "j_watchdog", "delivery-watchdog"),
+            (&target_actor, "j_other_key", "delivery-other"),
+            (&other_actor, "j_watchdog", "delivery-watchdog"),
+        ] {
+            storage
+                .record_execution_event(
+                    actor,
+                    job_id,
+                    "pending job",
+                    &actor.user_id,
+                    false,
+                    CronJobExecutionInput {
+                        execution_status: "running".to_string(),
+                        message_send_status: "pending".to_string(),
+                        should_deliver: true,
+                        delivered: false,
+                        response_preview: None,
+                        error_message: None,
+                        detail: serde_json::json!({
+                            "phase": "started",
+                            "delivery_key": delivery_key,
+                        }),
+                    },
+                )
+                .expect("record started");
+        }
+
+        let updated = storage
+            .mark_started_execution_failed_by_delivery_key(
+                &target_actor,
+                "j_watchdog",
+                &target_actor.user_id,
+                false,
+                "delivery-watchdog",
+                "feishu_scheduler_handler_watchdog",
+                "scheduler_handler_watchdog_timeout:1235s",
+            )
+            .expect("watchdog finalize");
+        assert_eq!(updated, 1);
+
+        let second = storage
+            .mark_started_execution_failed_by_delivery_key(
+                &target_actor,
+                "j_watchdog",
+                &target_actor.user_id,
+                false,
+                "delivery-watchdog",
+                "feishu_scheduler_handler_watchdog",
+                "scheduler_handler_watchdog_timeout:1235s",
+            )
+            .expect("watchdog finalize is idempotent");
+        assert_eq!(second, 0);
+
+        let finalized = storage
+            .list_execution_records("j_watchdog", 10)
+            .expect("list finalized");
+        assert_eq!(finalized.len(), 2);
+        let target = finalized
+            .iter()
+            .find(|record| record.user_id == target_actor.user_id)
+            .expect("target record");
+        assert_eq!(target.execution_status, "execution_failed");
+        assert_eq!(target.message_send_status, "skipped_error");
+        assert!(!target.should_deliver);
+        assert!(!target.delivered);
+        assert_eq!(
+            target.error_message.as_deref(),
+            Some("scheduler_handler_watchdog_timeout:1235s")
+        );
+        assert_eq!(target.detail["phase"], "scheduler_handler_watchdog_timeout");
+        assert_eq!(
+            target.detail["recovered_by"],
+            "feishu_scheduler_handler_watchdog"
+        );
+
+        let other_key = storage
+            .list_execution_records("j_other_key", 10)
+            .expect("list other key");
+        assert_eq!(other_key[0].execution_status, "running");
+        assert_eq!(other_key[0].message_send_status, "pending");
+
+        let other_actor_records = finalized
+            .iter()
+            .find(|record| record.user_id == other_actor.user_id)
+            .expect("other actor record");
+        assert_eq!(other_actor_records.execution_status, "running");
+        assert_eq!(other_actor_records.message_send_status, "pending");
     }
 
     #[test]

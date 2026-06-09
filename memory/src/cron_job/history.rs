@@ -8,11 +8,13 @@
 //! 场景下仍然可以只用 JSON 即可工作（`open_execution_conn` 会返回 `None`）。
 //! schema 用 `CREATE TABLE IF NOT EXISTS`,第一次连接时自动建表。
 
+use hone_core::cloud_runtime::{CloudCronExecutionFilter, CloudCronExecutionInput};
 use hone_core::{ActorIdentity, HoneError, HoneResult, truncate_chars_append};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 
 use super::CronJobStorage;
+use super::run_cloud_cron;
 use super::types::{CronJobExecutionInput, CronJobExecutionRecord};
 
 /// 跨任务列举执行记录的过滤条件。所有时间字段使用东八区 RFC3339 字符串
@@ -31,6 +33,94 @@ pub struct ExecutionFilter {
 }
 
 impl CronJobStorage {
+    pub fn mark_started_execution_failed_by_delivery_key(
+        &self,
+        actor: &ActorIdentity,
+        job_id: &str,
+        channel_target: &str,
+        heartbeat: bool,
+        delivery_key: &str,
+        recovered_by: &str,
+        reason: &str,
+    ) -> HoneResult<usize> {
+        let delivery_key = delivery_key.trim();
+        if delivery_key.is_empty() {
+            return Ok(0);
+        }
+        if let Some(postgres) = self.cloud_postgres() {
+            let actor = actor.clone();
+            let job_id = job_id.to_string();
+            let channel_target = channel_target.to_string();
+            let delivery_key = delivery_key.to_string();
+            let recovered_by = recovered_by.to_string();
+            let reason = truncate_chars_append(reason, 500, "...");
+            return run_cloud_cron(async move {
+                postgres
+                    .mark_cron_started_execution_failed_by_delivery_key(
+                        &actor,
+                        &job_id,
+                        &channel_target,
+                        heartbeat,
+                        &delivery_key,
+                        &recovered_by,
+                        &reason,
+                    )
+                    .await
+            });
+        }
+
+        let Some(conn) = self.open_execution_conn()? else {
+            return Ok(0);
+        };
+        let recovered_at = hone_core::beijing_now_rfc3339();
+        let error_message = truncate_chars_append(reason, 500, "...");
+        let updated = conn
+            .execute(
+                "
+                UPDATE cron_job_runs
+                SET
+                    executed_at = ?1,
+                    execution_status = 'execution_failed',
+                    message_send_status = 'skipped_error',
+                    should_deliver = 0,
+                    delivered = 0,
+                    response_preview = NULL,
+                    error_message = ?2,
+                    detail_json = json_object(
+                        'phase', 'scheduler_handler_watchdog_timeout',
+                        'recovered_at', ?1,
+                        'recovered_by', ?3,
+                        'delivery_key', json_extract(detail_json, '$.delivery_key'),
+                        'previous_phase', json_extract(detail_json, '$.phase')
+                    )
+                WHERE job_id = ?4
+                  AND actor_channel = ?5
+                  AND actor_user_id = ?6
+                  AND COALESCE(actor_channel_scope, '') = COALESCE(?7, '')
+                  AND channel_target = ?8
+                  AND heartbeat = ?9
+                  AND execution_status = 'running'
+                  AND message_send_status = 'pending'
+                  AND json_extract(detail_json, '$.phase') = 'started'
+                  AND json_extract(detail_json, '$.delivery_key') = ?10
+                ",
+                params![
+                    recovered_at,
+                    error_message,
+                    recovered_by,
+                    job_id,
+                    actor.channel,
+                    actor.user_id,
+                    actor.channel_scope,
+                    channel_target,
+                    if heartbeat { 1 } else { 0 },
+                    delivery_key,
+                ],
+            )
+            .map_err(sqlite_err)?;
+        Ok(updated)
+    }
+
     pub fn recover_stale_started_executions(
         &self,
         channel: &str,
@@ -38,6 +128,23 @@ impl CronJobStorage {
         recovered_by: &str,
         reason: &str,
     ) -> HoneResult<usize> {
+        if let Some(postgres) = self.cloud_postgres() {
+            let channel = channel.to_string();
+            let stale_before_rfc3339 = stale_before_rfc3339.to_string();
+            let recovered_by = recovered_by.to_string();
+            let reason = truncate_chars_append(reason, 500, "...");
+            return run_cloud_cron(async move {
+                postgres
+                    .recover_stale_cron_started_executions(
+                        &channel,
+                        &stale_before_rfc3339,
+                        &recovered_by,
+                        &reason,
+                    )
+                    .await
+            });
+        }
+
         let Some(conn) = self.open_execution_conn()? else {
             return Ok(0);
         };
@@ -89,6 +196,41 @@ impl CronJobStorage {
         heartbeat: bool,
         input: CronJobExecutionInput,
     ) -> HoneResult<()> {
+        let input = normalize_cron_execution_input_for_storage(actor, input);
+        if let Some(postgres) = self.cloud_postgres() {
+            let actor = actor.clone();
+            let job_id = job_id.to_string();
+            let job_name = job_name.to_string();
+            let channel_target = channel_target.to_string();
+            let cloud_input = CloudCronExecutionInput {
+                execution_status: input.execution_status,
+                message_send_status: input.message_send_status,
+                should_deliver: input.should_deliver,
+                delivered: input.delivered,
+                response_preview: input
+                    .response_preview
+                    .as_deref()
+                    .map(|text| truncate_chars_append(text, 500, "...")),
+                error_message: input
+                    .error_message
+                    .as_deref()
+                    .map(|text| truncate_chars_append(text, 500, "...")),
+                detail: input.detail,
+            };
+            return run_cloud_cron(async move {
+                postgres
+                    .record_cron_execution_event(
+                        &actor,
+                        &job_id,
+                        &job_name,
+                        &channel_target,
+                        heartbeat,
+                        cloud_input,
+                    )
+                    .await
+            });
+        }
+
         let Some(conn) = self.open_execution_conn()? else {
             return Ok(());
         };
@@ -256,6 +398,18 @@ impl CronJobStorage {
         job_id: &str,
         limit: usize,
     ) -> HoneResult<Vec<CronJobExecutionRecord>> {
+        if let Some(postgres) = self.cloud_postgres() {
+            let filter = CloudCronExecutionFilter {
+                job_id: Some(job_id.to_string()),
+                limit,
+                ..CloudCronExecutionFilter::default()
+            };
+            return run_cloud_cron(
+                async move { postgres.list_cron_execution_records(filter).await },
+            )
+            .map(|records| records.into_iter().map(cron_execution_from_cloud).collect());
+        }
+
         let Some(conn) = self.open_execution_conn()? else {
             return Ok(Vec::new());
         };
@@ -313,6 +467,24 @@ impl CronJobStorage {
         &self,
         filter: &ExecutionFilter,
     ) -> HoneResult<Vec<CronJobExecutionRecord>> {
+        if let Some(postgres) = self.cloud_postgres() {
+            let filter = CloudCronExecutionFilter {
+                since: filter.since.clone(),
+                until: filter.until.clone(),
+                channel: filter.channel.clone(),
+                user_id: filter.user_id.clone(),
+                job_id: filter.job_id.clone(),
+                execution_status: filter.execution_status.clone(),
+                message_send_status: filter.message_send_status.clone(),
+                heartbeat_only: filter.heartbeat_only,
+                limit: filter.limit,
+            };
+            return run_cloud_cron(
+                async move { postgres.list_cron_execution_records(filter).await },
+            )
+            .map(|records| records.into_iter().map(cron_execution_from_cloud).collect());
+        }
+
         let Some(conn) = self.open_execution_conn()? else {
             return Ok(Vec::new());
         };
@@ -459,6 +631,89 @@ impl CronJobStorage {
         )
         .map_err(sqlite_err)?;
         Ok(())
+    }
+}
+
+fn normalize_cron_execution_input_for_storage(
+    actor: &ActorIdentity,
+    mut input: CronJobExecutionInput,
+) -> CronJobExecutionInput {
+    if input.message_send_status != "send_failed" || input.delivered {
+        return input;
+    }
+
+    let sent_segments = input
+        .detail
+        .get("sent_segments")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let total_segments = input
+        .detail
+        .get("total_segments")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    if sent_segments != 0 || total_segments == 0 {
+        return input;
+    }
+
+    let fallback_error = match actor.channel.as_str() {
+        "discord" => "Discord 定时任务发送失败",
+        _ => "定时任务发送失败",
+    };
+    if input
+        .error_message
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        input.error_message = Some(fallback_error.to_string());
+    }
+
+    if let Value::Object(detail) = &mut input.detail
+        && detail
+            .get("failure_kind")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+    {
+        let failure_kind = match actor.channel.as_str() {
+            "discord" => "discord_send_failed",
+            "feishu" => "feishu_send_failed",
+            "telegram" => "telegram_send_failed",
+            "web" => "web_send_failed",
+            _ => "channel_send_failed",
+        };
+        detail.insert(
+            "failure_kind".to_string(),
+            Value::String(failure_kind.to_string()),
+        );
+    }
+
+    input
+}
+
+fn cron_execution_from_cloud(
+    record: hone_core::cloud_runtime::CloudCronExecutionRecord,
+) -> CronJobExecutionRecord {
+    CronJobExecutionRecord {
+        run_id: record.run_id,
+        job_id: record.job_id,
+        job_name: record.job_name,
+        channel: record.channel,
+        user_id: record.user_id,
+        channel_scope: record.channel_scope,
+        channel_target: record.channel_target,
+        heartbeat: record.heartbeat,
+        executed_at: record.executed_at,
+        execution_status: record.execution_status,
+        message_send_status: record.message_send_status,
+        should_deliver: record.should_deliver,
+        delivered: record.delivered,
+        response_preview: record.response_preview,
+        error_message: record.error_message,
+        detail: record.detail,
     }
 }
 

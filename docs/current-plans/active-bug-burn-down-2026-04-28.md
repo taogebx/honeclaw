@@ -3,12 +3,14 @@
 - title: Active Bug Burn-down 2026-04-28
 - status: in_progress
 - created_at: 2026-04-28
-- updated_at: 2026-05-30 00:09 CST
+- updated_at: 2026-06-09 04:43 CST
 - owner: Codex
 - related_files:
   - `docs/bugs/README.md`
   - `docs/bugs/*.md`
   - `crates/hone-channels/src/scheduler.rs`
+  - `crates/hone-channels/src/runners/codex_acp.rs`
+  - `crates/hone-channels/src/runners/tests.rs`
   - `crates/hone-event-engine/src/**`
   - `crates/hone-web-api/src/routes/**`
   - `memory/src/**`
@@ -34,6 +36,13 @@ Clear the current active bug queue as far as software changes can responsibly do
 
 ## Progress
 
+- 2026-06-09 04:43: Rebased onto remote `main`, which had already closed 3 user-visible wording P3 bugs through shared sanitizer hardening, then closed the 4 remaining active bugs after Rust verification recovered. Changes now verified: ACP stream disconnect sanitization and scheduler failure classification, Feishu daily-limit assistant-tail dedupe, finance all-in / concentrated-position and per-symbol fresh-quote prompt guards, plus a cron task status user-language prompt guard that complements the remote sanitizer fix. Active bug queue in `docs/bugs/README.md` is now 0. Focused tests and `cargo check -p hone-channels --tests` passed; default target `cargo check -p hone-feishu --tests` hung in rustc at 0% CPU, but the same check passed with `CARGO_TARGET_DIR=/tmp/honeclaw-feishu-check CARGO_INCREMENTAL=0`, confirming a local cache/toolchain issue rather than a code failure.
+- 2026-06-09 00:12: Prepared code/prompt hardening for all 6 currently active bugs but left the queue in `Fixing` because the local Rust toolchain is hanging before any real test can run. Changes prepared: ACP stream disconnect now maps to a safe direct error and scheduler ledger failure kind instead of `noop`; Feishu daily-limit failure fallback now skips duplicate assistant tail messages; cron task prompt now maps `enabled=true/false` into user language; finance policy now blocks all-in single-stock ranking/concentrated allocation templates and requires per-symbol fresh quote verification; company-profile path leak remains covered by existing sanitizer regression pending rerun. `git diff --check` passed. Required next step is to restore cargo/rustc, run the targeted tests listed in the bug docs plus `cargo check` for changed crates, then mark bugs `Fixed`, commit, and push if tests pass.
+- 2026-06-08 16:11: Closed the active P2 `web_direct_image_attachment_not_readable_internal_debug_leak` at code level. Public Web chat now routes uploaded attachments through the shared `hone-channels` ingest path instead of appending raw `[附件: path]` lines; local uploads are copied into the actor sandbox, and cloud `oss://` public uploads are downloaded via OSS before being handed to the runner. Shared attachment ingest now keeps the current-turn local path even after uploading the artifact to actor OSS in cloud mode, and image attachment guidance now prefers the local readable path while calling `image_understanding` only when the skill is actually exposed. Added focused public attachment regressions and reran `cargo check -p hone-web-api --tests` plus `cargo check -p hone-channels --tests`. Active queue is 7 and still has no `P0/P1`.
+- 2026-06-08 03:06: Closed the active P2 `discord_scheduler_completed_report_send_failed_without_error` at code level and re-confirmed the stale P1 rows are already fixed in current HEAD. `bins/hone-discord/src/utils.rs` now returns segment-send errors alongside `sent_segments/total_segments`, and `bins/hone-discord/src/scheduler.rs` now persists a non-empty `error_message` whenever Discord delivery fails before any segment is sent, falling back to a generic `Discord 定时任务发送失败` if the SDK surfaces no detail. Added focused `hone-discord` tests for the error-message selection path; `cargo test -p hone-discord scheduler_error_message_ -- --nocapture`, `cargo test -p hone-discord segment_send_result_keeps_error_message -- --nocapture`, `cargo check -p hone-discord --tests`, and `rustfmt --edition 2024 --check bins/hone-discord/src/scheduler.rs bins/hone-discord/src/utils.rs` passed. Current active queue has no `P0/P1`; remaining active items are `P2/P3`.
+- 2026-06-03 03:07: Closed the active P2 `web_scheduler_acp_stream_disconnect_no_final` enough for code-level closure. `crates/hone-web-api/src/routes/events.rs` now broadcasts the productized Web scheduler failure reply through the same `scheduled_message` SSE path used by successful runs, instead of only persisting it into session history. This means an online Web chat sees `定时任务「...」执行出错，请稍后重试。` immediately when ACP transport disconnect/internal-error paths are suppressed into a generic scheduler failure. Added `build_web_scheduler_push_event_uses_scheduled_message_payload` and `emit_web_scheduler_push_broadcasts_failure_prompt`; `cargo test -p hone-web-api scheduler_failure_trace_required_ -- --nocapture`, `cargo test -p hone-web-api web_scheduler_ -- --nocapture`, the two new focused tests, and `cargo check -p hone-web-api --tests` passed. Active bug queue is back to 0 pending live cloud/Web verification.
+- 2026-06-02 03:12: Added another reliability guard on top of the already-fixed P1 `feishu_scheduler_no_runs_after_midnight`. `hone-feishu` now starts the Feishu cron producer through a supervised spawn, so if `scheduler.start()` ever panics or exits unexpectedly, the runtime logs the failure and restarts the due-scan loop after 1 second instead of silently abandoning all future cron ticks. Added `handler::tests::supervised_task_restarts_after_panic`; `cargo test -p hone-feishu supervised_task_restarts_after_panic -- --nocapture` and `cargo check -p hone-feishu --tests` passed. Active bug queue remains 0.
+- 2026-05-30 16:10: Re-closed the reopened P1 Codex version-probe resource exhaustion bug linked to Issue #43. Codex ACP version validation now caches successful `codex --version` + codex-acp initialize checks by effective runner config, so direct / scheduler traffic does not create two extra probe children on every turn. If only the version-probe step hits a transient local resource limit such as `Resource temporarily unavailable` / `os error 35` / `would block`, the preflight logs a warning and continues to the real runner startup path; missing binaries, old versions, unparsable versions, and real runner startup failures still fail normally. Active bug queue is back to 0.
 - 2026-05-30 00:09: Re-closed the reopened P2 scheduler commodity-guard false positive for low-segmentation A/H market reviews. `text_is_predominantly_commodity_related(...)` now compares broad-market anchors against commodity anchors even when the response has only one or two sentence segments, so an A股/港股/美股/AI market review with WTI/Brent/oil only in a risk note is not fully replaced by the commodity safety notice. Added `commodity_guard_skips_low_segmentation_ah_market_review_with_oil_risk_note`; `commodity_guard_`, `commodity_`, `cargo check -p hone-channels --tests`, and rustfmt check passed. Active bug queue is back to 0.
 - 2026-05-29 00:13: Reconciled the active queue after `a78d3f2e fix: harden event digest and commodity guards` landed on `origin/main`. Current HEAD already covers both remaining active bugs: Feishu event digest `open_id cross app` now invalidates direct open_id cache and retries after `99992361`, while scheduler commodity guard skips broad-market review samples that only mention oil as a secondary risk variable. Verified `cargo test -p hone-event-engine feishu --lib -- --nocapture` and `cargo test -p hone-channels commodity_guard_ --lib -- --nocapture`; `docs/bugs/README.md` active queue is back to 0. This run did not require a new code patch because the code fix was already present; it synchronized the ledger and issue follow-up state.
 - 2026-05-28 03:11: Re-closed the reopened P1 event-engine Feishu direct digest `open_id cross app` regression by restoring the intended “all stable contacts resolve to one current-app open_id” contract end-to-end: Web API now forwards every stable direct contact target per actor, and `FeishuSink` now merges repeated actor entries instead of overwriting them. The same run also closed the active P2 heartbeat stale gold-price trigger by suppressing `JsonTriggered` deliveries whose current/latest-price message carries an explicit date older than the current Beijing date. Targeted `hone-event-engine` / `hone-web-api` / `hone-channels` tests and `cargo check -p hone-event-engine -p hone-web-api -p hone-channels --tests` passed. The remaining active bug is the scheduler commodity-guard false positive; current local regressions already pass, so the next run needs a live sample shape that still reproduces before making another code change.
@@ -106,6 +115,20 @@ Clear the current active bug queue as far as software changes can responsibly do
 
 Completed this round:
 
+- 2026-06-09 04:43:
+  - `cargo test -p hone-channels user_visible_error_message_ --lib -- --nocapture`
+  - `cargo test -p hone-channels suppressed_scheduler_failure_ --lib -- --nocapture`
+  - `cargo test -p hone-channels build_prompt_bundle_always_includes_finance_domain_policy --lib -- --nocapture`
+  - `cargo test -p hone-channels resolve_prompt_input_maps_cron_enabled_flags_to_user_language --lib -- --nocapture`
+  - `cargo test -p hone-channels sanitize_user_visible_output_redacts_internal_relative_company_profile_paths --lib -- --nocapture`
+  - `cargo test -p hone-feishu session_tail_assistant_matches_detects_duplicate_quota_reply -- --nocapture`
+  - `cargo check -p hone-channels --tests`
+  - `CARGO_TARGET_DIR=/tmp/honeclaw-feishu-check CARGO_INCREMENTAL=0 cargo check -p hone-feishu --tests`
+  - `git diff --check`
+  - Note: default target `cargo check -p hone-feishu --tests` hung in rustc at 0% CPU; fresh target passed.
+
+- 2026-06-09 00:12: `git diff --check` passed. Rust verification blocked before execution because `cargo --version`, direct toolchain `cargo --version`, and `rustc --version` all hung; no commit/push performed.
+
 - `cargo check -p hone-memory -p hone-scheduler -p hone-tools -p hone-web-api -p hone-event-engine -p hone-channels --tests`
 - `cargo test -p hone-memory once_jobs_with_future_date_do_not_run_today --lib`
 - `cargo test -p hone-event-engine per_actor_immediate_kinds_does_not_resurrect_low_signal_news --lib`
@@ -125,6 +148,11 @@ Completed this round:
 - `bash -n launch.sh`
 - `cargo test -p hone-memory execution_terminal_event_updates_matching_pending_row -- --nocapture`
 - `cargo test -p hone-channels scheduled_watchlist_ --lib -- --nocapture`
+- `cargo check -p hone-channels --tests`
+- `cargo test -p hone-web-api public_chat_user_input_ -- --nocapture`
+- `cargo test -p hone-web-api public_attachment_filename_prefers_client_name_for_oss_uri -- --nocapture`
+- `cargo test -p hone-channels build_user_input_includes_attachment_notes --lib -- --nocapture`
+- `cargo check -p hone-web-api --tests`
 - `cargo check -p hone-channels --tests`
 - `rustfmt --edition 2024 --check crates/hone-channels/src/scheduler.rs`
 - `cargo test -p hone-channels heartbeat_near_threshold_trigger_is_suppressed -- --nocapture`
@@ -178,6 +206,11 @@ Completed this round:
 - `cargo test -p hone-channels pdf_extract --lib -- --nocapture`
 - `cargo test -p hone-channels pdf_note_contains_extracted_text --lib -- --nocapture`
 - `cargo check -p hone-channels --tests`
+- `cargo test -p hone-channels codex_version_probe_ --lib -- --nocapture`
+- `cargo test -p hone-channels codex_version_validation_cache_key_tracks_effective_runner_args --lib -- --nocapture`
+- `cargo test -p hone-channels codex_version_ --lib -- --nocapture`
+- `cargo check -p hone-channels --tests`
+- `rustfmt --edition 2024 --config skip_children=true --check crates/hone-channels/src/runners/codex_acp.rs crates/hone-channels/src/runners/tests.rs`
 - `rustfmt --edition 2024 --check crates/hone-channels/src/attachments/vector_store.rs crates/hone-channels/src/attachments/ingest.rs`
 - `git diff --check`
 - `cargo fmt --all -- --check`

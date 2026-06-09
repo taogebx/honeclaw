@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,6 +9,7 @@ use async_trait::async_trait;
 use feishu_sdk::core::{Config as FeishuConfig, LogLevel as FeishuLogLevel, new_logger};
 use feishu_sdk::event::{Event, EventDispatcher, EventDispatcherConfig, EventHandler, EventResp};
 use feishu_sdk::ws::StreamClient;
+use futures::FutureExt;
 use hone_channels::ChatMode;
 use hone_channels::agent_session::{AgentRunOptions, AgentSession, MessageMetadata};
 use hone_channels::attachments::{
@@ -25,6 +27,7 @@ use hone_channels::runtime::{
 };
 use hone_channels::think::{ThinkRenderStyle, ThinkStreamFormatter, render_think_blocks};
 use hone_core::{ActorIdentity, SessionIdentity};
+use hone_memory::{SessionStorage, session_message_text};
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
@@ -186,10 +189,31 @@ fn persist_visible_assistant_message(
     content: &str,
     metadata: Option<HashMap<String, Value>>,
 ) {
+    if session_tail_assistant_matches(&state.core.session_storage, session_id, content) {
+        return;
+    }
     let _ = state
         .core
         .session_storage
         .add_message(session_id, "assistant", content, metadata);
+}
+
+fn session_tail_assistant_matches(
+    storage: &SessionStorage,
+    session_id: &str,
+    content: &str,
+) -> bool {
+    let expected = content.trim();
+    if expected.is_empty() {
+        return false;
+    }
+    storage
+        .get_messages(session_id, Some(1))
+        .ok()
+        .and_then(|messages| messages.into_iter().next())
+        .is_some_and(|message| {
+            message.role == "assistant" && session_message_text(&message).trim() == expected
+        })
 }
 
 #[async_trait]
@@ -356,8 +380,12 @@ pub(crate) async fn run() {
         warn!("HONE_FEISHU_DISABLE_SCHEDULER is set; Feishu cron scheduler is disabled");
     } else {
         let (scheduler, event_rx) = core.create_scheduler(vec!["feishu".to_string()]);
-        tokio::spawn(async move {
-            scheduler.start().await;
+        let scheduler = Arc::new(scheduler);
+        spawn_supervised_task("feishu_scheduler_loop", move || {
+            let scheduler = scheduler.clone();
+            async move {
+                scheduler.start().await;
+            }
         });
 
         let scheduler_state = state.clone();
@@ -1620,10 +1648,77 @@ fn collect_raw_attachments(msg: &FeishuIncomingMessage) -> Vec<RawAttachment> {
     out
 }
 
+fn spawn_supervised_task<F, Fut>(
+    task_name: &'static str,
+    mut task_factory: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            let result = AssertUnwindSafe(task_factory()).catch_unwind().await;
+            match result {
+                Ok(()) => error!(
+                    "[Feishu] supervised task exited unexpectedly: task={task_name}; restarting in 1s"
+                ),
+                Err(_) => {
+                    error!("[Feishu] supervised task panicked: task={task_name}; restarting in 1s")
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use hone_core::ActorIdentity;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn session_tail_assistant_matches_detects_duplicate_quota_reply() {
+        let root = std::env::temp_dir().join(format!(
+            "hone_feishu_tail_match_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create root");
+        let storage = SessionStorage::new(root.join("sessions"));
+        let actor = ActorIdentity::new("feishu", "ou_quota", None::<String>).expect("actor");
+        let session_id = storage
+            .create_session_for_actor(&actor)
+            .expect("create session");
+        let daily_limit_reply =
+            "已达到今日对话上限（12/12，北京时间 2026-06-07），请明天再试";
+
+        storage
+            .add_message(&session_id, "user", "继续", None)
+            .expect("add user");
+        assert!(!session_tail_assistant_matches(
+            &storage,
+            &session_id,
+            daily_limit_reply
+        ));
+        storage
+            .add_message(&session_id, "assistant", daily_limit_reply, None)
+            .expect("add assistant");
+
+        assert!(session_tail_assistant_matches(
+            &storage,
+            &session_id,
+            daily_limit_reply
+        ));
+        assert!(!session_tail_assistant_matches(
+            &storage,
+            &session_id,
+            "其它回复"
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn allow_list_empty_means_allow_all() {
@@ -1927,5 +2022,39 @@ mod tests {
         assert!(has_actionable_user_input("1", 0, 0));
         assert!(has_actionable_user_input("", 1, 0));
         assert!(has_actionable_user_input("", 0, 1));
+    }
+
+    #[tokio::test]
+    async fn supervised_task_restarts_after_panic() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let handle = spawn_supervised_task("test_supervisor", {
+            let attempts = attempts.clone();
+            let notify = notify.clone();
+            move || {
+                let attempts = attempts.clone();
+                let notify = notify.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    notify.notify_waiters();
+                    if attempt == 0 {
+                        panic!("boom");
+                    }
+                }
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if attempts.load(Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                notify.notified().await;
+            }
+        })
+        .await
+        .expect("supervisor should restart the task");
+
+        handle.abort();
     }
 }

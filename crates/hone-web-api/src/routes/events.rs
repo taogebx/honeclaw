@@ -21,6 +21,8 @@ use crate::routes::normalized_query_actor;
 use crate::state::{AppState, PushEvent};
 use crate::types::UserIdQuery;
 
+const SCHEDULER_EXECUTION_GRACE_SECS: u64 = 30;
+
 /// GET /api/events?user_id=... — 长连接 SSE 推送通道（调度器消息用）
 pub(crate) async fn handle_events(
     State(state): State<Arc<AppState>>,
@@ -77,6 +79,60 @@ fn web_scheduler_delivery_detail(
         "system_push_sent": false,
         "delivery_channel": channel,
     })
+}
+
+fn build_web_scheduler_push_event(event: &SchedulerEvent, response: &str) -> Option<PushEvent> {
+    if event.channel != "web" {
+        return None;
+    }
+    let text = response.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    Some(PushEvent {
+        channel: event.actor.channel.clone(),
+        user_id: event.actor.user_id.clone(),
+        channel_scope: event.actor.channel_scope.clone(),
+        event: "scheduled_message".into(),
+        data: json!({
+            "text": text,
+            "job_name": event.job_name.clone(),
+            "job_id": event.job_id.clone(),
+        }),
+    })
+}
+
+fn emit_web_scheduler_push(
+    push_tx: &tokio::sync::broadcast::Sender<PushEvent>,
+    event: &SchedulerEvent,
+    response: &str,
+) -> bool {
+    build_web_scheduler_push_event(event, response)
+        .is_some_and(|push_event| push_tx.send(push_event).is_ok())
+}
+
+fn scheduler_execution_timeout_for(overall_timeout: Duration) -> Duration {
+    overall_timeout.saturating_add(Duration::from_secs(SCHEDULER_EXECUTION_GRACE_SECS))
+}
+
+fn scheduler_handler_timeout_execution(
+    event: &SchedulerEvent,
+    timeout: Duration,
+) -> scheduler::ScheduledTaskExecution {
+    scheduler::ScheduledTaskExecution {
+        should_deliver: false,
+        content: String::new(),
+        error: Some(format!(
+            "web_scheduler_handler_timeout:{}s",
+            timeout.as_secs()
+        )),
+        metadata: json!({
+            "failure_kind": "web_scheduler_handler_timeout",
+            "timeout_secs": timeout.as_secs(),
+        }),
+        session_id: Some(event.actor.session_id()),
+    }
 }
 
 /// 接收调度器事件，为每个触发的任务启动独立处理协程
@@ -143,6 +199,10 @@ pub(crate) async fn handle_scheduler_events(
                 if let Some(response) = response.as_deref() {
                     persist_web_scheduler_failure(&state_clone, &event, &result, response);
                 }
+                let console_event_sent = response
+                    .as_deref()
+                    .map(|response| emit_web_scheduler_push(&state_clone.push_tx, &event, response))
+                    .unwrap_or(false);
                 let _ = storage.record_execution_event(
                     &event.actor,
                     &event.job_id,
@@ -168,7 +228,15 @@ pub(crate) async fn handle_scheduler_events(
                                 .then(|| "内部错误已抑制，已写入用户可见失败提示".to_string())
                         }),
                         detail: execution_detail_with_delivery_key(
-                            result.metadata.clone(),
+                            if failure_trace && event.channel == "web" {
+                                web_scheduler_delivery_detail(
+                                    result.metadata.clone(),
+                                    console_event_sent,
+                                    &event.channel,
+                                )
+                            } else {
+                                result.metadata.clone()
+                            },
                             &event.delivery_key,
                         ),
                     },
@@ -185,25 +253,16 @@ pub(crate) async fn handle_scheduler_events(
             }
 
             // 1. 推送到 Web 控制台 SSE（供控制台页面实时展示）
-            let push_result = state_clone.push_tx.send(PushEvent {
-                channel: event.actor.channel.clone(),
-                user_id: event.actor.user_id.clone(),
-                channel_scope: event.actor.channel_scope.clone(),
-                event: "scheduled_message".into(),
-                data: json!({
-                    "text": response.clone(),
-                    "job_name": event.job_name.clone(),
-                    "job_id": event.job_id.clone(),
-                }),
-            });
+            let console_event_sent =
+                emit_web_scheduler_push(&state_clone.push_tx, &event, &response);
 
             // 2. 若是 iMessage 渠道，把结果通过 hone-imessage 内置 HTTP 服务投递给用户
             let (mut message_send_status, mut delivered) =
-                web_scheduler_delivery_status(push_result.is_ok());
+                web_scheduler_delivery_status(console_event_sent);
             let mut error_message = result.error.clone();
             let mut detail = web_scheduler_delivery_detail(
                 result.metadata.clone(),
-                push_result.is_ok(),
+                console_event_sent,
                 &event.channel,
             );
             if event.channel == "imessage" {
@@ -273,7 +332,7 @@ pub(crate) async fn handle_scheduler_events(
                 }
                 detail = json!({
                     "scheduler": result.metadata,
-                    "console_event_sent": push_result.is_ok(),
+                    "console_event_sent": console_event_sent,
                     "imessage_http_delivery": delivered,
                     "delivery_channel": event.channel.clone(),
                 });
@@ -319,9 +378,25 @@ async fn run_scheduled_task(
         quota_mode: hone_channels::agent_session::AgentRunQuotaMode::ScheduledTask,
         model_override: None,
     };
-    let result =
-        scheduler::execute_scheduler_event(state.core.clone(), event, prompt_options, run_options)
-            .await;
+    let timeout = scheduler_execution_timeout_for(state.core.config.agent.overall_timeout());
+    let result = match tokio::time::timeout(
+        timeout,
+        scheduler::execute_scheduler_event(state.core.clone(), event, prompt_options, run_options),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            warn!(
+                "⏰ [{}] Web/iMessage scheduler 执行超时: job={} target={} timeout_secs={}",
+                actor.user_id,
+                event.job_name,
+                event.channel_target,
+                timeout.as_secs()
+            );
+            scheduler_handler_timeout_execution(event, timeout)
+        }
+    };
     if !result.should_deliver {
         if let Some(err) = result.error.as_deref() {
             error!(
@@ -408,6 +483,7 @@ fn persist_web_scheduler_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hone_core::ActorIdentity;
     use serde_json::Value;
 
     fn scheduled_result(error: Option<&str>, metadata: Value) -> scheduler::ScheduledTaskExecution {
@@ -417,6 +493,28 @@ mod tests {
             error: error.map(str::to_string),
             metadata,
             session_id: Some("session-1".to_string()),
+        }
+    }
+
+    fn sample_scheduler_event(channel: &str) -> SchedulerEvent {
+        SchedulerEvent {
+            actor: ActorIdentity::new(channel, "web-user-1", None::<String>).expect("actor"),
+            job_id: "job-1".to_string(),
+            job_name: "收盘复盘".to_string(),
+            task_prompt: "总结今天市场".to_string(),
+            channel: channel.to_string(),
+            channel_scope: None,
+            channel_target: "web-user-1".to_string(),
+            delivery_key: "delivery-1".to_string(),
+            push: Value::Null,
+            tags: vec![],
+            heartbeat: false,
+            schedule_hour: 20,
+            schedule_minute: 0,
+            schedule_repeat: "daily".to_string(),
+            schedule_date: None,
+            last_delivered_previews: vec![],
+            bypass_quiet_hours: false,
         }
     }
 
@@ -437,6 +535,52 @@ mod tests {
             }),
         );
         assert!(scheduler_failure_trace_required(&result));
+    }
+
+    #[test]
+    fn scheduler_handler_timeout_execution_is_failure_trace() {
+        let actor =
+            hone_core::ActorIdentity::new("web", "web-user-timeout", None::<String>).unwrap();
+        let event = SchedulerEvent {
+            actor: actor.clone(),
+            channel: "web".to_string(),
+            channel_target: "web-user-timeout".to_string(),
+            job_id: "job-timeout".to_string(),
+            job_name: "timeout job".to_string(),
+            task_prompt: "run".to_string(),
+            channel_scope: None,
+            push: json!({}),
+            tags: Vec::new(),
+            schedule_repeat: "daily".to_string(),
+            schedule_hour: 20,
+            schedule_minute: 0,
+            schedule_date: None,
+            last_delivered_previews: Vec::new(),
+            heartbeat: false,
+            bypass_quiet_hours: false,
+            delivery_key: "delivery-timeout".to_string(),
+        };
+        let result = scheduler_handler_timeout_execution(&event, Duration::from_secs(630));
+
+        assert!(!result.should_deliver);
+        assert_eq!(
+            result.session_id.as_deref(),
+            Some(actor.session_id().as_str())
+        );
+        assert_eq!(
+            result.metadata["failure_kind"].as_str(),
+            Some("web_scheduler_handler_timeout")
+        );
+        assert!(result.error.as_deref().unwrap().contains("630s"));
+        assert!(scheduler_failure_trace_required(&result));
+    }
+
+    #[test]
+    fn scheduler_execution_timeout_includes_grace_period() {
+        assert_eq!(
+            scheduler_execution_timeout_for(Duration::from_secs(600)),
+            Duration::from_secs(630)
+        );
     }
 
     #[test]
@@ -461,5 +605,43 @@ mod tests {
         assert_detail_bool(&detail, "console_event_sent", false);
         assert_detail_bool(&detail, "system_push_supported", false);
         assert_detail_bool(&detail, "system_push_sent", false);
+    }
+
+    #[test]
+    fn build_web_scheduler_push_event_uses_scheduled_message_payload() {
+        let event = sample_scheduler_event("web");
+        let push_event =
+            build_web_scheduler_push_event(&event, "定时任务「收盘复盘」执行出错，请稍后重试。")
+                .expect("push event");
+
+        assert_eq!(push_event.channel, "web");
+        assert_eq!(push_event.user_id, "web-user-1");
+        assert_eq!(push_event.event, "scheduled_message");
+        assert_eq!(push_event.data["job_id"], "job-1");
+        assert_eq!(push_event.data["job_name"], "收盘复盘");
+        assert_eq!(
+            push_event.data["text"],
+            "定时任务「收盘复盘」执行出错，请稍后重试。"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_web_scheduler_push_broadcasts_failure_prompt() {
+        let event = sample_scheduler_event("web");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+
+        assert!(emit_web_scheduler_push(
+            &tx,
+            &event,
+            "定时任务「收盘复盘」执行出错，请稍后重试。"
+        ));
+
+        let push_event = rx.recv().await.expect("recv push event");
+        assert_eq!(push_event.event, "scheduled_message");
+        assert_eq!(push_event.data["job_id"], "job-1");
+        assert_eq!(
+            push_event.data["text"],
+            "定时任务「收盘复盘」执行出错，请稍后重试。"
+        );
     }
 }
