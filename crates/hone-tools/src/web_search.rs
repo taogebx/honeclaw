@@ -109,10 +109,10 @@ impl WebSearchTool {
         let body = serde_json::json!({
             "api_key": key,
             "query": query,
-            "search_depth": "basic",
+            "search_depth": "advanced",
             "max_results": self.max_results,
             "include_answer": true,
-            "include_raw_content": false
+            "include_raw_content": true
         });
 
         let response = self
