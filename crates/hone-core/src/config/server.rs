@@ -117,6 +117,25 @@ fn default_fmp_timeout() -> u64 {
     60
 }
 
+/// Finnhub.io — FMP 失效时 fallback 用 (2026-06-09 加, FMP Free /quote 已 paywall)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FinnhubConfig {
+    /// Finnhub API token (从 https://finnhub.io dashboard 拿, Free tier 60 calls/min)
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_finnhub_base")]
+    pub base_url: String,
+    #[serde(default = "default_finnhub_timeout")]
+    pub timeout: u64,
+}
+
+fn default_finnhub_base() -> String {
+    "https://finnhub.io/api/v1".to_string()
+}
+fn default_finnhub_timeout() -> u64 {
+    30
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SearchConfig {
     #[serde(default = "default_tavily")]

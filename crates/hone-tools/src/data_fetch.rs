@@ -3,7 +3,8 @@
 //! 通过 Financial Modeling Prep (FMP) API 获取金融数据，支持多 Key 自动 fallback：
 //! - 依次尝试 `fmp.api_keys` 和 `fmp.api_key` 合并后的 Key 列表
 //! - 若 Key 无效（HTTP 401/403 或响应含认证错误）则切换到下一个
-//! - 所有 Key 均失败时返回最后一次的错误信息
+//! - 所有 Key 均失败时，若 `finnhub.api_key` 已配置，自动 fallback 到 Finnhub
+//!   (Finnhub Free 60 calls/min, 覆盖 quote/profile/financials/news/search)
 
 use async_trait::async_trait;
 use chrono::{Duration, NaiveDate};
@@ -13,13 +14,16 @@ use crate::base::{Tool, ToolParameter};
 
 const MAX_FMP_TRANSPORT_ERROR_CHARS: usize = 300;
 
-/// DataFetchTool — 金融数据获取（FMP，多 Key fallback）
+/// DataFetchTool — 金融数据获取（FMP 优先 + Finnhub fallback）
 pub struct DataFetchTool {
-    /// 有效 API Key 列表（过滤空值、去重后）
+    /// 有效 FMP API Key 列表（过滤空值、去重后）
     keys: Vec<String>,
     base_url: String,
     timeout: u64,
     http: reqwest::Client,
+    /// Finnhub fallback (FMP 全失败时启用; 空字符串=不启用)
+    finnhub_key: String,
+    finnhub_base_url: String,
 }
 
 impl DataFetchTool {
@@ -30,6 +34,8 @@ impl DataFetchTool {
             base_url: base_url.trim_end_matches('/').to_string(),
             timeout,
             http: reqwest::Client::new(),
+            finnhub_key: String::new(),
+            finnhub_base_url: "https://finnhub.io/api/v1".to_string(),
         }
     }
 
@@ -40,6 +46,8 @@ impl DataFetchTool {
             base_url: config.fmp.base_url.trim_end_matches('/').to_string(),
             timeout: config.fmp.timeout,
             http: reqwest::Client::new(),
+            finnhub_key: config.finnhub.api_key.trim().to_string(),
+            finnhub_base_url: config.finnhub.base_url.trim_end_matches('/').to_string(),
         }
     }
 
@@ -175,11 +183,101 @@ impl DataFetchTool {
             }
         }
 
+        // FMP 全部失败 → 尝试 Finnhub fallback (如已配置 + endpoint 支持)
+        if !self.finnhub_key.is_empty() {
+            if let Some(finnhub_url) = self.build_finnhub_url(data_type, ticker) {
+                tracing::info!(
+                    "FMP 全 {} 个 key 失败，尝试 Finnhub fallback for {} {}",
+                    self.keys.len(),
+                    data_type,
+                    ticker
+                );
+                match self.fetch_finnhub(&finnhub_url).await {
+                    Ok(data) => return Ok(data),
+                    Err(e) => {
+                        return Err(format!(
+                            "FMP 失败 ({}): {} | Finnhub fallback 也失败: {}",
+                            self.keys.len(),
+                            last_err,
+                            e
+                        ));
+                    }
+                }
+            }
+        }
+
         Err(format!(
             "所有 FMP API Key 均失败（共 {} 个）。最后错误：{}",
             self.keys.len(),
             last_err
         ))
+    }
+
+    /// 把 data_type 映射到 Finnhub endpoint URL。返回 None = Finnhub 不支持该类型
+    fn build_finnhub_url(&self, data_type: &str, ticker: &str) -> Option<String> {
+        let base = &self.finnhub_base_url;
+        match data_type {
+            "quote" => Some(format!("{}/quote?symbol={}", base, ticker)),
+            "profile" => Some(format!("{}/stock/profile2?symbol={}", base, ticker)),
+            "financials" => Some(format!(
+                "{}/stock/financials-reported?symbol={}&freq=quarterly",
+                base, ticker
+            )),
+            "news" => {
+                // Finnhub /company-news 必填 from/to, 默认拿过去 30 天
+                let today = hone_core::beijing_now().date_naive();
+                let from = today - Duration::days(30);
+                Some(format!(
+                    "{}/company-news?symbol={}&from={}&to={}",
+                    base,
+                    ticker,
+                    from.format("%Y-%m-%d"),
+                    today.format("%Y-%m-%d")
+                ))
+            }
+            "search" => Some(format!("{}/search?q={}", base, ticker)),
+            // gainers_losers / sector_performance / crypto_quote / etf_holdings / earnings_calendar
+            // Finnhub Free 不支持或 schema 差异大，不 fallback
+            _ => None,
+        }
+    }
+
+    /// 用 Finnhub key 调一次。token 走 query param `token=`
+    async fn fetch_finnhub(&self, url: &str) -> Result<Value, String> {
+        let connector = if url.contains('?') { "&" } else { "?" };
+        let full_url = format!("{}{connector}token={}", url, self.finnhub_key);
+
+        let response = self
+            .http
+            .get(&full_url)
+            .timeout(std::time::Duration::from_secs(self.timeout))
+            .send()
+            .await
+            .map_err(|e| format!("Finnhub 请求失败: {}", e))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("Finnhub 响应读取失败: {}", e))?;
+
+        if status == 401 || status == 403 {
+            return Err(format!("Finnhub key 无效 (HTTP {})", status));
+        }
+        if status == 429 {
+            return Err("Finnhub 限流 (HTTP 429, Free tier 60/min)".to_string());
+        }
+
+        let json: Value = serde_json::from_str(&body).map_err(|e| {
+            let prefix = body.chars().take(200).collect::<String>();
+            format!("Finnhub JSON 解析失败: {e}; body_prefix={prefix}")
+        })?;
+
+        // Finnhub 错误响应格式: {"error": "..."}
+        if let Some(err_msg) = json.get("error").and_then(|v| v.as_str()) {
+            return Err(format!("Finnhub: {}", err_msg));
+        }
+        Ok(json)
     }
 
     async fn fetch_from_url(&self, url: &str) -> Result<Value, String> {
