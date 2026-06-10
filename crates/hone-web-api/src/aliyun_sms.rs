@@ -160,6 +160,15 @@ pub(crate) async fn send_verify_code(
     http: &reqwest::Client,
     phone_number: &str,
 ) -> Result<(), AliyunSmsError> {
+    // 2026-06-10 dev-mode SMS bypass: 设 HONE_DEV_SMS_BYPASS=1 后, send 不真发 SMS
+    // (省阿里云配额; 配合下面 check_verify_code 的 HONE_DEV_VERIFY_CODE bypass 使用)
+    if std::env::var("HONE_DEV_SMS_BYPASS").ok().as_deref() == Some("1") {
+        tracing::warn!(
+            "[DEV] SMS bypass: pretending to send verify code to {} (无实际 SMS)",
+            phone_number
+        );
+        return Ok(());
+    }
     let config = AliyunSmsConfig::from_env()?;
     send_verify_code_with_config(http, &config, phone_number).await
 }
@@ -169,6 +178,17 @@ pub(crate) async fn check_verify_code(
     phone_number: &str,
     verify_code: &str,
 ) -> Result<bool, AliyunSmsError> {
+    // 2026-06-10 dev-mode bypass: 设 HONE_DEV_VERIFY_CODE=888888 后, 任何手机号 + 888888 通过
+    // 用于本地开发/测试时绕开真实 SMS 验证流程, 让 3001 public 端能注册/登录
+    if let Ok(bypass_code) = std::env::var("HONE_DEV_VERIFY_CODE") {
+        if !bypass_code.is_empty() && verify_code == bypass_code {
+            tracing::warn!(
+                "[DEV] verify code bypass MATCH: phone={} (HONE_DEV_VERIFY_CODE 生效)",
+                phone_number
+            );
+            return Ok(true);
+        }
+    }
     let config = AliyunSmsConfig::from_env()?;
     check_verify_code_with_config(http, &config, phone_number, verify_code).await
 }
